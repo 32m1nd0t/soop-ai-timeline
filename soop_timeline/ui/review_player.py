@@ -182,6 +182,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_attempts = 0
         self._seek_in_flight = False
         self._activate_attempts = 0
+        self._suppress_activate = False
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -256,8 +257,8 @@ class SoopReviewPlayer(QFrame):
         self._activate_once()
 
     def _activate_once(self) -> None:
-        if self._pending_seconds is not None:
-            return  # A pending seek will start playback instead.
+        if self._suppress_activate or self._pending_seconds is not None:
+            return  # Never re-mute after the user has sought to a position.
         if not self._dom_loaded or not self.web_view.is_ready:
             return
         self.web_view.evaluate_js(build_activate_script())
@@ -269,6 +270,9 @@ class SoopReviewPlayer(QFrame):
 
     def seek_to(self, seconds: int) -> None:
         value = max(0, int(seconds))
+        # Once the user seeks they want audio; never let the muted auto-activate
+        # loop run again and re-mute the video.
+        self._suppress_activate = True
         self.open_player()
         self._pending_seconds = value
         self._seek_generation += 1
@@ -284,6 +288,7 @@ class SoopReviewPlayer(QFrame):
     def reload(self) -> None:
         self.open_player()
         self._dom_loaded = False
+        self._suppress_activate = False
         self.time_label.setText("새로고침 중…")
         self.web_view.reload()
 
