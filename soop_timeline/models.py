@@ -63,3 +63,12 @@ class TimelineDocument:
     text: str
     status: str
     updated_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class TimelineRevision:
+    id: int
+    vod_id: str
+    text: str
+    reason: str
+    created_at: str

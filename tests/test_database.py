@@ -72,6 +72,27 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.list_streamers(enabled_only=True), [])
         self.assertEqual(len(self.database.list_streamers()), 1)
 
+    def test_timeline_revisions_and_analysis_queue_round_trip(self):
+        streamer = self.database.add_streamer("queue-user", "대기열")
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "9901",
+                    "title": "대기 영상",
+                    "url": "https://vod.sooplive.com/player/9901",
+                }
+            ],
+        )
+        self.database.create_timeline_revision("9901", "첫 버전", "테스트")
+        self.database.enqueue_analysis("9901")
+
+        revisions = self.database.list_timeline_revisions("9901")
+        self.assertEqual(revisions[0].text, "첫 버전")
+        self.assertEqual(self.database.recover_analysis_queue(), ["9901"])
+        self.database.remove_analysis_queue("9901")
+        self.assertEqual(self.database.list_analysis_queue(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

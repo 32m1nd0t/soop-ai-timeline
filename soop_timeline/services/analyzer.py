@@ -8,12 +8,21 @@ from typing import Callable
 
 from ..models import Vod
 from ..paths import analysis_data_dir
-from .credentials import get_gemini_api_key
+from .ai_provider import (
+    DEFAULT_AI_PROVIDER,
+    create_ai_provider,
+    normalize_ai_provider,
+    provider_model_setting,
+    provider_spec,
+)
+from .credentials import get_ai_api_key
 from .gemini_timeline import (
+    AITimelineGenerator,
     DEFAULT_TOPIC_GRANULARITY,
     GeneratedTimeline,
     GeminiTimelineGenerator,
     TimelineEntry,
+    create_timeline_generator,
     deduplicate_entries,
 )
 from .transcription import (
@@ -46,6 +55,25 @@ class AnalyzerConfig:
     whisper_device: str = "auto"
     gemini_api_key: str = ""
     topic_granularity: str = DEFAULT_TOPIC_GRANULARITY
+    ai_provider: str = DEFAULT_AI_PROVIDER
+    ai_model: str = ""
+    api_key: str = ""
+
+    @property
+    def selected_provider(self) -> str:
+        return normalize_ai_provider(self.ai_provider)
+
+    @property
+    def selected_model(self) -> str:
+        if self.ai_model.strip():
+            return self.ai_model.strip()
+        if self.selected_provider == "gemini" and self.gemini_model.strip():
+            return self.gemini_model.strip()
+        return provider_spec(self.selected_provider).default_model
+
+    @property
+    def selected_api_key(self) -> str:
+        return self.api_key.strip() or self.gemini_api_key.strip()
 
 
 class TimelineAnalyzer(ABC):
@@ -128,7 +156,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         self,
         config: AnalyzerConfig,
         transcriber_factory: Callable[..., FasterWhisperTranscriber] | None = None,
-        generator_factory: Callable[[str, str], GeminiTimelineGenerator] | None = None,
+        generator_factory: Callable[[str, str], AITimelineGenerator] | None = None,
     ):
         self.config = config
         self._transcriber_factory = transcriber_factory or (
@@ -138,52 +166,101 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             )
         )
         self._generator_factory = generator_factory or (
-            lambda key, model: GeminiTimelineGenerator(
+            lambda key, model: create_timeline_generator(
+                config.selected_provider,
                 key,
                 model,
                 topic_granularity=config.topic_granularity,
             )
         )
+        self.last_usage_summary = ""
 
     @classmethod
     def from_database(cls, database: object) -> "LocalWhisperGeminiAnalyzer":
+        provider = normalize_ai_provider(
+            database.get_setting("ai_provider", DEFAULT_AI_PROVIDER)
+        )
+        default_model = provider_spec(provider).default_model
+        legacy_gemini_model = database.get_setting(
+            "gemini_model",
+            DEFAULT_GEMINI_MODEL,
+        )
+        model_default = legacy_gemini_model if provider == "gemini" else default_model
         return cls(
             AnalyzerConfig(
-                gemini_model=database.get_setting("gemini_model", DEFAULT_GEMINI_MODEL),
+                gemini_model=legacy_gemini_model,
                 whisper_model=database.get_setting("whisper_model", DEFAULT_WHISPER_MODEL),
                 whisper_device=database.get_setting("whisper_device", "auto"),
-                gemini_api_key=get_gemini_api_key(),
+                gemini_api_key=get_ai_api_key("gemini"),
                 topic_granularity=database.get_setting(
                     "topic_granularity",
                     DEFAULT_TOPIC_GRANULARITY,
                 ),
+                ai_provider=provider,
+                ai_model=database.get_setting(
+                    provider_model_setting(provider),
+                    model_default,
+                ),
+                api_key=get_ai_api_key(provider),
             )
         )
 
     @property
     def available(self) -> bool:
-        if not self.config.gemini_api_key:
+        provider = create_ai_provider(
+            self.config.selected_provider,
+            self.config.selected_api_key,
+            self.config.selected_model,
+        )
+        if not provider.available:
             return False
         try:
             import faster_whisper  # noqa: F401
-            from google import genai  # noqa: F401
         except ImportError:
             return False
         return True
 
     @property
     def unavailable_reason(self) -> str:
-        if not self.config.gemini_api_key:
-            return "설정에서 Gemini API 키를 입력하세요."
+        provider = create_ai_provider(
+            self.config.selected_provider,
+            self.config.selected_api_key,
+            self.config.selected_model,
+        )
+        if not provider.available:
+            return provider.unavailable_reason
         try:
             import faster_whisper  # noqa: F401
         except ImportError:
             return "faster-whisper가 설치되지 않았습니다."
-        try:
-            from google import genai  # noqa: F401
-        except ImportError:
-            return "google-genai가 설치되지 않았습니다."
         return ""
+
+    @property
+    def provider_name(self) -> str:
+        return provider_spec(self.config.selected_provider).display_name
+
+    def _new_generator(self) -> AITimelineGenerator:
+        return self._generator_factory(
+            self.config.selected_api_key,
+            self.config.selected_model,
+        )
+
+    def _preflight(
+        self,
+        generator: object,
+        progress: ProgressCallback,
+        cancelled: CancelCallback,
+    ) -> None:
+        test_connection = getattr(generator, "test_connection", None)
+        if not callable(test_connection):
+            return
+        progress(1, f"{self.provider_name} API 연결과 모델 권한을 먼저 확인합니다…")
+        message = str(test_connection(cancelled))
+        progress(2, message)
+
+    def _capture_usage(self, generator: object) -> None:
+        summary = getattr(generator, "usage_summary", None)
+        self.last_usage_summary = str(summary()) if callable(summary) else ""
 
     def initial_document(self, vod: Vod) -> str:
         return f"오늘의 콘텐츠: {vod.title}\n\n"
@@ -198,6 +275,9 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
     ) -> str:
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
+
+        generator = self._new_generator()
+        self._preflight(generator, progress, cancelled)
 
         source_path = Path(media_path)
         cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
@@ -228,9 +308,52 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             if preview is not None:
                 preview("transcript", transcript_preview_document(transcript.segments))
 
-        generator = self._generator_factory(
-            self.config.gemini_api_key,
-            self.config.gemini_model,
+        timeline = generator.generate(
+            vod,
+            transcript,
+            progress,
+            cancelled,
+            preview=preview,
+        )
+        self._capture_usage(generator)
+        suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
+        progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
+        return timeline.to_document()
+
+    def regroup_vod(
+        self,
+        vod: Vod,
+        topic_granularity: str,
+        progress: ProgressCallback,
+        cancelled: CancelCallback,
+        preview: PreviewCallback | None = None,
+    ) -> str:
+        """Regenerate topic boundaries from the cached transcript only."""
+        if not self.available:
+            raise RuntimeError(self.unavailable_reason)
+        cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
+        transcript = load_vod_transcript_cache(
+            cache_path,
+            vod.vod_id,
+            vod.url,
+            self.config.whisper_model,
+        )
+        if transcript is None:
+            raise RuntimeError(
+                "완료된 로컬 자막이 없어 주제를 다시 묶을 수 없습니다. "
+                "먼저 영상 AI 분석을 완료하세요."
+            )
+        generator = create_timeline_generator(
+            self.config.selected_provider,
+            self.config.selected_api_key,
+            self.config.selected_model,
+            topic_granularity=topic_granularity,
+        )
+        self._preflight(generator, progress, cancelled)
+        progress(
+            5,
+            f"저장된 자막 {len(transcript.segments):,}개로 주제 경계를 다시 판정합니다 · "
+            "Whisper는 실행하지 않습니다.",
         )
         timeline = generator.generate(
             vod,
@@ -239,7 +362,9 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             cancelled,
             preview=preview,
         )
-        progress(100, "AI 타임라인 생성이 완료되었습니다.")
+        self._capture_usage(generator)
+        suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
+        progress(100, f"주제 다시 묶기가 완료되었습니다{suffix}.")
         return timeline.to_document()
 
     def analyze_vod(
@@ -252,7 +377,11 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
 
+        generator = self._new_generator()
+        self._preflight(generator, progress, cancelled)
+
         cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
+        partial_path = analysis_data_dir(vod.vod_id) / "transcript.partial.json"
         transcript = load_vod_transcript_cache(
             cache_path,
             vod.vod_id,
@@ -260,6 +389,12 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             self.config.whisper_model,
         )
         if transcript is None:
+            partial = load_vod_transcript_cache(
+                partial_path,
+                vod.vod_id,
+                vod.url,
+                self.config.whisper_model,
+            )
             from .vod_stream import fetch_vod_audio_source
 
             source = fetch_vod_audio_source(vod, progress, cancelled)
@@ -282,6 +417,13 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 progress=transcription_progress,
                 cancelled=cancelled,
                 preview=preview,
+                resume=partial,
+                checkpoint=lambda snapshot: save_vod_transcript_cache(
+                    partial_path,
+                    vod.vod_id,
+                    vod.url,
+                    snapshot,
+                ),
             )
             save_vod_transcript_cache(
                 cache_path,
@@ -289,6 +431,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 vod.url,
                 transcript,
             )
+            partial_path.unlink(missing_ok=True)
         else:
             progress(
                 78,
@@ -302,16 +445,11 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
             raise AnalysisCancelled("분석을 취소했습니다.")
 
-        generator = self._generator_factory(
-            self.config.gemini_api_key,
-            self.config.gemini_model,
-        )
-
         def generation_progress(percent: int, message: str) -> None:
             normalized = max(0, min(29, percent - 70))
             progress(80 + int((normalized / 29) * 19), message)
 
-        progress(80, "Gemini 타임라인 정리를 준비합니다…")
+        progress(80, f"{self.provider_name} 타임라인 정리를 준비합니다…")
         timeline = generator.generate(
             vod,
             transcript,
@@ -319,7 +457,9 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             cancelled,
             preview=preview,
         )
-        progress(100, "AI 타임라인 생성이 완료되었습니다.")
+        self._capture_usage(generator)
+        suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
+        progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
         return timeline.to_document()
 
     def analyze_live(
@@ -340,10 +480,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             self.config.whisper_model,
             self.config.whisper_device,
         )
-        generator = self._generator_factory(
-            self.config.gemini_api_key,
-            self.config.gemini_model,
-        )
+        generator = self._new_generator()
+        self._preflight(generator, progress, stop_requested)
         prompt = (
             f"한국어 인터넷 라이브 방송입니다. 스트리머는 {vod.streamer_name}이고 "
             f"방송 제목은 {vod.title}입니다. 인명과 고유명사를 문맥에 맞게 적으세요."
@@ -393,7 +531,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 return
             progress(
                 0,
-                "라이브 수신을 계속하며 Gemini가 "
+                f"라이브 수신을 계속하며 {self.provider_name}이(가) "
                 f"{format_timestamp(window[0].start)}~"
                 f"{format_timestamp(window[-1].end)} 구간을 정리합니다…",
             )
@@ -408,7 +546,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 next_summary_at = latest_end + LIVE_FIRST_SUMMARY_SECONDS
                 progress(
                     0,
-                    f"실시간 자막은 계속 작성 중 · Gemini 임시 정리 재시도 예정: {error}",
+                    f"실시간 자막은 계속 작성 중 · {self.provider_name} 임시 정리 재시도 예정: {error}",
                 )
                 return
             if partial.content_title:
@@ -440,7 +578,10 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         if not candidates or latest_end > last_summary_end + 10:
             summarize_snapshot(transcript, force=True)
         if not candidates:
-            progress(0, "누적 자막 전체를 Gemini가 최종 타임라인으로 정리합니다…")
+            progress(
+                0,
+                f"누적 자막 전체를 {self.provider_name}이(가) 최종 타임라인으로 정리합니다…",
+            )
             fallback = generator.generate(
                 vod,
                 transcript,
@@ -450,6 +591,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             )
             if preview is not None:
                 preview("live_timeline", fallback.to_document())
+            self._capture_usage(generator)
             return fallback.to_document()
 
         progress(0, "라이브 타임라인의 중복과 전체 제목을 최종 정리합니다…")
@@ -462,8 +604,13 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         )
         if preview is not None:
             preview("live_timeline", final.to_document())
-        progress(100, "라이브 타임라인 생성이 완료되었습니다.")
+        self._capture_usage(generator)
+        suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
+        progress(100, f"라이브 타임라인 생성이 완료되었습니다{suffix}.")
         return final.to_document()
+
+
+LocalWhisperAIAnalyzer = LocalWhisperGeminiAnalyzer
 
 
 def _save_live_transcript_snapshot(

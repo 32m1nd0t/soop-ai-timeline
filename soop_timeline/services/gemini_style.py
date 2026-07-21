@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-import json
 import re
-import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .credentials import get_gemini_api_key
+from .ai_provider import (
+    DEFAULT_AI_PROVIDER,
+    GEMINI_PROVIDER,
+    StructuredAIProvider,
+    create_ai_provider,
+    normalize_ai_provider,
+    provider_model_setting,
+    provider_spec,
+)
+from .credentials import get_ai_api_key
 from .transcription import AnalysisCancelled
 
 
@@ -85,7 +92,7 @@ class ParsedTimelineDocument:
         replacements: dict[str, str] = {}
         raw_entries = payload.get("entries", [])
         if not isinstance(raw_entries, list):
-            raise RuntimeError("Gemini 문체 교정 응답에 항목 목록이 없습니다.")
+            raise RuntimeError("AI 문체 교정 응답에 항목 목록이 없습니다.")
 
         for raw in raw_entries:
             if not isinstance(raw, dict):
@@ -99,7 +106,7 @@ class ParsedTimelineDocument:
         missing = expected_ids - replacements.keys()
         if missing:
             raise RuntimeError(
-                f"Gemini가 타임라인 {len(missing)}개 항목을 누락해 원문을 유지했습니다."
+                f"AI가 타임라인 {len(missing)}개 항목을 누락해 원문을 유지했습니다."
             )
 
         result = list(self.lines)
@@ -189,37 +196,42 @@ def build_style_prompt(parsed: ParsedTimelineDocument) -> str:
 """.strip()
 
 
-class GeminiTimelineStyler:
-    def __init__(self, api_key: str, model_name: str = DEFAULT_GEMINI_STYLE_MODEL):
-        self.api_key = api_key.strip()
-        self.model_name = model_name.strip() or DEFAULT_GEMINI_STYLE_MODEL
+class AITimelineStyler:
+    def __init__(self, provider: StructuredAIProvider):
+        self.provider = provider
 
     @classmethod
-    def from_database(cls, database: object) -> "GeminiTimelineStyler":
-        return cls(
-            get_gemini_api_key(),
-            database.get_setting("gemini_model", DEFAULT_GEMINI_STYLE_MODEL),
+    def from_database(cls, database: object) -> "AITimelineStyler":
+        provider = normalize_ai_provider(
+            database.get_setting("ai_provider", DEFAULT_AI_PROVIDER)
         )
+        default_model = provider_spec(provider).default_model
+        if provider == GEMINI_PROVIDER:
+            default_model = database.get_setting(
+                "gemini_model",
+                DEFAULT_GEMINI_STYLE_MODEL,
+            )
+        model = database.get_setting(
+            provider_model_setting(provider),
+            default_model,
+        )
+        return cls(create_ai_provider(provider, get_ai_api_key(provider), model))
+
+    @property
+    def api_key(self) -> str:
+        return self.provider.api_key
+
+    @property
+    def model_name(self) -> str:
+        return self.provider.model_name
 
     @property
     def available(self) -> bool:
-        if not self.api_key:
-            return False
-        try:
-            from google import genai  # noqa: F401
-        except ImportError:
-            return False
-        return True
+        return self.provider.available
 
     @property
     def unavailable_reason(self) -> str:
-        if not self.api_key:
-            return "설정에서 Gemini API 키를 입력하세요."
-        try:
-            from google import genai  # noqa: F401
-        except ImportError:
-            return "google-genai가 설치되지 않았습니다."
-        return ""
+        return self.provider.unavailable_reason
 
     def restyle(
         self,
@@ -235,13 +247,7 @@ class GeminiTimelineStyler:
         if is_cancelled():
             raise AnalysisCancelled("문체 교정을 취소했습니다.")
 
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self.api_key)
         payload = self._request_json(
-            client,
-            types,
             build_style_prompt(parsed),
             is_cancelled,
         )
@@ -251,37 +257,30 @@ class GeminiTimelineStyler:
 
     def _request_json(
         self,
-        client: object,
-        types: object,
         prompt: str,
         cancelled: Callable[[], bool],
     ) -> dict[str, object]:
-        last_error: Exception | None = None
-        for attempt in range(3):
-            if cancelled():
-                raise AnalysisCancelled("문체 교정을 취소했습니다.")
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    response_schema=STYLE_SCHEMA,
-                )
-                response = client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=config,
-                )
-                text = str(getattr(response, "text", "") or "").strip()
-                if not text:
-                    raise RuntimeError("Gemini가 빈 응답을 반환했습니다.")
-                payload = json.loads(text)
-                if not isinstance(payload, dict):
-                    raise RuntimeError("Gemini 문체 교정 응답 형식이 올바르지 않습니다.")
-                return payload
-            except AnalysisCancelled:
-                raise
-            except Exception as error:
-                last_error = error
-                if attempt < 2:
-                    time.sleep(2**attempt)
-        raise RuntimeError(f"Gemini 문체 교정에 실패했습니다: {last_error}") from last_error
+        return self.provider.request_json(
+            prompt,
+            STYLE_SCHEMA,
+            cancelled,
+            purpose="timeline_style",
+        )
+
+    def usage_summary(self) -> str:
+        return self.provider.usage.summary(self.provider.provider_id)
+
+
+class GeminiTimelineStyler(AITimelineStyler):
+    """Backward-compatible Gemini wrapper."""
+
+    def __init__(self, api_key: str, model_name: str = DEFAULT_GEMINI_STYLE_MODEL):
+        super().__init__(create_ai_provider(GEMINI_PROVIDER, api_key, model_name))
+
+
+def create_timeline_styler(
+    provider: str,
+    api_key: str,
+    model_name: str,
+) -> AITimelineStyler:
+    return AITimelineStyler(create_ai_provider(provider, api_key, model_name))

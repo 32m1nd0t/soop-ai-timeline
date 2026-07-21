@@ -1,0 +1,5 @@
+{
+  "continue_same_story": [12, 425],
+  "return_after_other_topic": [0, 296, 728],
+  "brief_detour_ignored": [32, 905]
+}

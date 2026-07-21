@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import json
-import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Iterable
 
 from ..models import Vod
+from .ai_provider import (
+    GEMINI_PROVIDER,
+    StructuredAIProvider,
+    create_ai_provider,
+)
 from .eta import EtaEstimator, format_eta
 from .gemini_style import DRY_TIMELINE_STYLE_GUIDE
 from .transcription import (
@@ -29,6 +32,8 @@ class TimelineEntry:
     segment_id: str
     start: float
     summary: str
+    topic_key: str = ""
+    decision: str = "new"
 
 
 @dataclass(slots=True)
@@ -59,12 +64,21 @@ TIMELINE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "segment_id": {"type": "string"},
+                    "decision": {
+                        "type": "string",
+                        "enum": ["continue", "new", "return"],
+                        "description": "직전 주제 계속, 새 주제 시작, 이전 주제 복귀 판정",
+                    },
+                    "topic_key": {
+                        "type": "string",
+                        "description": "같은 주제를 식별하는 짧고 안정적인 핵심어",
+                    },
                     "summary": {
                         "type": "string",
                         "description": "합니다/입니다체가 아닌 간결한 제목형·메모체 요약",
                     },
                 },
-                "required": ["segment_id", "summary"],
+                "required": ["segment_id", "decision", "topic_key", "summary"],
             },
         },
     },
@@ -72,16 +86,32 @@ TIMELINE_SCHEMA = {
 }
 
 
-class GeminiTimelineGenerator:
+class AITimelineGenerator:
     def __init__(
         self,
-        api_key: str,
-        model_name: str = "gemini-3.5-flash",
+        provider: StructuredAIProvider,
         topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
     ):
-        self.api_key = api_key.strip()
-        self.model_name = model_name.strip() or "gemini-3.5-flash"
+        self.provider = provider
         self.topic_granularity = normalize_topic_granularity(topic_granularity)
+
+    @property
+    def api_key(self) -> str:
+        return self.provider.api_key
+
+    @property
+    def model_name(self) -> str:
+        return self.provider.model_name
+
+    @property
+    def provider_name(self) -> str:
+        return self.provider.display_name
+
+    def test_connection(self, cancelled: CancelCallback | None = None) -> str:
+        return self.provider.test_connection(cancelled)
+
+    def usage_summary(self) -> str:
+        return self.provider.usage.summary(self.provider.provider_id)
 
     def generate(
         self,
@@ -91,17 +121,8 @@ class GeminiTimelineGenerator:
         cancelled: CancelCallback,
         preview: PreviewCallback | None = None,
     ) -> GeneratedTimeline:
-        if not self.api_key:
-            raise RuntimeError("Gemini API 키를 먼저 설정하세요.")
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as error:
-            raise RuntimeError(
-                "Gemini API 모듈(google-genai)이 설치되지 않았습니다."
-            ) from error
-
-        client = genai.Client(api_key=self.api_key)
+        if not self.provider.available:
+            raise RuntimeError(self.provider.unavailable_reason)
         windows = split_transcript(transcript.segments)
         candidates: list[TimelineEntry] = []
         titles: list[str] = []
@@ -116,7 +137,7 @@ class GeminiTimelineGenerator:
             percent = 70 + int((index / max(1, len(windows))) * 20)
             progress(
                 percent,
-                f"Gemini가 {start_label}~{end_label} 구간의 대화 주제를 정리합니다… · "
+                f"{self.provider_name}이(가) {start_label}~{end_label} 구간의 대화 주제를 정리합니다… · "
                 f"{format_eta(eta.remaining_seconds(index))}",
             )
             prompt = build_chunk_prompt(
@@ -125,7 +146,7 @@ class GeminiTimelineGenerator:
                 previous_entries=deduplicate_entries(candidates)[-8:],
                 granularity=self.topic_granularity,
             )
-            payload = self._request_json(client, types, prompt, cancelled)
+            payload = self._request_json(prompt, cancelled)
             title = str(payload.get("content_title", "")).strip()
             if title:
                 titles.append(title)
@@ -143,13 +164,15 @@ class GeminiTimelineGenerator:
                 )
             progress(
                 70 + int((completed / max(1, len(windows))) * 20),
-                f"Gemini 임시 타임라인 {completed}/{len(windows)} 구간 완료 · "
+                f"{self.provider_name} 임시 타임라인 {completed}/{len(windows)} 구간 완료 · "
                 f"{format_eta(eta.remaining_seconds(completed))}",
             )
 
         candidates = deduplicate_entries(candidates)
         if not candidates:
-            raise RuntimeError("Gemini가 유효한 타임라인 항목을 만들지 못했습니다.")
+            raise RuntimeError(
+                f"{self.provider_name}이(가) 유효한 타임라인 항목을 만들지 못했습니다."
+            )
 
         if cancelled():
             raise AnalysisCancelled("분석을 취소했습니다.")
@@ -165,7 +188,7 @@ class GeminiTimelineGenerator:
             transcript.segments,
             granularity=self.topic_granularity,
         )
-        final_payload = self._request_json(client, types, final_prompt, cancelled)
+        final_payload = self._request_json(final_prompt, cancelled)
         final_entries = entries_from_payload(final_payload, segment_lookup)
         final_entries = deduplicate_entries(final_entries) or candidates
         content_title = str(final_payload.get("content_title", "")).strip()
@@ -190,17 +213,11 @@ class GeminiTimelineGenerator:
         cancelled: CancelCallback,
         previous_entries: list[TimelineEntry] | None = None,
     ) -> GeneratedTimeline:
-        if not self.api_key:
-            raise RuntimeError("Gemini API 키를 먼저 설정하세요.")
+        if not self.provider.available:
+            raise RuntimeError(self.provider.unavailable_reason)
         if not segments:
             return GeneratedTimeline(vod.title, [])
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self.api_key)
         payload = self._request_json(
-            client,
-            types,
             build_chunk_prompt(
                 vod,
                 segments,
@@ -226,14 +243,10 @@ class GeminiTimelineGenerator:
     ) -> GeneratedTimeline:
         candidates = deduplicate_entries(entries)
         if not candidates:
-            raise RuntimeError("Gemini가 유효한 라이브 타임라인 항목을 만들지 못했습니다.")
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self.api_key)
+            raise RuntimeError(
+                f"{self.provider_name}이(가) 유효한 라이브 타임라인 항목을 만들지 못했습니다."
+            )
         payload = self._request_json(
-            client,
-            types,
             build_final_prompt(
                 vod,
                 titles,
@@ -251,36 +264,44 @@ class GeminiTimelineGenerator:
             entries=final_entries or candidates,
         )
 
-    def _request_json(self, client: object, types: object, prompt: str, cancelled: CancelCallback) -> dict[str, object]:
-        last_error: Exception | None = None
-        for attempt in range(3):
-            if cancelled():
-                raise AnalysisCancelled("분석을 취소했습니다.")
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                    response_schema=TIMELINE_SCHEMA,
-                )
-                response = client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=config,
-                )
-                text = str(getattr(response, "text", "") or "").strip()
-                if not text:
-                    raise RuntimeError("Gemini가 빈 응답을 반환했습니다.")
-                payload = json.loads(text)
-                if not isinstance(payload, dict):
-                    raise RuntimeError("Gemini 응답 형식이 올바르지 않습니다.")
-                return payload
-            except AnalysisCancelled:
-                raise
-            except Exception as error:
-                last_error = error
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-        raise RuntimeError(f"Gemini 요청에 실패했습니다: {last_error}") from last_error
+    def _request_json(
+        self,
+        prompt: str,
+        cancelled: CancelCallback,
+    ) -> dict[str, object]:
+        return self.provider.request_json(
+            prompt,
+            TIMELINE_SCHEMA,
+            cancelled,
+            purpose="timeline",
+        )
+
+
+class GeminiTimelineGenerator(AITimelineGenerator):
+    """Backward-compatible Gemini wrapper used by existing integrations/tests."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gemini-3.5-flash",
+        topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
+    ):
+        super().__init__(
+            create_ai_provider(GEMINI_PROVIDER, api_key, model_name),
+            topic_granularity,
+        )
+
+
+def create_timeline_generator(
+    provider: str,
+    api_key: str,
+    model_name: str,
+    topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
+) -> AITimelineGenerator:
+    return AITimelineGenerator(
+        create_ai_provider(provider, api_key, model_name),
+        topic_granularity,
+    )
 
 
 def split_transcript(
@@ -321,7 +342,8 @@ def build_chunk_prompt(
     )
     prior = deduplicate_entries(previous_entries or [])[-8:]
     previous_topic_text = "\n".join(
-        f"- {format_timestamp(entry.start)} {entry.summary}" for entry in prior
+        f"- {format_timestamp(entry.start)} [{entry.topic_key or entry.summary}] {entry.summary}"
+        for entry in prior
     ) or "- 없음"
     media_label = "라이브 방송" if vod.source_kind == "live" else "다시보기"
     return f"""
@@ -349,9 +371,15 @@ def build_chunk_prompt(
 - 서로 무관한 대화가 사이에 이어진 뒤 예전 주제로 돌아온 경우에는 `복귀` 성격의 새 항목을 만들 수 있습니다.
 - 주제 시작이 확실하지 않으면 성급히 쪼개지 말고 앞 주제에 포함합니다.
 
+판정 상태:
+- `continue`: 직전 주제가 그대로 이어짐. 첫 현재 segment_id와 기존 topic_key를 반환하되 프로그램은 새 줄을 만들지 않습니다.
+- `new`: 이전과 다른 주제가 실제로 시작됨. 새 topic_key와 시작 segment_id를 반환합니다.
+- `return`: 사이에 다른 주제가 이어진 뒤 과거 주제로 복귀함. 과거와 같은 topic_key를 사용하고 복귀 시작 segment_id를 반환합니다.
+
 출력 규칙:
 - segment_id는 반드시 아래 `이번 자막`에 실제로 존재하는 값만 사용합니다. 직전 주제의 ID는 반환하지 않습니다.
 - 각 항목에는 그 주제가 처음 시작되는 발화의 segment_id를 사용합니다.
+- topic_key는 같은 주제라면 창이 달라도 같은 짧은 핵심어를 사용합니다.
 - 시간은 만들지 않습니다. 프로그램이 segment_id의 원래 시간을 사용합니다.
 - 요약은 댓글에 바로 붙일 수 있는 구체적인 한국어 한 줄로 작성합니다.
 - 스트리머가 말하지 않은 사실을 추측하지 않습니다.
@@ -373,7 +401,8 @@ def build_final_prompt(
     granularity: str = DEFAULT_TOPIC_GRANULARITY,
 ) -> str:
     candidate_text = "\n".join(
-        f"{entry.segment_id} | {format_timestamp(entry.start)} | {entry.summary}"
+        f"{entry.segment_id} | {format_timestamp(entry.start)} | "
+        f"{entry.decision} | {entry.topic_key or entry.summary} | {entry.summary}"
         for entry in entries
     )
     evidence_text = build_candidate_evidence(entries, segments or [])
@@ -391,6 +420,8 @@ def build_final_prompt(
 
 규칙:
 - segment_id는 후보에 실제로 존재하는 값만 그대로 사용합니다.
+- 최종 entries의 decision은 새 주제면 `new`, 과거 주제 복귀면 `return`으로 작성하고, 연속 주제 후보는 병합하여 제외합니다.
+- 같은 주제는 동일한 topic_key를 유지합니다.
 - 같은 중심 질문이나 활동이 연속되는 동안 나온 배경·추억·사례·이유·장단점·반응 후보는 한 주제로 병합합니다.
 - 병합할 때는 해당 주제가 처음 시작된 가장 이른 후보의 segment_id를 사용합니다.
 - 시간 간격이나 후보 문장의 단어 차이만으로 새 주제라고 판단하지 않습니다.
@@ -472,15 +503,19 @@ def entries_from_payload(
         if not isinstance(raw, dict):
             continue
         segment_id = str(raw.get("segment_id", "")).strip()
+        decision = normalize_topic_decision(str(raw.get("decision", "new")))
+        topic_key = " ".join(str(raw.get("topic_key", "")).split())
         summary = " ".join(str(raw.get("summary", "")).split())
         segment = segment_lookup.get(segment_id)
-        if segment is None or not summary:
+        if segment is None or not summary or decision == "continue":
             continue
         result.append(
             TimelineEntry(
                 segment_id=segment_id,
                 start=segment.start,
                 summary=summary,
+                topic_key=topic_key or summary,
+                decision=decision,
             )
         )
     return result
@@ -493,6 +528,13 @@ def deduplicate_entries(entries: list[TimelineEntry]) -> list[TimelineEntry]:
     for entry in ordered:
         if entry.segment_id in seen_ids:
             continue
+        if result and entry.topic_key and result[-1].topic_key:
+            if (
+                entry.topic_key == result[-1].topic_key
+                and entry.decision != "return"
+                and entry.start - result[-1].start <= 30 * 60
+            ):
+                continue
         if result and entry.start - result[-1].start <= 180:
             similarity = SequenceMatcher(
                 None,
@@ -508,3 +550,8 @@ def deduplicate_entries(entries: list[TimelineEntry]) -> list[TimelineEntry]:
 
 def normalize_summary(value: str) -> str:
     return "".join(character for character in value.lower() if character.isalnum())
+
+
+def normalize_topic_decision(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"continue", "new", "return"} else "new"

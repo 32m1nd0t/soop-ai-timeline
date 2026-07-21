@@ -5,7 +5,11 @@ from soop_timeline.services.timeline_timestamp import (
     parse_timestamp,
     timestamp_at_position,
 )
-from soop_timeline.ui.review_player import build_player_url, build_seek_script
+from soop_timeline.ui.review_player import (
+    build_player_action_script,
+    build_player_url,
+    build_seek_script,
+)
 
 
 class TimelineTimestampTests(unittest.TestCase):
@@ -49,6 +53,10 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("autoPlay=true", url)
         self.assertIn("mutePlay=true", url)
         self.assertIn("showChat=false", url)
+
+    def test_player_action_scripts_support_position_and_relative_seek(self):
+        self.assertIn("currentTime", build_player_action_script("position"))
+        self.assertIn("+ -10", build_player_action_script("relative", -10))
 
 
 if __name__ == "__main__":

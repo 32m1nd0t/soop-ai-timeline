@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soop-timeline"
-version = "0.2.0"
+version = "0.3.0"
 description = "SOOP VOD timeline review desktop app"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "anthropic>=0.79,<1",
     "faster-whisper>=1.1,<2",
     "google-genai>=1.0,<2",
     "keyring>=25,<27",
+    "openai>=2.20,<3",
     "PySide6>=6.8,<7",
     "qtwebview2==0.4.1; platform_system == 'Windows'",
 ]

@@ -222,6 +222,66 @@ class VodStreamTests(unittest.TestCase):
                 )
             )
 
+    def test_stream_transcription_resumes_from_checkpoint(self):
+        chunks = [
+            AudioChunk(1, 85, bytes(20 * 16_000 * 2)),
+            AudioChunk(1, 100, bytes(20 * 16_000 * 2)),
+        ]
+
+        class FakePipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def transcribe(self, audio, **kwargs):
+                del audio, kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    raw = [
+                        SimpleNamespace(start=1, end=2, text="이미 처리됨"),
+                        SimpleNamespace(start=16, end=17, text="재개 발화"),
+                    ]
+                else:
+                    raw = [SimpleNamespace(start=10, end=11, text="마지막 발화")]
+                return iter(raw), SimpleNamespace(language="ko")
+
+        backend = _WhisperBackend(
+            runtime=WhisperRuntime("cuda", "float16", "테스트 GPU"),
+            model=object(),
+            batched_pipeline=FakePipeline(),
+        )
+        source = VodAudioSource(
+            "123",
+            120,
+            (VodAudioPart(1, 120, "https://vod-a.sooplive.com/audio.m3u8"),),
+        )
+        resume = Transcript(
+            model="large-v3-turbo",
+            language="ko",
+            duration_seconds=100,
+            segments=[TranscriptSegment("s000000", 90, 100, "기존 발화")],
+        )
+        checkpoints = []
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
+        with patch.object(transcriber, "_prepare_backend", return_value=backend), patch(
+            "soop_timeline.services.vod_stream.iter_audio_chunks",
+            return_value=iter(chunks),
+        ) as iterator:
+            result = transcriber.transcribe_stream(
+                source,
+                initial_prompt="테스트",
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+                resume=resume,
+                checkpoint=checkpoints.append,
+            )
+
+        self.assertEqual(
+            [segment.text for segment in result.segments],
+            ["기존 발화", "재개 발화", "마지막 발화"],
+        )
+        self.assertEqual(iterator.call_args.kwargs["start_seconds"], 85)
+        self.assertGreaterEqual(len(checkpoints), 1)
+
     def test_live_transcription_keeps_broadcast_runtime_timestamps(self):
         chunks = [
             AudioChunk(1, 3_600, bytes(15 * 16_000 * 2)),

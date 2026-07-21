@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -24,6 +25,10 @@ LIVE_INFO_URL = "https://live.sooplive.com/afreeca/player_live_api.php"
 LIVE_ORIGIN = "https://play.sooplive.com"
 DEFAULT_LIVE_CHUNK_SECONDS = 15
 DEFAULT_LIVE_OVERLAP_SECONDS = 2
+MAX_LIVE_RECONNECT_ATTEMPTS = 6
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -173,59 +178,122 @@ def iter_live_audio_chunks(
         "reconnect_delay_max": "5",
         "live_start_index": "-1",
     }
-    try:
-        with av.open(source.stream_url, options=options) as container:
-            audio_streams = [stream for stream in container.streams if stream.type == "audio"]
-            if not audio_streams:
-                raise RuntimeError("라이브 방송의 오디오 트랙을 찾지 못했습니다.")
-            stream = audio_streams[0]
-            resampler = av.AudioResampler(
-                format="s16",
-                layout="mono",
-                rate=WHISPER_SAMPLE_RATE,
-            )
-            for packet in container.demux(stream):
-                if stop_requested():
-                    break
-                for frame in packet.decode():
-                    for converted in _resampled_frames(resampler.resample(frame)):
-                        buffer.extend(_audio_frame_to_s16(converted))
-                        while len(buffer) >= target_bytes:
-                            yield AudioChunk(
-                                part_order=1,
-                                start_seconds=(
-                                    source.runtime_seconds
-                                    + local_start_samples / WHISPER_SAMPLE_RATE
-                                ),
-                                pcm_s16=bytes(buffer[:target_bytes]),
-                            )
-                            emitted = True
-                            del buffer[:advance_bytes]
-                            local_start_samples += advance_bytes // 2
-                            if stop_requested():
-                                break
+    stream_url = source.stream_url
+    timeline_base = source.runtime_seconds
+    reconnect_attempt = 0
+    while not stop_requested():
+        try:
+            with av.open(stream_url, options=options) as container:
+                audio_streams = [
+                    stream for stream in container.streams if stream.type == "audio"
+                ]
+                if not audio_streams:
+                    raise RuntimeError("라이브 방송의 오디오 트랙을 찾지 못했습니다.")
+                stream = audio_streams[0]
+                resampler = av.AudioResampler(
+                    format="s16",
+                    layout="mono",
+                    rate=WHISPER_SAMPLE_RATE,
+                )
+                received_frame = False
+                for packet in container.demux(stream):
                     if stop_requested():
                         break
-                if stop_requested():
+                    for frame in packet.decode():
+                        received_frame = True
+                        reconnect_attempt = 0
+                        for converted in _resampled_frames(resampler.resample(frame)):
+                            buffer.extend(_audio_frame_to_s16(converted))
+                            while len(buffer) >= target_bytes:
+                                yield AudioChunk(
+                                    part_order=1,
+                                    start_seconds=(
+                                        timeline_base
+                                        + local_start_samples / WHISPER_SAMPLE_RATE
+                                    ),
+                                    pcm_s16=bytes(buffer[:target_bytes]),
+                                )
+                                emitted = True
+                                del buffer[:advance_bytes]
+                                local_start_samples += advance_bytes // 2
+                                if stop_requested():
+                                    break
+                        if stop_requested():
+                            break
+                    if stop_requested():
+                        break
+                for converted in _resampled_frames(resampler.resample(None)):
+                    buffer.extend(_audio_frame_to_s16(converted))
+                if stop_requested() or received_frame:
+                    # A clean HLS EOF normally means the broadcast ended.
                     break
-            for converted in _resampled_frames(resampler.resample(None)):
-                buffer.extend(_audio_frame_to_s16(converted))
-    except RuntimeError:
-        raise
-    except Exception as error:
-        if stop_requested():
-            return
-        raise RuntimeError("SOOP 라이브 오디오 연결이 끊겼습니다.") from error
+                raise RuntimeError("라이브 스트림이 응답 없이 종료되었습니다.")
+        except Exception as error:
+            if stop_requested():
+                break
+            if len(buffer) >= WHISPER_SAMPLE_RATE * 2:
+                pending_bytes = bytes(buffer)
+                yield AudioChunk(
+                    part_order=1,
+                    start_seconds=(
+                        timeline_base
+                        + local_start_samples / WHISPER_SAMPLE_RATE
+                    ),
+                    pcm_s16=pending_bytes,
+                )
+                emitted = True
+                local_start_samples += len(pending_bytes) // 2
+                buffer.clear()
+            elif buffer:
+                local_start_samples += len(buffer) // 2
+                buffer.clear()
+            reconnect_attempt += 1
+            if reconnect_attempt > MAX_LIVE_RECONNECT_ATTEMPTS:
+                raise RuntimeError(
+                    "SOOP 라이브 오디오 연결이 반복해서 끊겨 자동 복구하지 못했습니다."
+                ) from error
+
+            delay = min(16.0, float(2 ** (reconnect_attempt - 1)))
+            logger.warning(
+                "Live stream disconnected; reconnecting attempt=%s delay=%s: %s",
+                reconnect_attempt,
+                delay,
+                error,
+            )
+            _interruptible_wait(delay, stop_requested)
+            if stop_requested():
+                break
+            try:
+                refreshed = fetch_live_audio_source(
+                    source.channel_id,
+                    source.broadcast_no,
+                    source.page_url,
+                    stop_requested,
+                )
+                stream_url = refreshed.stream_url
+                captured_seconds = local_start_samples / WHISPER_SAMPLE_RATE
+                timeline_base = max(
+                    timeline_base,
+                    refreshed.runtime_seconds - captured_seconds,
+                )
+            except Exception as refresh_error:
+                logger.warning("Live stream URL refresh failed: %s", refresh_error)
 
     minimum_final_bytes = overlap_bytes if emitted else WHISPER_SAMPLE_RATE * 2
     if len(buffer) > minimum_final_bytes:
         yield AudioChunk(
             part_order=1,
             start_seconds=(
-                source.runtime_seconds + local_start_samples / WHISPER_SAMPLE_RATE
+                timeline_base + local_start_samples / WHISPER_SAMPLE_RATE
             ),
             pcm_s16=bytes(buffer),
         )
+
+
+def _interruptible_wait(seconds: float, stop_requested: CancelCallback) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline and not stop_requested():
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
 def _request_live_info(

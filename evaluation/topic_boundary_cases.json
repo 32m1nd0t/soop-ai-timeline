@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "id": "continue_same_story",
+      "description": "같은 질문의 배경과 사례는 하나의 주제로 유지",
+      "expected_seconds": [10, 420],
+      "segments": [
+        {"start": 10, "text": "어제 이상한 꿈을 꿨는데"},
+        {"start": 90, "text": "꿈에 시청자가 나왔던 이유를 설명"},
+        {"start": 220, "text": "그 꿈에서 있었던 구체적인 장면"},
+        {"start": 420, "text": "이제 오늘 할 게임을 고르자"}
+      ]
+    },
+    {
+      "id": "return_after_other_topic",
+      "description": "다른 주제가 이어진 뒤 과거 주제로 돌아오면 복귀 경계 유지",
+      "expected_seconds": [0, 300, 720],
+      "segments": [
+        {"start": 0, "text": "여행지 선택 이야기"},
+        {"start": 300, "text": "새 장비 배송 상태 확인"},
+        {"start": 720, "text": "아까 여행 이야기로 돌아가서 숙소를 고르자"}
+      ]
+    },
+    {
+      "id": "brief_detour_ignored",
+      "description": "짧은 곁가지는 독립 경계로 만들지 않음",
+      "expected_seconds": [30, 900],
+      "segments": [
+        {"start": 30, "text": "레이드 공략 시작"},
+        {"start": 400, "text": "잠깐 날씨가 덥다는 이야기"},
+        {"start": 430, "text": "다시 레이드 패턴 설명"},
+        {"start": 900, "text": "레이드 종료 후 공지 시작"}
+      ]
+    }
+  ]
+}

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .models import Streamer, TimelineDocument, Vod, VodState
+from .models import Streamer, TimelineDocument, TimelineRevision, Vod, VodState
 
 
 def utc_now() -> str:
@@ -62,6 +62,28 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS timeline_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vod_id TEXT NOT NULL REFERENCES vods(vod_id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_timeline_revisions_vod
+            ON timeline_revisions(vod_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS analysis_queue (
+                vod_id TEXT PRIMARY KEY REFERENCES vods(vod_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                enqueued_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_queue_position
+            ON analysis_queue(position);
             """
         )
         vod_columns = {
@@ -347,6 +369,131 @@ class Database:
             status=row["status"],
             updated_at=row["updated_at"],
         )
+
+    def create_timeline_revision(
+        self,
+        vod_id: str,
+        text: str,
+        reason: str,
+        *,
+        keep: int = 50,
+    ) -> int | None:
+        if not text.strip():
+            return None
+        latest = self.connection.execute(
+            "SELECT id, text FROM timeline_revisions WHERE vod_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (vod_id,),
+        ).fetchone()
+        if latest is not None and str(latest["text"]) == text:
+            return int(latest["id"])
+        cursor = self.connection.execute(
+            """
+            INSERT INTO timeline_revisions(vod_id, text, reason, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (vod_id, text, reason.strip() or "수동 저장", utc_now()),
+        )
+        if keep > 0:
+            self.connection.execute(
+                """
+                DELETE FROM timeline_revisions
+                WHERE vod_id = ? AND id NOT IN (
+                    SELECT id FROM timeline_revisions
+                    WHERE vod_id = ? ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (vod_id, vod_id, keep),
+            )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def list_timeline_revisions(self, vod_id: str) -> list[TimelineRevision]:
+        rows = self.connection.execute(
+            "SELECT * FROM timeline_revisions WHERE vod_id = ? ORDER BY id DESC",
+            (vod_id,),
+        ).fetchall()
+        return [
+            TimelineRevision(
+                id=int(row["id"]),
+                vod_id=str(row["vod_id"]),
+                text=str(row["text"]),
+                reason=str(row["reason"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def get_timeline_revision(self, revision_id: int) -> TimelineRevision | None:
+        row = self.connection.execute(
+            "SELECT * FROM timeline_revisions WHERE id = ?",
+            (revision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TimelineRevision(
+            id=int(row["id"]),
+            vod_id=str(row["vod_id"]),
+            text=str(row["text"]),
+            reason=str(row["reason"]),
+            created_at=str(row["created_at"]),
+        )
+
+    def enqueue_analysis(self, vod_id: str, status: str = "queued") -> None:
+        now = utc_now()
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 AS next_position FROM analysis_queue"
+        ).fetchone()
+        position = int(row["next_position"] if row is not None else 1)
+        self.connection.execute(
+            """
+            INSERT INTO analysis_queue(vod_id, position, status, enqueued_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(vod_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (vod_id, position, status, now, now),
+        )
+        self.connection.commit()
+
+    def mark_analysis_running(self, vod_id: str) -> None:
+        self.enqueue_analysis(vod_id, "running")
+
+    def remove_analysis_queue(self, vod_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM analysis_queue WHERE vod_id = ?",
+            (vod_id,),
+        )
+        self.connection.commit()
+
+    def clear_analysis_queue(self) -> None:
+        self.connection.execute("DELETE FROM analysis_queue")
+        self.connection.commit()
+
+    def list_analysis_queue(self) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT vod_id FROM analysis_queue ORDER BY position, enqueued_at"
+        ).fetchall()
+        return [str(row["vod_id"]) for row in rows]
+
+    def recover_analysis_queue(self) -> list[str]:
+        pending = self.list_analysis_queue()
+        if not pending:
+            return []
+        placeholders = ",".join("?" for _ in pending)
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                "UPDATE analysis_queue SET status = 'queued', updated_at = ?",
+                (now,),
+            )
+            self.connection.execute(
+                f"UPDATE vods SET state = ?, updated_at = ? "
+                f"WHERE vod_id IN ({placeholders})",
+                (VodState.QUEUED.value, now, *pending),
+            )
+        return pending
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.connection.execute(

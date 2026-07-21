@@ -1,0 +1,75 @@
+name: Build and release Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install application and build dependencies
+        shell: pwsh
+        run: python -m pip install -e ".[build,gpu-windows]"
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify tag and application versions
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $appVersion = python -c "from soop_timeline import __version__; print(__version__)"
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          if ($appVersion.Trim() -ne $tagVersion) {
+            throw "태그 버전 $tagVersion 과 앱 버전 $appVersion 이 다릅니다."
+          }
+
+      - name: Build EXE and update manifest
+        shell: pwsh
+        env:
+          SOOP_TIMELINE_DOWNLOAD_URL: ${{ startsWith(github.ref, 'refs/tags/') && format('https://github.com/32m1nd0t/soop-ai-timeline/releases/download/{0}/SOOPTimeline.exe', github.ref_name) || '' }}
+          SOOP_TIMELINE_RELEASE_NOTES: ${{ startsWith(github.ref, 'refs/tags/') && format('SOOP AI 타임라인 {0}', github.ref_name) || '수동 빌드' }}
+        run: .\build_exe.ps1
+
+      - name: Smoke-test packaged app
+        shell: pwsh
+        run: .\dist\SOOPTimeline.exe --smoke-test
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SOOPTimeline-Windows
+          path: |
+            dist/SOOPTimeline.exe
+            dist/update.json
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/SOOPTimeline.exe" `
+            "dist/update.json" `
+            --title "SOOP AI 타임라인 ${{ github.ref_name }}" `
+            --generate-notes

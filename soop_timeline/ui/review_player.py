@@ -93,10 +93,40 @@ try {{
 """.strip()
 
 
+def build_player_action_script(action: str, value: int = 0) -> str:
+    safe_action = action if action in {"position", "toggle", "relative"} else "position"
+    amount = int(value)
+    return f"""
+const video = document.querySelector('video#video')
+    || document.querySelector('#video video')
+    || document.querySelector('video');
+if (!video) {{
+    return {{ ok: false, reason: 'video-not-found' }};
+}}
+const action = {safe_action!r};
+if (action === 'toggle') {{
+    if (video.paused) {{ try {{ await video.play(); }} catch (_) {{}} }}
+    else {{ video.pause(); }}
+}} else if (action === 'relative') {{
+    const duration = Number(video.duration);
+    const target = Math.max(0, Number(video.currentTime || 0) + {amount});
+    video.currentTime = Number.isFinite(duration) && duration > 0
+        ? Math.min(target, duration)
+        : target;
+}}
+return {{
+    ok: true,
+    currentTime: Number(video.currentTime || 0),
+    paused: Boolean(video.paused)
+}};
+""".strip()
+
+
 class SoopReviewPlayer(QFrame):
     closed = Signal()
     seek_completed = Signal(int)
     status_changed = Signal(str)
+    current_time_ready = Signal(int)
 
     def __init__(self, vod: Vod, parent: QWidget | None = None):
         super().__init__(parent)
@@ -196,6 +226,34 @@ class SoopReviewPlayer(QFrame):
         self.time_label.setText("새로고침 중…")
         self.web_view.reload()
 
+    def request_current_time(self) -> None:
+        self.open_player()
+        if not self._dom_loaded or not self.web_view.is_ready:
+            self.status_changed.emit("플레이어가 준비된 뒤 현재 위치를 다시 눌러 주세요.")
+            return
+        self.web_view.evaluate_js(
+            build_player_action_script("position"),
+            lambda result: self._handle_player_action("position", result),
+        )
+
+    def toggle_playback(self) -> None:
+        self.open_player()
+        if not self._dom_loaded or not self.web_view.is_ready:
+            return
+        self.web_view.evaluate_js(
+            build_player_action_script("toggle"),
+            lambda result: self._handle_player_action("toggle", result),
+        )
+
+    def seek_relative(self, seconds: int) -> None:
+        self.open_player()
+        if not self._dom_loaded or not self.web_view.is_ready:
+            return
+        self.web_view.evaluate_js(
+            build_player_action_script("relative", seconds),
+            lambda result: self._handle_player_action("relative", result),
+        )
+
     def close_player(self) -> None:
         self._retry_timer.stop()
         self._seek_in_flight = False
@@ -282,3 +340,25 @@ class SoopReviewPlayer(QFrame):
         self.time_label.setText(f"재생 위치 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동했습니다.")
         self.seek_completed.emit(seconds)
+
+    def _handle_player_action(self, action: str, result: object) -> None:
+        if not isinstance(result, dict) or not bool(result.get("success")):
+            return
+        payload = result.get("result")
+        if not isinstance(payload, dict) or not bool(payload.get("ok")):
+            self.status_changed.emit("검수 플레이어의 재생 위치를 읽지 못했습니다.")
+            return
+        seconds = max(0, int(float(payload.get("currentTime", 0) or 0)))
+        label = format_timestamp_seconds(seconds)
+        paused = bool(payload.get("paused"))
+        self.time_label.setText(
+            f"재생 위치 · {label}" + (" · 일시정지" if paused else "")
+        )
+        if action == "position":
+            self.current_time_ready.emit(seconds)
+        elif action == "toggle":
+            self.status_changed.emit(
+                f"{label} · {'일시정지' if paused else '재생 중'}"
+            )
+        else:
+            self.status_changed.emit(f"검수 영상을 {label} 지점으로 이동했습니다.")

@@ -6,14 +6,13 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ..models import Vod
 from ..services.analyzer import LocalWhisperGeminiAnalyzer
-from ..services.live_stream import LiveAudioSource
 from ..services.transcription import AnalysisCancelled
 
 
 logger = logging.getLogger(__name__)
 
 
-class LiveAnalysisWorker(QObject):
+class TimelineRegroupWorker(QObject):
     progress_changed = Signal(str, int, str)
     preview_changed = Signal(str, str, str)
     usage_changed = Signal(str, str)
@@ -26,12 +25,12 @@ class LiveAnalysisWorker(QObject):
         self,
         analyzer: LocalWhisperGeminiAnalyzer,
         vod: Vod,
-        source: LiveAudioSource,
+        granularity: str,
     ):
         super().__init__()
         self.analyzer = analyzer
         self.vod = vod
-        self.source = source
+        self.granularity = granularity
 
     @Slot()
     def run(self) -> None:
@@ -48,17 +47,17 @@ class LiveAnalysisWorker(QObject):
             self.preview_changed.emit(self.vod.vod_id, stage, text)
 
         try:
-            document = self.analyzer.analyze_live(
+            document = self.analyzer.regroup_vod(
                 self.vod,
-                self.source,
-                progress=progress,
-                stop_requested=thread.isInterruptionRequested,
-                preview=preview,
+                self.granularity,
+                progress,
+                thread.isInterruptionRequested,
+                preview,
             )
         except AnalysisCancelled:
             self.cancelled.emit(self.vod.vod_id)
         except Exception as error:
-            logger.exception("Live analysis failed for %s", self.vod.vod_id)
+            logger.exception("Timeline regroup failed for %s", self.vod.vod_id)
             self.failed.emit(self.vod.vod_id, str(error))
         else:
             usage = str(getattr(self.analyzer, "last_usage_summary", "") or "")

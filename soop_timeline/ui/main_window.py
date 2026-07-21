@@ -7,9 +7,11 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -32,15 +34,18 @@ from .. import __version__
 from ..database import Database
 from ..models import STATE_LABELS, Vod, VodState
 from ..services.analyzer import LocalWhisperGeminiAnalyzer, TimelineAnalyzer
+from ..services.ai_provider import estimate_timeline_calls
 from ..services.channel_id import normalize_channel_id
 from ..services.discovery import SoopVodDiscovery
-from ..services.gemini_style import GeminiTimelineStyler
+from ..services.diagnostics import build_diagnostic_report, create_diagnostic_bundle
+from ..services.gemini_style import AITimelineStyler
 from ..services.live_stream import LiveAudioSource
 from ..services.manual_link import (
     ResolvedVodLink,
     parse_soop_link,
 )
 from ..services.transcription import format_timestamp
+from ..services.timeline_validation import parse_duration_text
 from ..services.update_checker import (
     automatic_update_check_enabled,
     configured_manifest_url,
@@ -49,9 +54,11 @@ from ..services.update_checker import (
 from .analysis_worker import AnalysisWorker
 from .live_worker import LiveAnalysisWorker
 from .manual_link_worker import ManualLinkWorker
+from .regroup_worker import TimelineRegroupWorker
 from .settings_dialog import AnalysisSettingsDialog
 from .style_worker import TimelineStyleWorker
 from .timeline_editor import TimelineDocumentEditor
+from .version_history_dialog import TimelineVersionHistoryDialog
 
 
 AUTO_REFRESH_MS = 3 * 60 * 60 * 1_000
@@ -62,15 +69,16 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.database = database
         self.analyzer: TimelineAnalyzer = LocalWhisperGeminiAnalyzer.from_database(database)
-        self.styler = GeminiTimelineStyler.from_database(database)
+        self.styler = AITimelineStyler.from_database(database)
         self.discovery = SoopVodDiscovery(self)
         self._actual_new_count = 0
         self._editor_tabs: dict[str, TimelineDocumentEditor] = {}
         self._analysis_jobs: dict[str, tuple[QThread, AnalysisWorker]] = {}
         self._live_jobs: dict[str, tuple[QThread, LiveAnalysisWorker]] = {}
         self._style_jobs: dict[str, tuple[QThread, TimelineStyleWorker]] = {}
+        self._regroup_jobs: dict[str, tuple[QThread, TimelineRegroupWorker]] = {}
         self._manual_link_job: tuple[QThread, ManualLinkWorker] | None = None
-        self._analysis_queue: list[str] = []
+        self._analysis_queue: list[str] = self.database.recover_analysis_queue()
         self._close_after_analysis = False
         self._update_reply: QNetworkReply | None = None
         self._update_check_silent = True
@@ -108,6 +116,8 @@ class MainWindow(QMainWindow):
         self.load_streamers()
         self.load_vods()
         QTimer.singleShot(1_200, self._initial_refresh)
+        if self._analysis_queue:
+            QTimer.singleShot(1_800, self._resume_persisted_analysis)
         if automatic_update_check_enabled(self.database):
             QTimer.singleShot(2_500, lambda: self.check_for_updates(silent=True))
 
@@ -140,9 +150,12 @@ class MainWindow(QMainWindow):
         self.create_button = QPushButton("선택 영상 타임라인 작성")
         self.create_button.setObjectName("primaryButton")
         self.create_button.clicked.connect(self.open_selected_timelines)
+        self.diagnostics_button = QPushButton("진단 정보")
+        self.diagnostics_button.clicked.connect(self.show_diagnostics_options)
         header.addWidget(self.refresh_button)
         header.addWidget(self.settings_button)
         header.addWidget(self.update_button)
+        header.addWidget(self.diagnostics_button)
         header.addWidget(self.create_button)
         root.addLayout(header)
 
@@ -174,6 +187,35 @@ class MainWindow(QMainWindow):
         root.addLayout(status_row)
 
         return root_widget
+
+    def show_diagnostics_options(self) -> None:
+        message = QMessageBox(self)
+        message.setWindowTitle("진단 정보")
+        message.setText("API 키와 자막 원문을 제외한 환경 정보와 최근 오류 로그를 만듭니다.")
+        copy_button = message.addButton("클립보드 복사", QMessageBox.ButtonRole.AcceptRole)
+        save_button = message.addButton("ZIP 저장", QMessageBox.ButtonRole.ActionRole)
+        message.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() is copy_button:
+            QApplication.clipboard().setText(build_diagnostic_report(self.database))
+            self.status_label.setText("진단 정보를 클립보드에 복사했습니다.")
+            return
+        if message.clickedButton() is not save_button:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "진단 묶음 저장",
+            "soop-timeline-diagnostics.zip",
+            "ZIP 파일 (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            create_diagnostic_bundle(path, self.database)
+        except OSError as error:
+            QMessageBox.critical(self, "진단 묶음 저장 실패", str(error))
+            return
+        self.status_label.setText("진단 묶음을 저장했습니다.")
 
     def _build_manual_link_panel(self) -> QWidget:
         panel = QFrame()
@@ -404,6 +446,7 @@ class MainWindow(QMainWindow):
                 or self._analysis_queue
                 or self._style_jobs
                 or self._live_jobs
+                or self._regroup_jobs
             ):
                 QMessageBox.information(
                     self,
@@ -602,6 +645,9 @@ class MainWindow(QMainWindow):
         editor.analysis_requested.connect(self.start_analysis)
         editor.analysis_cancel_requested.connect(self.cancel_analysis)
         editor.style_requested.connect(self.start_style_correction)
+        editor.regroup_requested.connect(self.start_topic_regroup)
+        editor.snapshot_requested.connect(self._snapshot_timeline)
+        editor.version_history_requested.connect(self.show_version_history)
         self._editor_tabs[vod_id] = editor
         title = vod.title if len(vod.title) <= 22 else f"{vod.title[:21]}…"
         index = self.tabs.addTab(editor, title)
@@ -621,6 +667,35 @@ class MainWindow(QMainWindow):
         if vod and vod.state != VodState.READY.value:
             self.database.set_vod_state(vod_id, VodState.REVIEW.value)
 
+    @Slot(str, str, str)
+    def _snapshot_timeline(self, vod_id: str, reason: str, text: str) -> None:
+        self.database.create_timeline_revision(vod_id, text, reason)
+
+    @Slot(str)
+    def show_version_history(self, vod_id: str) -> None:
+        revisions = self.database.list_timeline_revisions(vod_id)
+        if not revisions:
+            QMessageBox.information(
+                self,
+                "버전 기록 없음",
+                "아직 저장된 이전 버전이 없습니다. AI 재분석·주제 재묶기·일괄 변경 전에 자동 생성됩니다.",
+            )
+            return
+        dialog = TimelineVersionHistoryDialog(revisions, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.restored_text is None:
+            return
+        editor = self._editor_tabs.get(vod_id)
+        if editor is None:
+            return
+        self.database.create_timeline_revision(
+            vod_id,
+            editor.text(),
+            "버전 복원 전",
+        )
+        editor.set_text(dialog.restored_text)
+        self.database.save_timeline(vod_id, dialog.restored_text, VodState.REVIEW.value)
+        editor.status_label.setText("선택한 버전으로 복원했습니다.")
+
     def _mark_review_complete(self, vod_id: str) -> None:
         editor = self._editor_tabs.get(vod_id)
         if editor is not None:
@@ -633,7 +708,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
-        self.styler = GeminiTimelineStyler.from_database(self.database)
+        self.styler = AITimelineStyler.from_database(self.database)
         for editor in self._editor_tabs.values():
             editor.set_analyzer_availability(
                 self.analyzer.available,
@@ -765,7 +840,23 @@ class MainWindow(QMainWindow):
         if open_button is not None and message.clickedButton() is open_button:
             QDesktopServices.openUrl(QUrl(info.download_url))
 
-    def start_analysis(self, vod_id: str) -> None:
+    def _resume_persisted_analysis(self) -> None:
+        if self._analysis_jobs or not self._analysis_queue:
+            return
+        vod_id = self._analysis_queue.pop(0)
+        if self.database.get_vod(vod_id) is None:
+            self.database.remove_analysis_queue(vod_id)
+            QTimer.singleShot(0, self._resume_persisted_analysis)
+            return
+        self.open_timeline(vod_id)
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.status_label.setText(
+                "이전 실행에서 중단된 분석을 체크포인트부터 재개합니다…"
+            )
+        self.start_analysis(vod_id, _from_queue=True)
+
+    def start_analysis(self, vod_id: str, *, _from_queue: bool = False) -> None:
         vod = self.database.get_vod(vod_id)
         if vod is not None and vod.source_kind == "live":
             editor = self._editor_tabs.get(vod_id)
@@ -784,9 +875,16 @@ class MainWindow(QMainWindow):
         if self._style_jobs:
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
-                editor.status_label.setText("Gemini 문체 교정이 끝난 뒤 분석할 수 있습니다.")
+                editor.status_label.setText("AI 문체 교정이 끝난 뒤 분석할 수 있습니다.")
             return
-        if vod_id in self._analysis_jobs or vod_id in self._analysis_queue:
+        if self._regroup_jobs:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.status_label.setText("주제 다시 묶기가 끝난 뒤 분석할 수 있습니다.")
+            return
+        if vod_id in self._analysis_jobs or (
+            vod_id in self._analysis_queue and not _from_queue
+        ):
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
                 editor.status_label.setText("이미 분석 중이거나 대기열에 있습니다.")
@@ -797,6 +895,7 @@ class MainWindow(QMainWindow):
             running_vod = self.database.get_vod(running_vod_id)
             running_title = running_vod.title if running_vod else running_vod_id
             self._analysis_queue.append(vod_id)
+            self.database.enqueue_analysis(vod_id)
             self.database.set_vod_state(vod_id, VodState.QUEUED.value)
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
@@ -826,6 +925,12 @@ class MainWindow(QMainWindow):
         if vod is None or editor is None:
             return
 
+        self.database.create_timeline_revision(
+            vod_id,
+            editor.text(),
+            "AI 분석 전",
+        )
+
         thread = QThread(self)
         thread.setProperty("vod_id", vod_id)
         worker = AnalysisWorker(self.analyzer, vod)
@@ -833,6 +938,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress_changed.connect(editor.set_analysis_progress)
         worker.preview_changed.connect(editor.set_analysis_preview)
+        worker.usage_changed.connect(editor.set_ai_usage)
         worker.succeeded.connect(self._analysis_succeeded)
         worker.failed.connect(self._analysis_failed)
         worker.cancelled.connect(self._analysis_cancelled)
@@ -842,9 +948,16 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
 
         self._analysis_jobs[vod_id] = (thread, worker)
+        self.database.mark_analysis_running(vod_id)
         self.database.set_vod_state(vod_id, VodState.ANALYZING.value)
         editor.set_analysis_running(True)
-        editor.set_analysis_progress(0, "SOOP 고속 오디오 분석을 준비합니다…")
+        duration_seconds = parse_duration_text(vod.duration_text)
+        estimate = estimate_timeline_calls(duration_seconds or 0)
+        editor.set_analysis_progress(
+            0,
+            f"SOOP 고속 오디오 분석 준비 · AI 호출 예상 약 {estimate:,}회 "
+            "(자막 구간 수에 따라 달라질 수 있음)",
+        )
         self.status_label.setText(f"AI 분석 시작: {vod.title}")
         self.load_vods()
         thread.start()
@@ -854,7 +967,13 @@ class MainWindow(QMainWindow):
         vod_id: str,
         source: LiveAudioSource,
     ) -> None:
-        if self._analysis_jobs or self._analysis_queue or self._style_jobs or self._live_jobs:
+        if (
+            self._analysis_jobs
+            or self._analysis_queue
+            or self._style_jobs
+            or self._live_jobs
+            or self._regroup_jobs
+        ):
             self._manual_link_failed(
                 "다른 AI 작업이 진행 중이어서 라이브 분석을 시작하지 못했습니다."
             )
@@ -875,6 +994,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress_changed.connect(self._live_progress_changed)
         worker.preview_changed.connect(self._live_preview_changed)
+        worker.usage_changed.connect(self._ai_usage_changed)
         worker.succeeded.connect(self._live_succeeded)
         worker.failed.connect(self._live_failed)
         worker.cancelled.connect(self._live_cancelled)
@@ -935,7 +1055,7 @@ class MainWindow(QMainWindow):
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
         self.status_label.setText(
-            "라이브 수신과 Gemini 최종 타임라인 정리가 완료되었습니다."
+            "라이브 수신과 AI 최종 타임라인 정리가 완료되었습니다."
         )
         self.load_vods()
 
@@ -980,19 +1100,22 @@ class MainWindow(QMainWindow):
         if self._analysis_jobs or self._analysis_queue or self._live_jobs:
             editor.status_label.setText("영상 분석이 끝난 뒤 문체를 교정할 수 있습니다.")
             return
+        if self._regroup_jobs:
+            editor.status_label.setText("주제 다시 묶기가 끝난 뒤 문체를 교정할 수 있습니다.")
+            return
         if self._style_jobs:
-            editor.status_label.setText("이미 Gemini 문체 교정 작업이 진행 중입니다.")
+            editor.status_label.setText("이미 AI 문체 교정 작업이 진행 중입니다.")
             return
 
-        self.styler = GeminiTimelineStyler.from_database(self.database)
+        self.styler = AITimelineStyler.from_database(self.database)
         if not self.styler.available:
             QMessageBox.information(
                 self,
-                "Gemini 설정 필요",
+                "AI 설정 필요",
                 self.styler.unavailable_reason,
             )
             self.open_analysis_settings()
-            self.styler = GeminiTimelineStyler.from_database(self.database)
+            self.styler = AITimelineStyler.from_database(self.database)
             if not self.styler.available:
                 return
 
@@ -1000,6 +1123,11 @@ class MainWindow(QMainWindow):
         if not document.strip():
             QMessageBox.information(self, "내용 없음", "교정할 타임라인이 없습니다.")
             return
+        self.database.create_timeline_revision(
+            vod_id,
+            document,
+            "AI 문체 교정 전",
+        )
 
         self._save_timeline(vod_id, document)
         thread = QThread(self)
@@ -1008,6 +1136,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._style_succeeded)
+        worker.usage_changed.connect(self._ai_usage_changed)
         worker.failed.connect(self._style_failed)
         worker.cancelled.connect(self._style_cancelled)
         worker.finished.connect(thread.quit)
@@ -1017,7 +1146,7 @@ class MainWindow(QMainWindow):
 
         self._style_jobs[vod_id] = (thread, worker)
         editor.set_style_running(True)
-        self.status_label.setText("Gemini 문체 교정을 시작했습니다.")
+        self.status_label.setText("AI 문체 교정을 시작했습니다.")
         thread.start()
 
     @Slot(str, str)
@@ -1028,7 +1157,7 @@ class MainWindow(QMainWindow):
             editor.set_style_running(False)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
-        self.status_label.setText("Gemini 문체 교정이 완료되었습니다.")
+        self.status_label.setText("AI 문체 교정이 완료되었습니다.")
         self.load_vods()
 
     @Slot(str, str)
@@ -1037,15 +1166,15 @@ class MainWindow(QMainWindow):
         if editor is not None:
             editor.set_style_running(False)
             editor.status_label.setText(f"문체 교정 실패: {message}")
-        self.status_label.setText("Gemini 문체 교정에 실패했습니다.")
-        QMessageBox.critical(self, "Gemini 문체 교정 실패", message)
+        self.status_label.setText("AI 문체 교정에 실패했습니다.")
+        QMessageBox.critical(self, "AI 문체 교정 실패", message)
 
     @Slot(str)
     def _style_cancelled(self, vod_id: str) -> None:
         editor = self._editor_tabs.get(vod_id)
         if editor is not None:
             editor.set_style_running(False)
-            editor.status_label.setText("Gemini 문체 교정을 취소했습니다.")
+            editor.status_label.setText("AI 문체 교정을 취소했습니다.")
 
     @Slot()
     def _style_thread_finished(self) -> None:
@@ -1054,6 +1183,105 @@ class MainWindow(QMainWindow):
         if not vod_id:
             return
         self._style_jobs.pop(vod_id, None)
+
+    @Slot(str, str)
+    def start_topic_regroup(self, vod_id: str, granularity: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        vod = self.database.get_vod(vod_id)
+        if editor is None or vod is None:
+            return
+        if (
+            self._analysis_jobs
+            or self._analysis_queue
+            or self._live_jobs
+            or self._style_jobs
+            or self._regroup_jobs
+        ):
+            editor.status_label.setText("다른 AI 작업이 끝난 뒤 주제를 다시 묶을 수 있습니다.")
+            return
+        analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
+        if not analyzer.available:
+            QMessageBox.information(self, "AI 설정 필요", analyzer.unavailable_reason)
+            return
+
+        self.database.create_timeline_revision(
+            vod_id,
+            editor.text(),
+            f"주제 다시 묶기 전 ({granularity})",
+        )
+        thread = QThread(self)
+        thread.setProperty("vod_id", vod_id)
+        worker = TimelineRegroupWorker(analyzer, vod, granularity)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress_changed.connect(self._regroup_progress_changed)
+        worker.preview_changed.connect(self._regroup_preview_changed)
+        worker.usage_changed.connect(self._ai_usage_changed)
+        worker.succeeded.connect(self._regroup_succeeded)
+        worker.failed.connect(self._regroup_failed)
+        worker.cancelled.connect(self._regroup_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._regroup_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._regroup_jobs[vod_id] = (thread, worker)
+        editor.set_regroup_running(True)
+        editor.analysis_progress.setVisible(True)
+        editor.set_analysis_progress(0, "저장된 자막으로 주제 다시 묶기를 준비합니다…")
+        self.status_label.setText("주제 다시 묶기를 시작했습니다.")
+        thread.start()
+
+    @Slot(str, int, str)
+    def _regroup_progress_changed(self, vod_id: str, percent: int, message: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_analysis_progress(percent, message)
+
+    @Slot(str, str)
+    def _ai_usage_changed(self, vod_id: str, summary: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_ai_usage(summary)
+
+    @Slot(str, str, str)
+    def _regroup_preview_changed(self, vod_id: str, stage: str, text: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_analysis_preview(stage, text)
+
+    @Slot(str, str)
+    def _regroup_succeeded(self, vod_id: str, document: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.apply_regroup_result(document)
+            editor.analysis_progress.setVisible(False)
+        self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
+        self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self.status_label.setText("주제 다시 묶기가 완료되었습니다.")
+
+    @Slot(str, str)
+    def _regroup_failed(self, vod_id: str, message: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_regroup_running(False)
+            editor.analysis_progress.setVisible(False)
+            editor.status_label.setText(f"주제 다시 묶기 실패: {message}")
+        QMessageBox.critical(self, "주제 다시 묶기 실패", message)
+
+    @Slot(str)
+    def _regroup_cancelled(self, vod_id: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_regroup_running(False)
+            editor.analysis_progress.setVisible(False)
+            editor.status_label.setText("주제 다시 묶기를 취소했습니다.")
+
+    @Slot()
+    def _regroup_thread_finished(self) -> None:
+        thread = self.sender()
+        vod_id = str(thread.property("vod_id") or "") if thread is not None else ""
+        if vod_id:
+            self._regroup_jobs.pop(vod_id, None)
         if self._close_after_analysis and not self._active_jobs():
             QTimer.singleShot(0, self.close)
 
@@ -1066,7 +1294,7 @@ class MainWindow(QMainWindow):
             if editor is not None:
                 editor.request_live_stop()
             self.status_label.setText(
-                "라이브 종료 요청됨 · 남은 자막과 Gemini 최종 타임라인을 정리합니다…"
+                "라이브 종료 요청됨 · 남은 자막과 AI 최종 타임라인을 정리합니다…"
             )
             return
         job = self._analysis_jobs.get(vod_id)
@@ -1089,6 +1317,7 @@ class MainWindow(QMainWindow):
             editor.set_analysis_running(False)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self.database.remove_analysis_queue(vod_id)
         self.status_label.setText("AI 타임라인 생성이 완료되었습니다. 결과를 검수하세요.")
         self.load_vods()
 
@@ -1099,6 +1328,7 @@ class MainWindow(QMainWindow):
             editor.set_analysis_running(False)
             editor.status_label.setText(f"분석 실패: {message}")
         self.database.set_vod_state(vod_id, VodState.FAILED.value)
+        self.database.remove_analysis_queue(vod_id)
         self.status_label.setText("AI 분석에 실패했습니다.")
         self.load_vods()
         QMessageBox.critical(self, "AI 분석 실패", message)
@@ -1110,6 +1340,7 @@ class MainWindow(QMainWindow):
             editor.set_analysis_running(False)
             editor.status_label.setText("분석을 취소했습니다.")
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self.database.remove_analysis_queue(vod_id)
         self.status_label.setText("AI 분석을 취소했습니다.")
         self.load_vods()
 
@@ -1127,7 +1358,10 @@ class MainWindow(QMainWindow):
             return
         if self._analysis_queue:
             next_vod_id = self._analysis_queue.pop(0)
-            QTimer.singleShot(0, lambda: self.start_analysis(next_vod_id))
+            QTimer.singleShot(
+                0,
+                lambda: self.start_analysis(next_vod_id, _from_queue=True),
+            )
 
     def open_vod_from_row(self, row: int, column: int) -> None:
         del column
@@ -1148,6 +1382,7 @@ class MainWindow(QMainWindow):
                 or widget.vod.vod_id in self._analysis_queue
                 or widget.vod.vod_id in self._style_jobs
                 or widget.vod.vod_id in self._live_jobs
+                or widget.vod.vod_id in self._regroup_jobs
             ):
                 QMessageBox.information(
                     self,
@@ -1177,11 +1412,14 @@ class MainWindow(QMainWindow):
             return
         self._close_after_analysis = True
         self._analysis_queue.clear()
+        self.database.clear_analysis_queue()
         for thread, _ in self._analysis_jobs.values():
             thread.requestInterruption()
         for thread, _ in self._style_jobs.values():
             thread.requestInterruption()
         for thread, _ in self._live_jobs.values():
+            thread.requestInterruption()
+        for thread, _ in self._regroup_jobs.values():
             thread.requestInterruption()
         if self._manual_link_job is not None:
             self._manual_link_job[0].requestInterruption()
@@ -1197,5 +1435,6 @@ class MainWindow(QMainWindow):
             or self._analysis_queue
             or self._style_jobs
             or self._live_jobs
+            or self._regroup_jobs
             or self._manual_link_job is not None
         )

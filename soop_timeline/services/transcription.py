@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 ProgressCallback = Callable[[int, str], None]
 CancelCallback = Callable[[], bool]
 PreviewCallback = Callable[[str, str], None]
+CheckpointCallback = Callable[["Transcript"], None]
 LiveUpdateCallback = Callable[["Transcript"], None]
 
 
@@ -324,13 +325,19 @@ class FasterWhisperTranscriber:
         progress: ProgressCallback,
         cancelled: CancelCallback,
         preview: PreviewCallback | None = None,
+        resume: Transcript | None = None,
+        checkpoint: CheckpointCallback | None = None,
     ) -> Transcript:
         """Transcribe bounded PCM chunks while the next audio chunk is streamed.
 
         Only SOOP's audio-only HLS is read. No complete media or audio file is
         created, and the decoder and batched GPU inference overlap in time.
         """
-        from .vod_stream import AudioChunk, iter_audio_chunks
+        from .vod_stream import (
+            DEFAULT_OVERLAP_SECONDS,
+            AudioChunk,
+            iter_audio_chunks,
+        )
 
         backend = self._prepare_backend(progress, cancelled)
         batch_size = 8 if backend.runtime.device == "cuda" else 2
@@ -356,9 +363,32 @@ class FasterWhisperTranscriber:
                         return False
             return False
 
+        resume_segments = list(resume.segments) if resume is not None else []
+        resume_boundary = (
+            max(
+                float(getattr(resume, "duration_seconds", 0.0) or 0.0),
+                max((segment.end for segment in resume_segments), default=0.0),
+            )
+            if resume_segments
+            else 0.0
+        )
+        stream_start = max(0.0, resume_boundary - DEFAULT_OVERLAP_SECONDS)
+        if resume_segments:
+            progress(
+                5,
+                f"저장된 중간 자막 {len(resume_segments):,}개를 이어서 분석합니다 · "
+                f"재개 지점 {format_timestamp(resume_boundary)}",
+            )
+            if preview is not None:
+                preview("transcript", transcript_preview_document(resume_segments))
+
         def produce() -> None:
             try:
-                for chunk in iter_audio_chunks(source, should_stop):
+                for chunk in iter_audio_chunks(
+                    source,
+                    should_stop,
+                    start_seconds=stream_start,
+                ):
                     if not put_item(chunk):
                         return
             except BaseException as error:
@@ -385,8 +415,12 @@ class FasterWhisperTranscriber:
                         raise RuntimeError("고속 오디오 스트림이 예기치 않게 종료되었습니다.")
 
         language = "ko"
-        accepted: list[tuple[float, float, str]] = []
-        lower_boundary = 0.0
+        accepted: list[tuple[float, float, str]] = [
+            (segment.start, segment.end, segment.text)
+            for segment in resume_segments
+            if segment.text.strip()
+        ]
+        lower_boundary = resume_boundary
         eta = EtaEstimator(source.total_duration_seconds)
         try:
             current_item = get_item()
@@ -445,6 +479,25 @@ class FasterWhisperTranscriber:
                     preview(
                         "transcript",
                         transcript_preview_document(accepted),
+                    )
+
+                if checkpoint is not None and accepted:
+                    checkpoint(
+                        Transcript(
+                            model=self.model_name,
+                            language=language,
+                            duration_seconds=upper_boundary,
+                            segments=[
+                                TranscriptSegment(
+                                    segment_id=f"s{index:06d}",
+                                    start=start,
+                                    end=end,
+                                    text=text,
+                                )
+                                for index, (start, end, text) in enumerate(accepted)
+                                if text.strip()
+                            ],
+                        )
                     )
 
                 processed_seconds = min(source.total_duration_seconds, upper_boundary)

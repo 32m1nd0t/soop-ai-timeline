@@ -21,10 +21,13 @@ def main() -> int:
 
     from .database import Database
     from .paths import app_data_dir, database_path
+    from .services.diagnostics import configure_logging, install_exception_hook
     from .styles import APP_STYLE
     from .ui.main_window import MainWindow
 
     startup_vod_id = option_value(sys.argv, "--open-vod")
+    configure_logging()
+    install_exception_hook()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("SOOP AI 타임라인")
     app.setOrganizationName("SOOPTimeline")
@@ -53,11 +56,13 @@ def main() -> int:
 
 
 def _verify_packaged_dependencies() -> None:
+    import anthropic  # noqa: F401
     import av  # noqa: F401
     import keyring
     from faster_whisper import BatchedInferencePipeline, WhisperModel  # noqa: F401
     from google import genai  # noqa: F401
     from google.genai import types
+    import openai  # noqa: F401
 
     keyring.get_keyring()
     types.GenerateContentConfig(
