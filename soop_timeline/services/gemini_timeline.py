@@ -27,8 +27,8 @@ DEFAULT_TOPIC_GRANULARITY = "broad"
 TOPIC_GRANULARITIES = {"broad", "balanced", "detailed"}
 
 QUOTE_STYLE_EXEMPTION = (
-    "예외: summary 안에서 큰따옴표(\"…\")로 감싼 스트리머 직접 인용은 위 문체 규칙을 "
-    "적용하지 않고 실제 말투·종결어미 그대로 둡니다. 큰따옴표 밖의 메모만 위 문체 규칙을 따릅니다."
+    "예외: quote(스트리머 직접 인용)에는 위 문체 규칙을 적용하지 않고 실제 말투·종결어미를 "
+    "그대로 둡니다. 위 문체 규칙은 summary에만 적용합니다."
 )
 
 
@@ -40,6 +40,17 @@ class TimelineEntry:
     topic_key: str = ""
     decision: str = "new"
     quote: str = ""
+
+
+def format_entry_text(entry: TimelineEntry) -> str:
+    """Compose the displayed line: quote first, summary only when it adds info."""
+    quote = entry.quote.strip()
+    summary = entry.summary.strip()
+    if quote:
+        if summary and summary.strip('"').strip() != quote:
+            return f'"{quote}" {summary}'
+        return f'"{quote}"'
+    return summary
 
 
 @dataclass(slots=True)
@@ -116,9 +127,9 @@ class GeneratedTimeline:
     def to_document(self) -> str:
         lines = [f"오늘의 콘텐츠: {self.content_title.strip()}", ""]
         lines.extend(
-            f"{format_timestamp(entry.start)} {entry.summary.strip()}"
+            f"{format_timestamp(entry.start)} {text}"
             for entry in self.entries
-            if entry.summary.strip()
+            if (text := format_entry_text(entry))
         )
         return "\n".join(lines).rstrip() + "\n"
 
@@ -148,16 +159,16 @@ TIMELINE_SCHEMA = {
                     "quote": {
                         "type": "string",
                         "description": (
-                            "그 주제를 여는 스트리머의 대표 발언을 따옴표 없이 그대로. "
-                            "여는 발언이 없거나 인용이 부적절하면 빈 문자열"
+                            "그 항목을 대표하는 스트리머 발언을 따옴표 없이 그대로. "
+                            "대표할 발언이 없으면 빈 문자열"
                         ),
                     },
                     "summary": {
                         "type": "string",
                         "description": (
-                            "표시할 한 줄. 여는 발언이 있으면 그 말을 큰따옴표로 그대로 담고, "
-                            "인용만으로 주제가 안 드러날 때만 뒤에 ' — 짧은 메모'를 붙임. "
-                            "여는 발언이 없으면 합니다/입니다체가 아닌 건조한 제목형 요약"
+                            "quote가 있으면 기본은 빈 문자열. quote만으로는 무슨 상황인지 "
+                            "도저히 알 수 없을 때만 아주 짧은 보충. quote가 없을 때만 그 순간을 "
+                            "간결하고 자연스러운 한 줄로. 합니다/입니다체는 피함"
                         ),
                     },
                 },
@@ -515,9 +526,10 @@ def build_chunk_prompt(
 - 각 항목의 segment_id는 그 주제를 실제로 여는 발화에 맞춥니다. 본론 전의 무관한 잡담·전환 군더더기까지 앞으로 끌어오지 말고, 주제가 청자에게 분명해지는 지점을 시작으로 잡습니다.
 - topic_key는 같은 주제라면 창이 달라도 같은 짧은 핵심어를 사용합니다.
 - 시간은 만들지 않습니다. 프로그램이 segment_id의 원래 시간을 사용합니다.
-- 주제가 스트리머의 인상적인 발언으로 시작하면, quote에 그 발언을 그대로 담고 summary에는 그 말을 큰따옴표로 넣습니다(실제 말투·존댓말 그대로 둡니다). 이때 segment_id는 그 발언 지점을 씁니다.
-- 직접 인용만으로 주제가 충분히 드러나면 요약을 덧붙이지 않습니다. 인용만으로 부족할 때만 summary의 큰따옴표 뒤에 ` — 짧은 메모`를 붙입니다.
-- 여는 발언이 없거나 인용이 어색하면 quote를 비우고 summary만 건조한 제목형 한 줄로 작성합니다. 요약은 최대한 짧게, 꼭 필요한 경우에만 답니다.
+- 각 항목은 '직접 인용' 또는 '요약' 중 하나로 표현합니다. 둘은 한 타임라인 안에서 자연스럽게 섞여야 하며, 전부 인용이거나 전부 요약이 되지 않게 합니다.
+- 그 순간을 스트리머의 한 마디가 잘 대표하면(툭 던진 말, 기억에 남는 발언) quote에 그 말을 그대로 담고 summary는 비웁니다. 프로그램이 quote를 큰따옴표로 표시하므로 인용을 summary에 반복하지 않습니다. 이때 segment_id는 그 발언 지점을 씁니다.
+- 하나의 발언으로 대표하기 어려운 상황·활동·이야기 흐름이면 quote를 비우고 summary에 그 순간을 간결하고 자연스러운 한 줄로 적습니다. 억지로 `~하는 누구` 같은 같은 틀로 만들지 말고 읽기 자연스러운 짧은 표현이면 됩니다.
+- quote가 있으면 summary를 덧붙이지 않는 것이 기본입니다. quote만 봐서는 무슨 상황인지 도저히 알 수 없을 때에 한해서만 summary에 아주 짧은 보충을 적습니다.
 - 단어 사전에 있는 인명·게임명·고유명사는 가능한 한 그 표기를 유지합니다.
 - 스트리머가 말하지 않은 사실을 추측하지 않습니다.
 - 광고, 장시간 무음, 단순 배경음은 제외합니다.
@@ -578,8 +590,9 @@ def build_final_prompt(
 - 서로 무관한 주제가 충분히 이어진 뒤 과거 주제로 복귀한 경우에는 시간 흐름을 위해 별도 항목으로 유지할 수 있습니다.
 - 시간순으로 정렬합니다.
 - content_title은 방송 전체의 핵심 콘텐츠를 짧은 제목형으로 작성합니다.
-- 후보에 `인용:`이 있으면 그 스트리머 직접 인용은 그대로 quote에 담고 summary에 큰따옴표로 유지합니다. 인용문의 말투·종결어미는 고치지 않습니다.
-- 직접 인용만으로 주제가 드러나면 요약을 덧붙이지 않습니다. 인용이 없거나 부족한 항목의 summary만 아래 문체 규칙에 맞게 건조하게 다시 씁니다. 요약은 최대한 짧게, 꼭 필요한 경우에만 답니다.
+- 최종 타임라인에는 인용 항목과 요약 항목이 자연스럽게 섞이도록 유지합니다. 좋은 대표 발언은 인용으로, 상황·활동·이야기 흐름은 요약으로 남기며 한쪽으로 쏠리지 않게 합니다.
+- 후보에 `인용:`이 있으면 그 발언을 quote에 그대로 담고 summary는 비웁니다(인용문의 말투·종결어미는 고치지 않습니다). quote만으로 상황을 알 수 없을 때만 summary에 아주 짧은 보충을 답니다.
+- quote가 없는 항목만 summary를 아래 문체 규칙에 맞게 간결하고 자연스럽게 씁니다. 억지 명사형 변환은 하지 않습니다.
 - 단어 사전에 있는 인명·게임명·고유명사는 가능한 한 그 표기를 유지합니다.
 
 {DRY_TIMELINE_STYLE_GUIDE}
@@ -666,16 +679,14 @@ def entries_from_payload(
         segment = segment_lookup.get(segment_id)
         if segment is None or decision == "continue":
             continue
-        if not summary:
-            summary = f'"{quote}"' if quote else ""
-        if not summary:
+        if not summary and not quote:
             continue
         result.append(
             TimelineEntry(
                 segment_id=segment_id,
                 start=segment.start,
                 summary=summary,
-                topic_key=topic_key or summary,
+                topic_key=topic_key or summary or quote,
                 decision=decision,
                 quote=quote,
             )
@@ -700,8 +711,8 @@ def deduplicate_entries(entries: list[TimelineEntry]) -> list[TimelineEntry]:
         if result and entry.start - result[-1].start <= 180:
             similarity = SequenceMatcher(
                 None,
-                normalize_summary(result[-1].summary),
-                normalize_summary(entry.summary),
+                normalize_summary(format_entry_text(result[-1])),
+                normalize_summary(format_entry_text(entry)),
             ).ratio()
             if similarity >= 0.78:
                 continue

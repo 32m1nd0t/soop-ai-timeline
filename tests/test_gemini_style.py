@@ -57,7 +57,7 @@ class GeminiStyleTests(unittest.TestCase):
 
     def test_prompt_requires_dry_neutral_style_without_structure_changes(self):
         prompt = build_style_prompt(parse_timeline_document(SOURCE_DOCUMENT))
-        self.assertIn("건조하고 중립적인", prompt)
+        self.assertIn("간결하고 자연스러운", prompt)
         self.assertIn("항목을 추가·삭제·병합·분할", prompt)
         self.assertIn("line_0000 | 00:01:02", prompt)
         self.assertIn("MBTI 검사 재진행", prompt)
