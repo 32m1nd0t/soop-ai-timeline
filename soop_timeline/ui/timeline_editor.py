@@ -1270,6 +1270,13 @@ class TimelineDocumentEditor(QWidget):
         if self._rebuilding or not self._blocks:
             return
         current_parts = self.blocks()
+        # Rebuilding blocks recreates their QPlainTextEdit editors, which wipes the
+        # native undo/redo history. During normal editing the split boundary shifts
+        # on almost every keystroke, so only reflow when a block has actually grown
+        # past the comment limit and must be split; otherwise leave the editors
+        # (and their Ctrl+Z history) alone.
+        if not any(len(part) > COMMENT_LIMIT for part in current_parts):
+            return
         combined = "".join(current_parts)
         next_parts = split_timeline(combined)
         if next_parts == current_parts:
