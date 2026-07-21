@@ -19,6 +19,7 @@ from soop_timeline.services.gemini_timeline import (
     build_chunk_prompt,
     build_final_prompt,
     deduplicate_entries,
+    entries_from_payload,
     split_transcript,
 )
 from soop_timeline.services.transcription import Transcript, TranscriptSegment
@@ -62,7 +63,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             "key-1",
             2,
             ["제목"],
-            [TimelineEntry("s1", 10, "요약", "주제", "new")],
+            [TimelineEntry("s1", 10, '"직접 인용" — 메모', "주제", "new", "직접 인용")],
             stage="final_pending",
             last_error="quota",
         )
@@ -71,7 +72,38 @@ class AnalysisPipelineTests(unittest.TestCase):
             save_timeline_generation_state(path, state)
             restored = load_timeline_generation_state(path, "key-1")
             self.assertEqual(restored.to_dict(), state.to_dict())
+            self.assertEqual(restored.entries[0].quote, "직접 인용")
             self.assertIsNone(load_timeline_generation_state(path, "other-key"))
+
+    def test_entries_capture_quote_and_fall_back_to_quoted_summary(self):
+        lookup = {
+            segment.segment_id: segment for segment in sample_transcript().segments
+        }
+        payload = {
+            "entries": [
+                {
+                    "segment_id": "s000001",
+                    "decision": "new",
+                    "topic_key": "꿈",
+                    "quote": "어제 진짜 이상한 꿈 꿨거든요",
+                    "summary": '"어제 진짜 이상한 꿈 꿨거든요"',
+                },
+                {
+                    "segment_id": "s000002",
+                    "decision": "new",
+                    "topic_key": "게임",
+                    "quote": "자 이제 게임 갑니다",
+                    "summary": "",
+                },
+            ]
+        }
+        entries = entries_from_payload(payload, lookup)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].quote, "어제 진짜 이상한 꿈 꿨거든요")
+        self.assertIn("이상한 꿈", entries[0].summary)
+        # An entry with only a quote falls back to the quoted text as its summary.
+        self.assertEqual(entries[1].summary, '"자 이제 게임 갑니다"')
+        self.assertEqual(entries[1].quote, "자 이제 게임 갑니다")
 
     def test_transcript_is_split_with_overlap(self):
         windows = split_transcript(
@@ -115,7 +147,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertIn("타임라인 소제목", prompt)
             self.assertIn("존댓말 종결어미와 마침표를 사용하지 않습니다", prompt)
             self.assertIn("여름·겨울 여행 환경과 선호 비교", prompt)
-        self.assertIn("문체 규칙에 맞게 반드시 다시 작성", final_prompt)
+        self.assertIn("문체 규칙에 맞게 건조하게 다시 씁니다", final_prompt)
 
     def test_topic_prompts_keep_previous_context_and_merge_subtopics(self):
         previous = [TimelineEntry("old", 100, "와우 시절과 현재 선호 비교")]

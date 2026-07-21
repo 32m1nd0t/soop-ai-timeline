@@ -162,6 +162,11 @@ class Database:
         self.connection.execute("DELETE FROM streamers WHERE id = ?", (streamer_id,))
         self.connection.commit()
 
+    def delete_vod(self, vod_id: str) -> None:
+        """Remove a single VOD and its cascaded timeline docs, revisions, queue rows."""
+        self.connection.execute("DELETE FROM vods WHERE vod_id = ?", (vod_id,))
+        self.connection.commit()
+
     def list_vod_ids_for_streamer(self, streamer_id: int) -> list[str]:
         rows = self.connection.execute(
             "SELECT vod_id FROM vods WHERE streamer_id = ?",

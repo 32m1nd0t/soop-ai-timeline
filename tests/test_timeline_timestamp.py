@@ -68,9 +68,9 @@ class TimelineTimestampTests(unittest.TestCase):
 
     def test_seek_script_targets_soop_video_and_requested_time(self):
         script = build_seek_script(7_433)
-        self.assertTrue(script.startswith("const target = 7433"))
         self.assertIn("const target = 7433", script)
-        self.assertIn("video#video", script)
+        # The replay is chosen by media presence, not the first <video> element.
+        self.assertIn("__pickVod", script)
         self.assertIn("video.currentTime = target", script)
         self.assertIn("video.muted = false", script)
         self.assertIn("VOD 보기", script)

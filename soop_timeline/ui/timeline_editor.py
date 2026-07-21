@@ -142,6 +142,7 @@ class TimelineDocumentEditor(QWidget):
     review_completed = Signal(str)
     analysis_requested = Signal(str)
     analysis_cancel_requested = Signal(str)
+    reanalyze_as_vod_requested = Signal(str)
     style_requested = Signal(str)
     regroup_requested = Signal(str, str)
     snapshot_requested = Signal(str, str, str)
@@ -248,6 +249,16 @@ class TimelineDocumentEditor(QWidget):
         self.cancel_analysis_button.clicked.connect(
             lambda: self.analysis_cancel_requested.emit(self.vod.vod_id)
         )
+        self.reanalyze_vod_button = QPushButton("다시보기 전체로 재분석")
+        self.reanalyze_vod_button.setObjectName("primaryButton")
+        self.reanalyze_vod_button.setToolTip(
+            "방송이 끝난 뒤, 완성된 다시보기 전체 영상을 처음부터 정식 분석합니다. "
+            "라이브 중 놓친 앞부분까지 포함되고 검수 플레이어도 사용할 수 있습니다."
+        )
+        self.reanalyze_vod_button.setVisible(self._is_live)
+        self.reanalyze_vod_button.clicked.connect(
+            lambda: self.reanalyze_as_vod_requested.emit(self.vod.vod_id)
+        )
         self.style_button = QPushButton("AI 문체 교정")
         self.style_button.setToolTip(
             "Whisper 재분석 없이 현재 타임라인만 건조한 제목형으로 교정합니다."
@@ -269,6 +280,7 @@ class TimelineDocumentEditor(QWidget):
         summary_row.addWidget(self.total_label)
         summary_row.addStretch(1)
         summary_row.addWidget(self.analyze_button)
+        summary_row.addWidget(self.reanalyze_vod_button)
         summary_row.addWidget(self.cancel_analysis_button)
         summary_row.addWidget(self.style_button)
         summary_row.addWidget(self.find_button)
@@ -430,7 +442,6 @@ class TimelineDocumentEditor(QWidget):
         preview_layout.addLayout(preview_header)
         preview_layout.addWidget(self.preview_editor)
         self.preview_card.setVisible(False)
-        root.addWidget(self.preview_card)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -454,7 +465,16 @@ class TimelineDocumentEditor(QWidget):
         self.content_splitter.addWidget(self.review_player)
         self.content_splitter.setStretchFactor(0, 1)
         self.content_splitter.setStretchFactor(1, 0)
-        root.addWidget(self.content_splitter, 1)
+
+        # 실시간 미리보기가 위에 세로로 쌓이면서 아래 댓글 블록이 잘리던 문제를 피하려고
+        # 미리보기(좌)와 댓글 블록(우)을 가로로 나란히 배치한다. 미리보기가 숨겨지면
+        # 좌측 칸이 접혀 댓글 블록이 전체 폭을 차지하므로 평소 편집 화면은 그대로다.
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.body_splitter.addWidget(self.preview_card)
+        self.body_splitter.addWidget(self.content_splitter)
+        self.body_splitter.setStretchFactor(0, 0)
+        self.body_splitter.setStretchFactor(1, 1)
+        root.addWidget(self.body_splitter, 1)
 
         self.status_label = QLabel("변경 내용은 자동으로 저장됩니다.")
         self.status_label.setObjectName("statusText")
@@ -643,6 +663,7 @@ class TimelineDocumentEditor(QWidget):
 
     def set_live_running(self, running: bool) -> None:
         self.analyze_button.setVisible(False)
+        self.reanalyze_vod_button.setVisible(self._is_live and not running)
         self.cancel_analysis_button.setVisible(running)
         self.cancel_analysis_button.setText(
             "라이브 종료 요청됨…" if not running else "라이브 종료 및 정리"

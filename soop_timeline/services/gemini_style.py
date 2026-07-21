@@ -184,6 +184,7 @@ def build_style_prompt(parsed: ParsedTimelineDocument) -> str:
 - line_id와 타임스탬프는 수정하지 않습니다.
 - 항목을 추가·삭제·병합·분할하거나 순서를 바꾸지 않습니다.
 - 원문에 없는 사실과 감정을 추측하지 않습니다.
+- 큰따옴표("…")로 감싼 스트리머 직접 인용은 말투·종결어미 그대로 두고 문체를 바꾸지 않습니다. 큰따옴표 밖의 메모만 건조하게 교정합니다.
 
 {DRY_TIMELINE_STYLE_GUIDE}
 

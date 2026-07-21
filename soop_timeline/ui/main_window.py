@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -411,6 +412,8 @@ class MainWindow(QMainWindow):
         self.vod_table.verticalHeader().setVisible(False)
         self.vod_table.verticalHeader().setDefaultSectionSize(43)
         self.vod_table.cellDoubleClicked.connect(self.open_vod_from_row)
+        self.vod_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.vod_table.customContextMenuRequested.connect(self._show_vod_context_menu)
 
         header = self.vod_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -813,6 +816,7 @@ class MainWindow(QMainWindow):
         editor.review_completed.connect(self._mark_review_complete)
         editor.analysis_requested.connect(self.start_analysis)
         editor.analysis_cancel_requested.connect(self.cancel_analysis)
+        editor.reanalyze_as_vod_requested.connect(self.reanalyze_live_as_vod)
         editor.style_requested.connect(self.start_style_correction)
         editor.regroup_requested.connect(self.start_topic_regroup)
         editor.snapshot_requested.connect(self._snapshot_timeline)
@@ -1100,6 +1104,37 @@ class MainWindow(QMainWindow):
                 "이전 실행에서 중단된 분석을 체크포인트부터 재개합니다…"
             )
         self.start_analysis(vod_id, _from_queue=True)
+
+    def reanalyze_live_as_vod(self, live_vod_id: str) -> None:
+        """Analyze the finished broadcast's full replay VOD from scratch.
+
+        The live session only captured audio from the join time onward, so a
+        completed replay is re-run through the normal manual-link → VOD path
+        (real vod_id, working review player, full-length transcript).
+        """
+        if self._active_jobs():
+            QMessageBox.information(
+                self,
+                "AI 작업 진행 중",
+                "다른 AI 작업이 끝난 뒤 다시보기 전체 분석을 시작하세요.",
+            )
+            return
+        if self.database.get_vod(live_vod_id) is None:
+            return
+        link, accepted = QInputDialog.getText(
+            self,
+            "다시보기 전체로 재분석",
+            "방송이 끝난 뒤 올라온 ‘다시보기’ 영상 주소를 붙여넣으세요.\n"
+            "라이브 페이지가 아니라 vod.sooplive.com 다시보기 주소여야 전체가 분석됩니다.\n"
+            "예: https://vod.sooplive.com/player/00000000",
+        )
+        if not accepted:
+            return
+        link = link.strip()
+        if not link:
+            return
+        self.manual_link_input.setText(link)
+        self.resolve_manual_link()
 
     def start_analysis(self, vod_id: str, *, _from_queue: bool = False) -> None:
         vod = self.database.get_vod(vod_id)
@@ -1630,6 +1665,95 @@ class MainWindow(QMainWindow):
                 0,
                 lambda: self.start_analysis(next_vod_id, _from_queue=True),
             )
+
+    def _vod_active_job(self, vod_id: str) -> bool:
+        return (
+            vod_id in self._analysis_jobs
+            or vod_id in self._analysis_queue
+            or vod_id in self._live_jobs
+            or vod_id in self._style_jobs
+            or vod_id in self._regroup_jobs
+        )
+
+    def _show_vod_context_menu(self, pos) -> None:
+        item = self.vod_table.itemAt(pos)
+        if item is None:
+            return
+        id_item = self.vod_table.item(item.row(), 0)
+        if id_item is None:
+            return
+        vod_id = str(id_item.data(Qt.ItemDataRole.UserRole))
+        vod = self.database.get_vod(vod_id)
+        if vod is None:
+            return
+
+        menu = QMenu(self)
+        if self._vod_active_job(vod_id):
+            cancel_action = menu.addAction("AI 작업 취소")
+            cancel_action.triggered.connect(
+                lambda _=False, vid=vod_id: self._cancel_or_dequeue(vid)
+            )
+        delete_action = menu.addAction("목록에서 삭제")
+        delete_action.triggered.connect(
+            lambda _=False, vid=vod_id: self.delete_vod_entry(vid)
+        )
+        menu.exec(self.vod_table.viewport().mapToGlobal(pos))
+
+    def _cancel_or_dequeue(self, vod_id: str) -> None:
+        if vod_id in self._analysis_jobs or vod_id in self._live_jobs:
+            self.cancel_analysis(vod_id)
+            return
+        if vod_id in self._analysis_queue:
+            self._analysis_queue.remove(vod_id)
+            self.database.remove_analysis_queue(vod_id)
+            self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.status_label.setText("분석 대기를 취소했습니다.")
+            self.status_label.setText("분석 대기열에서 제거했습니다.")
+            self.load_vods()
+            return
+        job = self._style_jobs.get(vod_id) or self._regroup_jobs.get(vod_id)
+        if job is not None:
+            job[0].requestInterruption()
+            self.status_label.setText("진행 중인 AI 작업 취소를 요청했습니다…")
+
+    def delete_vod_entry(self, vod_id: str) -> None:
+        if self._vod_active_job(vod_id):
+            QMessageBox.information(
+                self,
+                "AI 작업 진행 중",
+                "이 항목의 AI 작업을 먼저 취소한 뒤 삭제하세요.",
+            )
+            return
+        vod = self.database.get_vod(vod_id)
+        if vod is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "목록에서 삭제",
+            f"'{vod.title}' 항목과 저장된 타임라인·이전 버전·자막 캐시를 삭제할까요?\n"
+            "SOOP의 원본 영상은 지워지지 않지만, 이 프로그램의 기록은 복구할 수 없습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        editor = self._editor_tabs.pop(vod_id, None)
+        if editor is not None:
+            editor.blockSignals(True)
+            index = self.tabs.indexOf(editor)
+            if index >= 0:
+                self.tabs.removeTab(index)
+            editor.deleteLater()
+        if vod_id in self._analysis_queue:
+            self._analysis_queue.remove(vod_id)
+        self.database.remove_analysis_queue(vod_id)
+        remove_vod_cache(vod_id)
+        self.database.delete_vod(vod_id)
+        self.load_vods()
+        self.status_label.setText("항목을 목록에서 삭제했습니다.")
 
     def open_vod_from_row(self, row: int, column: int) -> None:
         del column

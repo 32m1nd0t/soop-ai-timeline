@@ -27,23 +27,47 @@ def build_player_url(vod_id: str) -> QUrl:
     return url
 
 
+# SOOP's embed can hold several <video> elements: an empty placeholder plus the
+# real replay, and — when the streamer is live again — a 'VOD 보기' promo layer
+# over an unloaded (black) replay. This helper dismisses that layer and returns
+# the element that actually has media, instead of the first <video> in the DOM.
+_PICK_VIDEO_FN = """
+function __pickVod() {
+    const vodButton = Array.from(
+        document.querySelectorAll('button, a, [role="button"]')
+    ).find((element) => (element.textContent || '').trim() === 'VOD 보기');
+    if (vodButton && vodButton.offsetParent !== null) {
+        vodButton.click();
+    }
+    const videos = Array.from(document.querySelectorAll('video'));
+    if (!videos.length) { return null; }
+    let best = null;
+    let bestScore = -1;
+    for (const candidate of videos) {
+        const duration = Number(candidate.duration);
+        let seekEnd = 0;
+        try {
+            if (candidate.seekable && candidate.seekable.length) {
+                seekEnd = Number(candidate.seekable.end(candidate.seekable.length - 1));
+            }
+        } catch (_) {}
+        let score = 0;
+        if (Number.isFinite(duration) && duration > 0) { score += 4; }
+        if (seekEnd > 0) { score += 2; }
+        if (candidate.currentSrc || candidate.src) { score += 1; }
+        score += (Number(candidate.readyState) || 0) * 0.1;
+        if (score > bestScore) { bestScore = score; best = candidate; }
+    }
+    return best;
+}
+"""
+
+
 def build_seek_script(seconds: int) -> str:
     target = max(0, int(seconds))
-    return f"""
+    return (_PICK_VIDEO_FN + f"""
 const target = {target};
-
-// When the streamer is currently live, SOOP can place a 'VOD 보기' layer
-// over the requested replay. Select the replay before looking for its video.
-const vodButton = Array.from(
-    document.querySelectorAll('button, a, [role="button"]')
-).find((element) => (element.textContent || '').trim() === 'VOD 보기');
-if (vodButton && vodButton.offsetParent !== null) {{
-    vodButton.click();
-}}
-
-const video = document.querySelector('video#video')
-    || document.querySelector('#video video')
-    || document.querySelector('video');
+const video = __pickVod();
 if (!video) {{
     return {{ ok: false, reason: 'video-not-found' }};
 }}
@@ -90,16 +114,33 @@ try {{
         message: String(error)
     }};
 }}
-""".strip()
+""").strip()
+
+
+def build_activate_script() -> str:
+    """Dismiss the live overlay and start muted playback so the replay shows."""
+    return (_PICK_VIDEO_FN + """
+const video = __pickVod();
+if (!video) {
+    return { ok: false, reason: 'video-not-found' };
+}
+try {
+    video.muted = true;
+    try { await video.play(); } catch (_) {}
+} catch (_) {}
+return {
+    ok: true,
+    readyState: Number(video.readyState || 0),
+    hasMedia: Boolean(video.currentSrc || video.src)
+};
+""").strip()
 
 
 def build_player_action_script(action: str, value: int = 0) -> str:
     safe_action = action if action in {"position", "toggle", "relative"} else "position"
     amount = int(value)
-    return f"""
-const video = document.querySelector('video#video')
-    || document.querySelector('#video video')
-    || document.querySelector('video');
+    return (_PICK_VIDEO_FN + f"""
+const video = __pickVod();
 if (!video) {{
     return {{ ok: false, reason: 'video-not-found' }};
 }}
@@ -119,7 +160,7 @@ return {{
     currentTime: Number(video.currentTime || 0),
     paused: Boolean(video.paused)
 }};
-""".strip()
+""").strip()
 
 
 class SoopReviewPlayer(QFrame):
@@ -140,6 +181,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_generation = 0
         self._seek_attempts = 0
         self._seek_in_flight = False
+        self._activate_attempts = 0
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -205,6 +247,25 @@ class SoopReviewPlayer(QFrame):
             self.status_changed.emit("SOOP 검수 플레이어를 불러옵니다…")
             self.time_label.setText("Edge 플레이어 준비 중…")
             self.web_view.load_url(build_player_url(self.vod.vod_id).toString())
+        elif self._dom_loaded and self._pending_seconds is None:
+            self._activate_playback()
+
+    def _activate_playback(self) -> None:
+        """Nudge the replay to load and play so the player is not left black."""
+        self._activate_attempts = 0
+        self._activate_once()
+
+    def _activate_once(self) -> None:
+        if self._pending_seconds is not None:
+            return  # A pending seek will start playback instead.
+        if not self._dom_loaded or not self.web_view.is_ready:
+            return
+        self.web_view.evaluate_js(build_activate_script())
+        self._activate_attempts += 1
+        # The replay video only attaches its source after the live overlay is
+        # dismissed, so retry a few times over the first few seconds.
+        if self._activate_attempts < 4:
+            QTimer.singleShot(1200, self._activate_once)
 
     def seek_to(self, seconds: int) -> None:
         value = max(0, int(seconds))
@@ -280,6 +341,7 @@ class SoopReviewPlayer(QFrame):
         if self._pending_seconds is None:
             self.time_label.setText("시간을 더블클릭하세요")
             self.status_changed.emit("SOOP 검수 플레이어를 열었습니다.")
+            self._activate_playback()
             return
         self._attempt_seek()
         if not self._retry_timer.isActive():
