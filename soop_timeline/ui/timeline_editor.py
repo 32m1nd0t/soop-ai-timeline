@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QMouseEvent, QTextCursor
+from PySide6.QtGui import (
+    QDesktopServices,
+    QKeySequence,
+    QMouseEvent,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -18,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Vod
+from ..services.text_editing import find_literal_matches, replace_literal_all
 from ..services.timeline_blocks import COMMENT_LIMIT, block_label, split_timeline
 from ..services.timeline_timestamp import timestamp_at_position
 from .review_player import SoopReviewPlayer
@@ -130,6 +139,9 @@ class TimelineDocumentEditor(QWidget):
         self._analyzer_available = analyzer_available
         self._style_available = style_available
         self._is_live = vod.source_kind == "live"
+        self._search_matches: list[tuple[int, int]] = []
+        self._search_index = -1
+        self._find_replace_undo_text: str | None = None
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -203,6 +215,9 @@ class TimelineDocumentEditor(QWidget):
         self.style_button.clicked.connect(
             lambda: self.style_requested.emit(self.vod.vod_id)
         )
+        self.find_button = QPushButton("찾기·바꾸기")
+        self.find_button.setToolTip("전체 댓글 블록에서 단어를 찾거나 일괄 변경합니다. (Ctrl+F)")
+        self.find_button.clicked.connect(self.toggle_find_replace)
         self.copy_all_button = QPushButton("전체 텍스트 복사")
         self.copy_all_button.clicked.connect(self.copy_all)
         self.ready_button = QPushButton("검수 완료")
@@ -216,10 +231,26 @@ class TimelineDocumentEditor(QWidget):
         summary_row.addWidget(self.analyze_button)
         summary_row.addWidget(self.cancel_analysis_button)
         summary_row.addWidget(self.style_button)
+        summary_row.addWidget(self.find_button)
         summary_row.addWidget(self.copy_all_button)
         summary_row.addWidget(self.ready_button)
         summary_row.addWidget(self.publish_button)
         root.addLayout(summary_row)
+
+        self.find_replace_bar = self._build_find_replace_bar()
+        self.find_replace_bar.setVisible(False)
+        root.addWidget(self.find_replace_bar)
+
+        self.find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self.find_shortcut.activated.connect(self.show_find_replace)
+        self.replace_shortcut = QShortcut(QKeySequence("Ctrl+H"), self)
+        self.replace_shortcut.activated.connect(
+            lambda: self.show_find_replace(focus_replace=True)
+        )
+        self.find_next_shortcut = QShortcut(QKeySequence("F3"), self)
+        self.find_next_shortcut.activated.connect(self.find_next)
+        self.find_previous_shortcut = QShortcut(QKeySequence("Shift+F3"), self)
+        self.find_previous_shortcut.activated.connect(self.find_previous)
 
         self.analysis_progress = QProgressBar()
         self.analysis_progress.setRange(0, 100)
@@ -291,6 +322,68 @@ class TimelineDocumentEditor(QWidget):
         )
         self.set_style_availability(style_available, style_unavailable_reason)
         self.set_text(text)
+
+    def _build_find_replace_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("editorCard")
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(8)
+
+        find_row = QHBoxLayout()
+        find_label = QLabel("찾기")
+        find_label.setObjectName("sectionTitle")
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("찾을 단어 또는 문장")
+        self.find_input.setClearButtonEnabled(True)
+        self.find_input.textChanged.connect(
+            lambda: self._refresh_find_matches(reset=True)
+        )
+        self.find_input.returnPressed.connect(self.find_next)
+        self.match_label = QLabel("검색어를 입력하세요")
+        self.match_label.setObjectName("muted")
+        self.case_sensitive_check = QCheckBox("대소문자 구분")
+        self.case_sensitive_check.toggled.connect(
+            lambda: self._refresh_find_matches(reset=True)
+        )
+        previous_button = QPushButton("이전")
+        previous_button.clicked.connect(self.find_previous)
+        next_button = QPushButton("다음")
+        next_button.clicked.connect(self.find_next)
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(self.hide_find_replace)
+
+        find_row.addWidget(find_label)
+        find_row.addWidget(self.find_input, 1)
+        find_row.addWidget(self.match_label)
+        find_row.addWidget(self.case_sensitive_check)
+        find_row.addWidget(previous_button)
+        find_row.addWidget(next_button)
+        find_row.addWidget(close_button)
+        layout.addLayout(find_row)
+
+        replace_row = QHBoxLayout()
+        replace_label = QLabel("바꾸기")
+        replace_label.setObjectName("sectionTitle")
+        self.replace_input = QLineEdit()
+        self.replace_input.setPlaceholderText("바꿀 내용 · 비워 두면 삭제")
+        self.replace_input.returnPressed.connect(self.replace_current_match)
+        replace_button = QPushButton("현재 항목 변경")
+        replace_button.clicked.connect(self.replace_current_match)
+        replace_all_button = QPushButton("모두 변경")
+        replace_all_button.setObjectName("primaryButton")
+        replace_all_button.clicked.connect(self.replace_all_matches)
+        self.undo_replace_button = QPushButton("변경 되돌리기")
+        self.undo_replace_button.setEnabled(False)
+        self.undo_replace_button.clicked.connect(self.undo_find_replace)
+
+        replace_row.addWidget(replace_label)
+        replace_row.addWidget(self.replace_input, 1)
+        replace_row.addWidget(replace_button)
+        replace_row.addWidget(replace_all_button)
+        replace_row.addWidget(self.undo_replace_button)
+        layout.addLayout(replace_row)
+        return bar
 
     def set_analyzer_availability(self, available: bool, reason: str = "") -> None:
         self._analyzer_available = available
@@ -447,6 +540,202 @@ class TimelineDocumentEditor(QWidget):
     def set_text(self, text: str) -> None:
         self._replace_blocks(split_timeline(text))
 
+    def toggle_find_replace(self) -> None:
+        if self.find_replace_bar.isVisible():
+            self.hide_find_replace()
+        else:
+            self.show_find_replace()
+
+    def show_find_replace(self, focus_replace: bool = False) -> None:
+        self.find_replace_bar.setVisible(True)
+        self._refresh_find_matches(reset=False)
+        target = self.replace_input if focus_replace else self.find_input
+        target.setFocus()
+        target.selectAll()
+
+    def hide_find_replace(self) -> None:
+        self.find_replace_bar.setVisible(False)
+
+    def find_next(self) -> None:
+        self._navigate_find(1)
+
+    def find_previous(self) -> None:
+        self._navigate_find(-1)
+
+    def _navigate_find(self, direction: int) -> None:
+        self._refresh_find_matches(reset=False)
+        if not self.find_input.text():
+            self.status_label.setText("찾을 단어나 문장을 입력하세요.")
+            return
+        if not self._search_matches:
+            self.status_label.setText("일치하는 내용을 찾지 못했습니다.")
+            return
+
+        if self._search_index < 0:
+            anchor = self._global_cursor_position()
+            if direction > 0:
+                next_indexes = [
+                    index
+                    for index, (start, _) in enumerate(self._search_matches)
+                    if start >= anchor
+                ]
+                self._search_index = next_indexes[0] if next_indexes else 0
+            else:
+                previous_indexes = [
+                    index
+                    for index, (_, end) in enumerate(self._search_matches)
+                    if end <= anchor
+                ]
+                self._search_index = (
+                    previous_indexes[-1]
+                    if previous_indexes
+                    else len(self._search_matches) - 1
+                )
+        else:
+            self._search_index = (
+                self._search_index + direction
+            ) % len(self._search_matches)
+        self._select_search_match(self._search_index)
+
+    def _refresh_find_matches(self, *, reset: bool) -> None:
+        previous_start: int | None = None
+        if 0 <= self._search_index < len(self._search_matches):
+            previous_start = self._search_matches[self._search_index][0]
+        self._search_matches = find_literal_matches(
+            self.text(),
+            self.find_input.text(),
+            case_sensitive=self.case_sensitive_check.isChecked(),
+        )
+        if reset:
+            self._search_index = -1
+        elif previous_start is not None:
+            self._search_index = next(
+                (
+                    index
+                    for index, (start, _) in enumerate(self._search_matches)
+                    if start == previous_start
+                ),
+                -1,
+            )
+        elif self._search_index >= len(self._search_matches):
+            self._search_index = -1
+        self._update_match_label()
+
+    def _update_match_label(self) -> None:
+        if not self.find_input.text():
+            self.match_label.setText("검색어를 입력하세요")
+        elif not self._search_matches:
+            self.match_label.setText("0개")
+        elif 0 <= self._search_index < len(self._search_matches):
+            self.match_label.setText(
+                f"{self._search_index + 1} / {len(self._search_matches)}개"
+            )
+        else:
+            self.match_label.setText(f"{len(self._search_matches)}개")
+
+    def _global_cursor_position(self) -> int:
+        consumed = 0
+        for block in self._blocks:
+            if block.editor.hasFocus():
+                return consumed + block.editor.textCursor().position()
+            consumed += len(block.text())
+        return 0
+
+    def _select_search_match(self, index: int) -> None:
+        if not 0 <= index < len(self._search_matches):
+            return
+        start, end = self._search_matches[index]
+        consumed = 0
+        for block_index, block in enumerate(self._blocks):
+            block_end = consumed + len(block.text())
+            if start < block_end or block_index == len(self._blocks) - 1:
+                local_start = max(0, start - consumed)
+                local_end = min(len(block.text()), max(local_start, end - consumed))
+                cursor = block.editor.textCursor()
+                cursor.setPosition(local_start)
+                cursor.setPosition(local_end, QTextCursor.MoveMode.KeepAnchor)
+                block.editor.setTextCursor(cursor)
+                block.editor.setFocus()
+                block.editor.ensureCursorVisible()
+                self.scroll.ensureWidgetVisible(block, 0, 70)
+                break
+            consumed = block_end
+        self._update_match_label()
+        self.status_label.setText(
+            f"검색 결과 {index + 1}/{len(self._search_matches)}"
+        )
+
+    def replace_current_match(self) -> None:
+        self._refresh_find_matches(reset=False)
+        if not self._search_matches:
+            self.status_label.setText("변경할 검색 결과가 없습니다.")
+            return
+        if not 0 <= self._search_index < len(self._search_matches):
+            self.find_next()
+        if not 0 <= self._search_index < len(self._search_matches):
+            return
+
+        start, end = self._search_matches[self._search_index]
+        original = self.text()
+        replacement = self.replace_input.text()
+        updated = original[:start] + replacement + original[end:]
+        self._apply_find_replace_text(original, updated)
+        self._refresh_find_matches(reset=True)
+
+        next_position = start + len(replacement)
+        next_index = next(
+            (
+                index
+                for index, (match_start, _) in enumerate(self._search_matches)
+                if match_start >= next_position
+            ),
+            -1,
+        )
+        if next_index >= 0:
+            self._search_index = next_index
+            self._select_search_match(next_index)
+        else:
+            self._update_match_label()
+        self.status_label.setText("현재 검색 결과를 변경했습니다.")
+
+    def replace_all_matches(self) -> None:
+        query = self.find_input.text()
+        if not query:
+            self.status_label.setText("찾을 단어나 문장을 입력하세요.")
+            return
+        original = self.text()
+        updated, count = replace_literal_all(
+            original,
+            query,
+            self.replace_input.text(),
+            case_sensitive=self.case_sensitive_check.isChecked(),
+        )
+        if count == 0:
+            self.status_label.setText("변경할 검색 결과가 없습니다.")
+            return
+        self._apply_find_replace_text(original, updated)
+        self._refresh_find_matches(reset=True)
+        self.status_label.setText(f"전체 문서에서 {count:,}곳을 변경했습니다.")
+
+    def _apply_find_replace_text(self, original: str, updated: str) -> None:
+        if original == updated:
+            return
+        self._find_replace_undo_text = original
+        self.undo_replace_button.setEnabled(True)
+        self.set_text(updated)
+        self._save_timer.start()
+
+    def undo_find_replace(self) -> None:
+        if self._find_replace_undo_text is None:
+            return
+        previous = self._find_replace_undo_text
+        self._find_replace_undo_text = None
+        self.undo_replace_button.setEnabled(False)
+        self.set_text(previous)
+        self._save_timer.start()
+        self._refresh_find_matches(reset=True)
+        self.status_label.setText("마지막 찾기·바꾸기 작업을 되돌렸습니다.")
+
     def copy_all(self) -> None:
         QApplication.clipboard().setText(self.text())
         self.status_label.setText("전체 타임라인을 클립보드에 복사했습니다.")
@@ -510,7 +799,11 @@ class TimelineDocumentEditor(QWidget):
     def _on_block_changed(self) -> None:
         if self._rebuilding:
             return
+        self._find_replace_undo_text = None
+        self.undo_replace_button.setEnabled(False)
         self._update_summary()
+        if self.find_replace_bar.isVisible():
+            self._refresh_find_matches(reset=False)
         self._save_timer.start()
         self._rebalance_timer.start()
 
@@ -570,6 +863,8 @@ class TimelineDocumentEditor(QWidget):
 
         self._rebuilding = False
         self._update_summary()
+        if hasattr(self, "find_input"):
+            self._refresh_find_matches(reset=False)
         self.blocks_layout.invalidate()
         self.blocks_layout.activate()
         self.scroll_content.updateGeometry()
