@@ -37,7 +37,10 @@ class AIProviderTests(unittest.TestCase):
         self.assertEqual(estimate_timeline_calls(45 * 60), 2)
         self.assertGreater(estimate_timeline_calls(8 * 3600), 2)
 
-    def test_schema_is_strict_for_nested_objects(self):
+    def test_schema_strips_additional_properties_for_nested_objects(self):
+        # The Gemini API rejects ``additionalProperties`` with 400
+        # INVALID_ARGUMENT, so it must be removed from every node, including
+        # any that were provided on the input schema.
         schema = {
             "type": "object",
             "properties": {
@@ -47,15 +50,21 @@ class AIProviderTests(unittest.TestCase):
                         "type": "object",
                         "properties": {"name": {"type": "string"}},
                         "required": ["name"],
+                        "additionalProperties": False,
                     },
                 }
             },
             "required": ["items"],
+            "additionalProperties": False,
         }
         strict = strict_json_schema(schema)
-        self.assertFalse(strict["additionalProperties"])
-        self.assertFalse(strict["properties"]["items"]["items"]["additionalProperties"])
-        self.assertNotIn("additionalProperties", schema)
+        self.assertNotIn("additionalProperties", strict)
+        self.assertNotIn(
+            "additionalProperties",
+            strict["properties"]["items"]["items"],
+        )
+        # The input schema must not be mutated in place.
+        self.assertIn("additionalProperties", schema)
 
     def test_usage_is_recorded_for_connection_test(self):
         provider = FakeProvider("key", "model")
