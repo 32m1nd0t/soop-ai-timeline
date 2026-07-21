@@ -278,14 +278,19 @@ def create_ai_provider(
 
 
 def strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
-    """Return a defensive schema for Gemini structured JSON output."""
+    """Return a schema Gemini's structured output accepts.
+
+    The Gemini (AI Studio) API rejects the ``additionalProperties`` field with
+    ``400 INVALID_ARGUMENT``, so it is stripped from every node before the
+    request is sent.
+    """
     result = deepcopy(schema)
 
     def visit(node: object) -> None:
         if not isinstance(node, dict):
             return
-        if node.get("type") == "object":
-            node.setdefault("additionalProperties", False)
+        node.pop("additionalProperties", None)
+        node.pop("additional_properties", None)
         properties = node.get("properties")
         if isinstance(properties, dict):
             for child in properties.values():
