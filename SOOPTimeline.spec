@@ -46,6 +46,24 @@ for package in (
 
 hiddenimports += collect_submodules("keyring.backends")
 
+# faster-whisper's ctranslate2 backend only loads cuBLAS (plus the small cuDNN
+# dispatcher, cudnn64_9.dll) for Whisper GPU inference; the heavy cuDNN engine
+# DLLs below are never loaded. PyInstaller's bundled hooks (hook-nvidia.*)
+# collect every CUDA DLL regardless of the collect_all() above, so these are
+# dropped from the final Analysis TOC to cut ~760 MB without losing GPU speed.
+# Verified against the loaded modules of a real large-v3-turbo CUDA
+# transcription: only cublas64_12.dll, cublasLt64_12.dll and cudnn64_9.dll load.
+UNUSED_CUDA_DLLS = {
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "nvblas64_12.dll",
+}
+
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -59,6 +77,15 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+
+def _strip_unused_cuda(toc):
+    return [entry for entry in toc if os.path.basename(entry[0]).lower() not in UNUSED_CUDA_DLLS]
+
+
+a.binaries = _strip_unused_cuda(a.binaries)
+a.datas = _strip_unused_cuda(a.datas)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
