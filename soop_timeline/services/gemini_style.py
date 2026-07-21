@@ -5,15 +5,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .ai_provider import (
-    DEFAULT_AI_PROVIDER,
     GEMINI_PROVIDER,
     StructuredAIProvider,
     create_ai_provider,
-    normalize_ai_provider,
-    provider_model_setting,
-    provider_spec,
 )
-from .credentials import get_ai_api_key
+from .credentials import get_gemini_api_key
 from .transcription import AnalysisCancelled
 
 
@@ -202,20 +198,17 @@ class AITimelineStyler:
 
     @classmethod
     def from_database(cls, database: object) -> "AITimelineStyler":
-        provider = normalize_ai_provider(
-            database.get_setting("ai_provider", DEFAULT_AI_PROVIDER)
-        )
-        default_model = provider_spec(provider).default_model
-        if provider == GEMINI_PROVIDER:
-            default_model = database.get_setting(
-                "gemini_model",
-                DEFAULT_GEMINI_STYLE_MODEL,
-            )
         model = database.get_setting(
-            provider_model_setting(provider),
-            default_model,
+            "gemini_model",
+            DEFAULT_GEMINI_STYLE_MODEL,
         )
-        return cls(create_ai_provider(provider, get_ai_api_key(provider), model))
+        return cls(
+            create_ai_provider(
+                GEMINI_PROVIDER,
+                get_gemini_api_key(),
+                model,
+            )
+        )
 
     @property
     def api_key(self) -> str:
@@ -272,15 +265,7 @@ class AITimelineStyler:
 
 
 class GeminiTimelineStyler(AITimelineStyler):
-    """Backward-compatible Gemini wrapper."""
+    """Gemini-backed timeline style editor."""
 
     def __init__(self, api_key: str, model_name: str = DEFAULT_GEMINI_STYLE_MODEL):
         super().__init__(create_ai_provider(GEMINI_PROVIDER, api_key, model_name))
-
-
-def create_timeline_styler(
-    provider: str,
-    api_key: str,
-    model_name: str,
-) -> AITimelineStyler:
-    return AITimelineStyler(create_ai_provider(provider, api_key, model_name))

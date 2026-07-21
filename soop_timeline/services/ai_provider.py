@@ -14,8 +14,6 @@ from .transcription import AnalysisCancelled
 
 
 GEMINI_PROVIDER = "gemini"
-OPENAI_PROVIDER = "openai"
-ANTHROPIC_PROVIDER = "anthropic"
 DEFAULT_AI_PROVIDER = GEMINI_PROVIDER
 
 
@@ -38,28 +36,12 @@ AI_PROVIDER_SPECS: dict[str, AIProviderSpec] = {
         "GEMINI_API_KEY",
         "google.genai",
     ),
-    OPENAI_PROVIDER: AIProviderSpec(
-        OPENAI_PROVIDER,
-        "OpenAI",
-        "gpt-5.6-luna",
-        "OpenAI API 대시보드에서 발급한 API 키",
-        "OPENAI_API_KEY",
-        "openai",
-    ),
-    ANTHROPIC_PROVIDER: AIProviderSpec(
-        ANTHROPIC_PROVIDER,
-        "Anthropic Claude",
-        "claude-sonnet-4-6",
-        "Anthropic Console에서 발급한 API 키",
-        "ANTHROPIC_API_KEY",
-        "anthropic",
-    ),
 }
 
 
 def normalize_ai_provider(value: str) -> str:
     provider = str(value or "").strip().lower()
-    return provider if provider in AI_PROVIDER_SPECS else DEFAULT_AI_PROVIDER
+    return provider if provider == GEMINI_PROVIDER else DEFAULT_AI_PROVIDER
 
 
 def provider_spec(provider: str) -> AIProviderSpec:
@@ -254,86 +236,6 @@ class GeminiProvider(StructuredAIProvider):
         )
 
 
-class OpenAIProvider(StructuredAIProvider):
-    @property
-    def provider_id(self) -> str:
-        return OPENAI_PROVIDER
-
-    def _perform_request(
-        self,
-        prompt: str,
-        schema: dict[str, object],
-        *,
-        purpose: str,
-    ) -> StructuredAIResponse:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=self.api_key)
-        response = client.responses.create(
-            model=self.model_name,
-            input=prompt,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": _schema_name(purpose),
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            store=False,
-        )
-        text = str(getattr(response, "output_text", "") or "").strip()
-        payload = _parse_json_text(text, self.display_name)
-        usage = getattr(response, "usage", None)
-        return StructuredAIResponse(
-            payload,
-            _int_attr(usage, "input_tokens"),
-            _int_attr(usage, "output_tokens"),
-        )
-
-
-class AnthropicProvider(StructuredAIProvider):
-    @property
-    def provider_id(self) -> str:
-        return ANTHROPIC_PROVIDER
-
-    def _perform_request(
-        self,
-        prompt: str,
-        schema: dict[str, object],
-        *,
-        purpose: str,
-    ) -> StructuredAIResponse:
-        del purpose
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=self.api_key)
-        response = client.messages.create(
-            model=self.model_name,
-            max_tokens=16_384,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={
-                "format": {
-                    "type": "json_schema",
-                    "schema": schema,
-                }
-            },
-        )
-        blocks = getattr(response, "content", []) or []
-        text = "".join(
-            str(getattr(block, "text", "") or "")
-            for block in blocks
-            if getattr(block, "type", "text") == "text"
-        ).strip()
-        payload = _parse_json_text(text, self.display_name)
-        usage = getattr(response, "usage", None)
-        return StructuredAIResponse(
-            payload,
-            _int_attr(usage, "input_tokens"),
-            _int_attr(usage, "output_tokens"),
-        )
-
-
 def create_ai_provider(
     provider: str,
     api_key: str,
@@ -341,15 +243,11 @@ def create_ai_provider(
 ) -> StructuredAIProvider:
     normalized = normalize_ai_provider(provider)
     model = model_name.strip() or provider_spec(normalized).default_model
-    if normalized == OPENAI_PROVIDER:
-        return OpenAIProvider(api_key, model)
-    if normalized == ANTHROPIC_PROVIDER:
-        return AnthropicProvider(api_key, model)
     return GeminiProvider(api_key, model)
 
 
 def strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
-    """Return a cross-provider schema accepted by strict JSON modes."""
+    """Return a defensive schema for Gemini structured JSON output."""
     result = deepcopy(schema)
 
     def visit(node: object) -> None:
@@ -402,11 +300,6 @@ def _int_attr(value: object, name: str) -> int:
         return max(0, int(getattr(value, name, 0) or 0))
     except (TypeError, ValueError):
         return 0
-
-
-def _schema_name(value: str) -> str:
-    cleaned = "".join(character if character.isalnum() else "_" for character in value)
-    return (cleaned.strip("_") or "soop_timeline")[:64]
 
 
 def _safe_error(error: Exception | None) -> str:

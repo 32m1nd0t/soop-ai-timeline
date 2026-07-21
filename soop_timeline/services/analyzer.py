@@ -8,21 +8,14 @@ from typing import Callable
 
 from ..models import Vod
 from ..paths import analysis_data_dir
-from .ai_provider import (
-    DEFAULT_AI_PROVIDER,
-    create_ai_provider,
-    normalize_ai_provider,
-    provider_model_setting,
-    provider_spec,
-)
-from .credentials import get_ai_api_key
+from .ai_provider import GEMINI_PROVIDER, create_ai_provider
+from .credentials import get_gemini_api_key
 from .gemini_timeline import (
     AITimelineGenerator,
     DEFAULT_TOPIC_GRANULARITY,
     GeneratedTimeline,
     GeminiTimelineGenerator,
     TimelineEntry,
-    create_timeline_generator,
     deduplicate_entries,
 )
 from .transcription import (
@@ -55,25 +48,6 @@ class AnalyzerConfig:
     whisper_device: str = "auto"
     gemini_api_key: str = ""
     topic_granularity: str = DEFAULT_TOPIC_GRANULARITY
-    ai_provider: str = DEFAULT_AI_PROVIDER
-    ai_model: str = ""
-    api_key: str = ""
-
-    @property
-    def selected_provider(self) -> str:
-        return normalize_ai_provider(self.ai_provider)
-
-    @property
-    def selected_model(self) -> str:
-        if self.ai_model.strip():
-            return self.ai_model.strip()
-        if self.selected_provider == "gemini" and self.gemini_model.strip():
-            return self.gemini_model.strip()
-        return provider_spec(self.selected_provider).default_model
-
-    @property
-    def selected_api_key(self) -> str:
-        return self.api_key.strip() or self.gemini_api_key.strip()
 
 
 class TimelineAnalyzer(ABC):
@@ -166,8 +140,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             )
         )
         self._generator_factory = generator_factory or (
-            lambda key, model: create_timeline_generator(
-                config.selected_provider,
+            lambda key, model: GeminiTimelineGenerator(
                 key,
                 model,
                 topic_granularity=config.topic_granularity,
@@ -177,40 +150,28 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
     @classmethod
     def from_database(cls, database: object) -> "LocalWhisperGeminiAnalyzer":
-        provider = normalize_ai_provider(
-            database.get_setting("ai_provider", DEFAULT_AI_PROVIDER)
-        )
-        default_model = provider_spec(provider).default_model
-        legacy_gemini_model = database.get_setting(
-            "gemini_model",
-            DEFAULT_GEMINI_MODEL,
-        )
-        model_default = legacy_gemini_model if provider == "gemini" else default_model
         return cls(
             AnalyzerConfig(
-                gemini_model=legacy_gemini_model,
+                gemini_model=database.get_setting(
+                    "gemini_model",
+                    DEFAULT_GEMINI_MODEL,
+                ),
                 whisper_model=database.get_setting("whisper_model", DEFAULT_WHISPER_MODEL),
                 whisper_device=database.get_setting("whisper_device", "auto"),
-                gemini_api_key=get_ai_api_key("gemini"),
+                gemini_api_key=get_gemini_api_key(),
                 topic_granularity=database.get_setting(
                     "topic_granularity",
                     DEFAULT_TOPIC_GRANULARITY,
                 ),
-                ai_provider=provider,
-                ai_model=database.get_setting(
-                    provider_model_setting(provider),
-                    model_default,
-                ),
-                api_key=get_ai_api_key(provider),
             )
         )
 
     @property
     def available(self) -> bool:
         provider = create_ai_provider(
-            self.config.selected_provider,
-            self.config.selected_api_key,
-            self.config.selected_model,
+            GEMINI_PROVIDER,
+            self.config.gemini_api_key,
+            self.config.gemini_model,
         )
         if not provider.available:
             return False
@@ -223,9 +184,9 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
     @property
     def unavailable_reason(self) -> str:
         provider = create_ai_provider(
-            self.config.selected_provider,
-            self.config.selected_api_key,
-            self.config.selected_model,
+            GEMINI_PROVIDER,
+            self.config.gemini_api_key,
+            self.config.gemini_model,
         )
         if not provider.available:
             return provider.unavailable_reason
@@ -237,12 +198,12 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
     @property
     def provider_name(self) -> str:
-        return provider_spec(self.config.selected_provider).display_name
+        return "Gemini"
 
     def _new_generator(self) -> AITimelineGenerator:
         return self._generator_factory(
-            self.config.selected_api_key,
-            self.config.selected_model,
+            self.config.gemini_api_key,
+            self.config.gemini_model,
         )
 
     def _preflight(
@@ -343,10 +304,9 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 "완료된 로컬 자막이 없어 주제를 다시 묶을 수 없습니다. "
                 "먼저 영상 AI 분석을 완료하세요."
             )
-        generator = create_timeline_generator(
-            self.config.selected_provider,
-            self.config.selected_api_key,
-            self.config.selected_model,
+        generator = GeminiTimelineGenerator(
+            self.config.gemini_api_key,
+            self.config.gemini_model,
             topic_granularity=topic_granularity,
         )
         self._preflight(generator, progress, cancelled)

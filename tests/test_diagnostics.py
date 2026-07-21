@@ -19,10 +19,10 @@ class DiagnosticsTests(unittest.TestCase):
             {"SOOP_TIMELINE_DATA_DIR": directory},
         ):
             database = Database(Path(directory) / "timeline.db")
-            database.set_setting("ai_provider", "openai")
-            database.set_setting("ai_model_openai", "test-model")
+            database.set_setting("gemini_model", "test-model")
             report = build_diagnostic_report(database)
-            self.assertIn("AI 공급자: OpenAI", report)
+            self.assertIn("AI 공급자: Google Gemini", report)
+            self.assertIn("Gemini 모델: test-model", report)
             self.assertIn("API 키: 포함하지 않음", report)
 
             destination = Path(directory) / "diagnostics.zip"
@@ -30,7 +30,7 @@ class DiagnosticsTests(unittest.TestCase):
             with zipfile.ZipFile(destination) as archive:
                 self.assertIn("diagnostics.txt", archive.namelist())
                 bundled = archive.read("diagnostics.txt").decode("utf-8")
-                self.assertNotIn("OPENAI_API_KEY", bundled)
+                self.assertNotIn("GEMINI_API_KEY", bundled)
             database.close()
 
 

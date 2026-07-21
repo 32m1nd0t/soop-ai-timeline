@@ -29,13 +29,11 @@ if update_manifest_url:
     datas.append((str(update_channel_path), "."))
 
 for package in (
-    "anthropic",
     "av",
     "ctranslate2",
     "faster_whisper",
     "google.genai",
     "onnxruntime",
-    "openai",
     "qtwebview2",
     "tokenizers",
 ):

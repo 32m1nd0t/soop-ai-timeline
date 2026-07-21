@@ -292,18 +292,6 @@ class GeminiTimelineGenerator(AITimelineGenerator):
         )
 
 
-def create_timeline_generator(
-    provider: str,
-    api_key: str,
-    model_name: str,
-    topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
-) -> AITimelineGenerator:
-    return AITimelineGenerator(
-        create_ai_provider(provider, api_key, model_name),
-        topic_granularity,
-    )
-
-
 def split_transcript(
     segments: list[TranscriptSegment],
     window_seconds: float = 45 * 60,

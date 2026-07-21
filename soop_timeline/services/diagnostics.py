@@ -12,12 +12,6 @@ import zipfile
 
 from .. import __version__
 from ..paths import app_data_dir, database_path
-from .ai_provider import (
-    DEFAULT_AI_PROVIDER,
-    normalize_ai_provider,
-    provider_model_setting,
-    provider_spec,
-)
 from .transcription import detect_whisper_runtime
 
 
@@ -71,11 +65,7 @@ def install_exception_hook() -> None:
 
 
 def build_diagnostic_report(database: object) -> str:
-    provider = normalize_ai_provider(
-        database.get_setting("ai_provider", DEFAULT_AI_PROVIDER)
-    )
-    spec = provider_spec(provider)
-    model = database.get_setting(provider_model_setting(provider), spec.default_model)
+    model = database.get_setting("gemini_model", "gemini-3.5-flash")
     whisper_model = database.get_setting("whisper_model", "large-v3-turbo")
     whisper_device = database.get_setting("whisper_device", "auto")
     try:
@@ -93,8 +83,8 @@ def build_diagnostic_report(database: object) -> str:
         f"패키징 실행: {bool(getattr(sys, 'frozen', False))}",
         f"운영체제: {platform.platform()}",
         f"Python: {platform.python_version()} ({platform.architecture()[0]})",
-        f"AI 공급자: {spec.display_name}",
-        f"AI 모델: {model}",
+        "AI 공급자: Google Gemini",
+        f"Gemini 모델: {model}",
         "API 키: 포함하지 않음",
         f"Whisper 모델: {whisper_model}",
         f"Whisper 설정 장치: {whisper_device}",

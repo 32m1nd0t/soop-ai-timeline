@@ -56,14 +56,11 @@ def main() -> int:
 
 
 def _verify_packaged_dependencies() -> None:
-    import anthropic  # noqa: F401
     import av  # noqa: F401
     import keyring
     from faster_whisper import BatchedInferencePipeline, WhisperModel  # noqa: F401
     from google import genai  # noqa: F401
     from google.genai import types
-    import openai  # noqa: F401
-
     keyring.get_keyring()
     types.GenerateContentConfig(
         response_mime_type="application/json",

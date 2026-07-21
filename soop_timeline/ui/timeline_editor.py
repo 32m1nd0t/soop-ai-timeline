@@ -467,7 +467,7 @@ class TimelineDocumentEditor(QWidget):
         if self._is_live:
             self.notice.setText(
                 "라이브 연결 시 화면의 방송 경과시간을 시작 기준으로 사용합니다. "
-                "약 15초 단위로 로컬 Whisper 자막이 표시되고, 선택한 AI의 임시 "
+                "약 15초 단위로 로컬 Whisper 자막이 표시되고, Gemini의 임시 "
                 "타임라인은 첫 1분 이후 약 3분 간격으로 갱신됩니다. "
                 "SOOP 라이브에는 오디오 전용 주소가 없어 저화질 스트림을 "
                 "메모리에서 수신하되 오디오만 해독하며 파일은 저장하지 않습니다."
@@ -477,7 +477,7 @@ class TimelineDocumentEditor(QWidget):
             self.notice.setText(
                 "AI 분석을 누르면 공개 VOD의 오디오 전용 스트림을 고속으로 읽습니다. "
                 "영상과 오디오 파일은 저장하지 않으며, 로컬 Whisper가 만든 "
-                "타임스탬프 자막만 선택한 AI에 전송됩니다."
+                "타임스탬프 자막만 Gemini에 전송됩니다."
             )
         else:
             self.notice.setText(
@@ -574,7 +574,7 @@ class TimelineDocumentEditor(QWidget):
         self.ready_button.setEnabled(not running)
         if running:
             self.status_label.setText(
-                "선택한 AI가 타임스탬프를 유지하며 문체만 건조하게 교정합니다…"
+                "Gemini가 타임스탬프를 유지하며 문체만 건조하게 교정합니다…"
             )
 
     def apply_analysis_result(self, text: str) -> None:

@@ -4,7 +4,7 @@ import logging
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from ..services.ai_provider import create_ai_provider
+from ..services.ai_provider import GEMINI_PROVIDER, create_ai_provider
 
 
 logger = logging.getLogger(__name__)
@@ -15,9 +15,8 @@ class AIConnectionTestWorker(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, provider: str, api_key: str, model_name: str):
+    def __init__(self, api_key: str, model_name: str):
         super().__init__()
-        self.provider = provider
         self.api_key = api_key
         self.model_name = model_name
 
@@ -26,7 +25,7 @@ class AIConnectionTestWorker(QObject):
         thread = QThread.currentThread()
         try:
             client = create_ai_provider(
-                self.provider,
+                GEMINI_PROVIDER,
                 self.api_key,
                 self.model_name,
             )
@@ -35,7 +34,7 @@ class AIConnectionTestWorker(QObject):
                 force=True,
             )
         except Exception as error:
-            logger.exception("AI connection test failed for %s", self.provider)
+            logger.exception("Gemini connection test failed")
             self.failed.emit(str(error))
         else:
             self.succeeded.emit(message)

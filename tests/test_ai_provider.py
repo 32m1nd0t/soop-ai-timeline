@@ -1,6 +1,7 @@
 import unittest
 
 from soop_timeline.services.ai_provider import (
+    AI_PROVIDER_SPECS,
     AIUsage,
     StructuredAIProvider,
     StructuredAIResponse,
@@ -26,7 +27,8 @@ class FakeProvider(StructuredAIProvider):
 
 class AIProviderTests(unittest.TestCase):
     def test_provider_name_and_call_estimate_are_normalized(self):
-        self.assertEqual(normalize_ai_provider("OPENAI"), "openai")
+        self.assertEqual(set(AI_PROVIDER_SPECS), {"gemini"})
+        self.assertEqual(normalize_ai_provider("legacy-provider"), "gemini")
         self.assertEqual(normalize_ai_provider("unknown"), "gemini")
         self.assertEqual(estimate_timeline_calls(0), 2)
         self.assertEqual(estimate_timeline_calls(45 * 60), 2)
