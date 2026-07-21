@@ -39,7 +39,7 @@ AI_PROVIDER_SPECS: dict[str, AIProviderSpec] = {
     GEMINI_PROVIDER: AIProviderSpec(
         GEMINI_PROVIDER,
         "Google Gemini",
-        "gemini-2.5-flash-lite",
+        "gemini-flash-lite-latest",
         "Google AI Studio에서 발급한 Gemini API 키",
         "GEMINI_API_KEY",
         "google.genai",

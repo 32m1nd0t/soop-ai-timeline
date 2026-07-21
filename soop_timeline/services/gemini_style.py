@@ -13,7 +13,7 @@ from .credentials import get_gemini_api_key
 from .transcription import AnalysisCancelled
 
 
-DEFAULT_GEMINI_STYLE_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_STYLE_MODEL = "gemini-flash-lite-latest"
 TITLE_PATTERN = re.compile(r"^\s*오늘의\s*콘텐츠\s*:\s*(?P<title>.*)$")
 ENTRY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{1,3}:[0-5]\d:[0-5]\d)\s+(?P<summary>\S.*)$"
