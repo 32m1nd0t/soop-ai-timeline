@@ -1,10 +1,17 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path -LiteralPath $python)) {
-    throw "가상 환경을 찾을 수 없습니다: $python"
+if (Test-Path -LiteralPath $venvPython) {
+    $python = $venvPython
+}
+else {
+    $pythonCommand = Get-Command "python" -ErrorAction SilentlyContinue
+    if ($null -eq $pythonCommand) {
+        throw "Python 실행 파일을 찾을 수 없습니다."
+    }
+    $python = $pythonCommand.Source
 }
 
 Push-Location -LiteralPath $projectRoot
