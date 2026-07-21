@@ -90,6 +90,42 @@ class AIProviderTests(unittest.TestCase):
         self.assertEqual(rate.category, "rate_limit")
         self.assertTrue(rate.retryable)
 
+    def test_rate_limit_honours_server_retry_delay(self):
+        class ApiError(RuntimeError):
+            def __init__(self):
+                super().__init__("Resource has been exhausted (rate limit)")
+                self.code = 429
+                self.details = {
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "rate limit",
+                        "details": [
+                            {
+                                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                "retryDelay": "39s",
+                            }
+                        ],
+                    }
+                }
+
+        info = classify_ai_error(ApiError())
+        self.assertEqual(info.category, "rate_limit")
+        self.assertTrue(info.retryable)
+        # Waits at least as long as the server asked, capped at the backoff limit.
+        self.assertGreaterEqual(info.retry_after_seconds, 39.0)
+        self.assertLessEqual(info.retry_after_seconds, 60.0)
+
+    def test_rate_limit_without_retry_info_uses_default_delay(self):
+        class ProviderError(RuntimeError):
+            def __init__(self, code, message):
+                super().__init__(message)
+                self.code = code
+
+        rate = classify_ai_error(ProviderError(429, "too many requests"))
+        self.assertEqual(rate.category, "rate_limit")
+        self.assertGreater(rate.retry_after_seconds, 0.0)
+
     def test_transient_failure_retries_but_permanent_failure_stops(self):
         class SequenceProvider(FakeProvider):
             def __init__(self, errors):

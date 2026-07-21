@@ -65,7 +65,7 @@ def install_exception_hook() -> None:
 
 
 def build_diagnostic_report(database: object) -> str:
-    model = database.get_setting("gemini_model", "gemini-3.5-flash")
+    model = database.get_setting("gemini_model", "gemini-2.5-flash-lite")
     whisper_model = database.get_setting("whisper_model", "large-v3-turbo")
     whisper_device = database.get_setting("whisper_device", "auto")
     try:

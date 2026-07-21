@@ -94,7 +94,7 @@ git push origin v0.4.0
 
 - 타임라인 AI: `Google Gemini`
 - Gemini API 키: Windows 자격 증명 관리자에 보관
-- 기본 모델: `gemini-3.5-flash`이며 모델명 직접 변경 가능
+- 기본 모델: `gemini-2.5-flash-lite`이며 모델명 직접 변경 가능
 - Gemini 연결 테스트: 실제 소량의 구조화 출력 요청으로 키·모델 권한 확인
 - 타임라인 밀도: 기본 `큰 주제 위주`(같은 중심 토크의 세부 내용 병합), `기본`, `촘촘하게` 선택 가능
 - Whisper 모델: 기본 `large-v3-turbo`(속도 우선), 선택 가능 `large-v3`(정확도 우선)

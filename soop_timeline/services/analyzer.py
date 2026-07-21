@@ -36,7 +36,7 @@ from .transcription import (
 )
 
 
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 LIVE_SUMMARY_OVERLAP_SECONDS = 30
 LIVE_TOPIC_CONFIRMATION_SECONDS = 30

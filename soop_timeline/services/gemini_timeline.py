@@ -404,7 +404,7 @@ class GeminiTimelineGenerator(AITimelineGenerator):
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-3.5-flash",
+        model_name: str = "gemini-2.5-flash-lite",
         topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
     ):
         super().__init__(

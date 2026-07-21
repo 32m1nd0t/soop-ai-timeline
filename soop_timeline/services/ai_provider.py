@@ -39,7 +39,7 @@ AI_PROVIDER_SPECS: dict[str, AIProviderSpec] = {
     GEMINI_PROVIDER: AIProviderSpec(
         GEMINI_PROVIDER,
         "Google Gemini",
-        "gemini-3.5-flash",
+        "gemini-2.5-flash-lite",
         "Google AI Studio에서 발급한 Gemini API 키",
         "GEMINI_API_KEY",
         "google.genai",
@@ -103,6 +103,13 @@ class AIRequestFailure(RuntimeError):
 
 
 CancelCallback = Callable[[], bool]
+
+# Rate limits and transient network errors are retried with backoff. Gemini's
+# free-tier per-minute quotas can take up to ~60s to reset, so allow several
+# attempts and honour the server-provided Retry-After delay before giving up.
+MAX_REQUEST_ATTEMPTS = 5
+MAX_RETRY_BACKOFF_SECONDS = 60.0
+
 _validated_connections: set[str] = set()
 _validation_lock = threading.Lock()
 
@@ -152,7 +159,7 @@ class StructuredAIProvider(ABC):
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(MAX_REQUEST_ATTEMPTS):
             if cancelled():
                 raise AnalysisCancelled("AI 요청을 취소했습니다.")
             try:
@@ -170,10 +177,11 @@ class StructuredAIProvider(ABC):
             except Exception as error:
                 last_error = error
                 info = classify_ai_error(error)
-                if not info.retryable or attempt >= 2:
+                if not info.retryable or attempt >= MAX_REQUEST_ATTEMPTS - 1:
                     raise AIRequestFailure(self.display_name, info) from error
                 delay = info.retry_after_seconds or float(2**attempt)
-                _interruptible_backoff(min(15.0, delay), cancelled)
+                delay = min(MAX_RETRY_BACKOFF_SECONDS, max(1.0, delay))
+                _interruptible_backoff(delay, cancelled)
         info = classify_ai_error(last_error)
         raise AIRequestFailure(self.display_name, info) from last_error
 
@@ -405,11 +413,12 @@ def classify_ai_error(error: Exception | None) -> AIErrorInfo:
                 False,
                 "Gemini 사용 한도가 소진되었습니다. 구간 결과는 저장되어 있으므로 한도가 복구된 뒤 최종 정리를 재시도하세요.",
             )
+        server_delay = _retry_delay_from_error(error)
         return AIErrorInfo(
             "rate_limit",
             True,
-            "Gemini 요청이 잠시 너무 많습니다. 잠시 기다린 뒤 자동으로 다시 시도합니다.",
-            8.0,
+            "Gemini 요청 한도(rate limit)에 반복해서 걸렸습니다. 잠시(1~2분) 기다린 뒤 다시 시도하세요.",
+            server_delay + 1.0 if server_delay else 20.0,
         )
     if code is not None and code >= 500:
         return AIErrorInfo(
@@ -440,6 +449,43 @@ def classify_ai_error(error: Exception | None) -> AIErrorInfo:
             "Gemini 응답 형식을 해석하지 못했습니다. 자동으로 다시 요청합니다.",
         )
     return AIErrorInfo("unknown", False, message or "알 수 없는 오류가 발생했습니다.")
+
+
+def _retry_delay_from_error(error: Exception | None) -> float:
+    """Return the server-provided RetryInfo delay in seconds, if any.
+
+    Gemini's 429 responses carry a ``RetryInfo`` detail such as
+    ``{"retryDelay": "39s"}`` telling the client exactly how long to wait
+    before retrying. Respecting it avoids failing while the per-minute quota
+    is still resetting.
+    """
+    details = getattr(error, "details", None)
+    error_block = details.get("error") if isinstance(details, dict) else None
+    entries = error_block.get("details") if isinstance(error_block, dict) else None
+    if not isinstance(entries, list):
+        return 0.0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if "retryinfo" not in str(entry.get("@type", "")).lower():
+            continue
+        seconds = _parse_duration_seconds(str(entry.get("retryDelay", "")))
+        if seconds > 0:
+            return min(MAX_RETRY_BACKOFF_SECONDS, seconds)
+    return 0.0
+
+
+def _parse_duration_seconds(value: str) -> float:
+    """Parse a protobuf Duration string such as ``"39s"`` or ``"1.5s"``."""
+    text = value.strip().lower()
+    if text.endswith("s"):
+        text = text[:-1].strip()
+    if not text:
+        return 0.0
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        return 0.0
 
 
 def _error_status_code(error: Exception) -> int | None:
