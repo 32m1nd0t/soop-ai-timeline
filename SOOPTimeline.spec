@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import tempfile
 
+import qtwebview2
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
@@ -45,6 +47,31 @@ for package in (
     hiddenimports += package_hiddenimports
 
 hiddenimports += collect_submodules("keyring.backends")
+
+# qtwebview2 loads its .NET assemblies via clr.AddReference(get_absolute_path(
+# 'lib/Microsoft.Web.WebView2.*')). In a frozen build get_absolute_path resolves
+# against sys._MEIPASS, so the assemblies (and the native WebView2Loader under
+# lib/runtimes/**) must sit at the BUNDLE ROOT's ./lib. collect_all() only places
+# them under ./qtwebview2/lib, so WebView2 fails to initialise and the review
+# player stays blank. Mirror the package's lib/ tree to ./lib to match dev layout.
+_qtwebview2_lib = Path(qtwebview2.__file__).resolve().parent / "lib"
+_bundled_webview2_assets = 0
+if _qtwebview2_lib.is_dir():
+    for _asset in _qtwebview2_lib.rglob("*"):
+        if _asset.is_file():
+            _rel_parent = _asset.relative_to(_qtwebview2_lib).parent
+            _dest = "lib" if str(_rel_parent) == "." else str(Path("lib") / _rel_parent)
+            datas.append((str(_asset), _dest))
+            _bundled_webview2_assets += 1
+print(
+    f"[SOOPTimeline.spec] bundled {_bundled_webview2_assets} WebView2 assemblies "
+    "into ./lib"
+)
+if _bundled_webview2_assets == 0:
+    raise SystemExit(
+        "SOOPTimeline.spec: no WebView2 assemblies found under qtwebview2/lib; "
+        "the review player would ship broken."
+    )
 
 # faster-whisper's ctranslate2 backend only loads cuBLAS (plus the small cuDNN
 # dispatcher, cudnn64_9.dll) for Whisper GPU inference; the heavy cuDNN engine
