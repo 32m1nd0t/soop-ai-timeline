@@ -38,6 +38,7 @@ class Streamer:
     added_at: str
     last_checked_at: str | None = None
     last_error: str | None = None
+    glossary: str = ""
 
 
 @dataclass(slots=True)
@@ -55,6 +56,7 @@ class Vod:
     discovered_at: str
     updated_at: str
     source_kind: str = "vod"
+    streamer_glossary: str = ""
 
 
 @dataclass(slots=True)

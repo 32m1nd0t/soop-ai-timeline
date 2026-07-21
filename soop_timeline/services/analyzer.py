@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Callable
@@ -15,9 +16,11 @@ from .gemini_timeline import (
     DEFAULT_TOPIC_GRANULARITY,
     GeneratedTimeline,
     GeminiTimelineGenerator,
+    TimelineGenerationState,
     TimelineEntry,
     deduplicate_entries,
 )
+from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
 from .transcription import (
     CancelCallback,
     FasterWhisperTranscriber,
@@ -35,10 +38,10 @@ from .transcription import (
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
-LIVE_FIRST_SUMMARY_SECONDS = 60
-LIVE_SUMMARY_INTERVAL_SECONDS = 3 * 60
 LIVE_SUMMARY_OVERLAP_SECONDS = 30
 LIVE_TOPIC_CONFIRMATION_SECONDS = 30
+TIMELINE_CHECKPOINT_FILENAME = "timeline.partial.json"
+LIVE_TRANSCRIPT_FILENAME = "live-transcript.json"
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,6 +51,7 @@ class AnalyzerConfig:
     whisper_device: str = "auto"
     gemini_api_key: str = ""
     topic_granularity: str = DEFAULT_TOPIC_GRANULARITY
+    live_ai_mode: str = "saving"
 
 
 class TimelineAnalyzer(ABC):
@@ -147,6 +151,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             )
         )
         self.last_usage_summary = ""
+        self.last_result_warning = ""
 
     @classmethod
     def from_database(cls, database: object) -> "LocalWhisperGeminiAnalyzer":
@@ -163,6 +168,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     "topic_granularity",
                     DEFAULT_TOPIC_GRANULARITY,
                 ),
+                live_ai_mode=database.get_setting(LIVE_AI_MODE_SETTING, "saving"),
             )
         )
 
@@ -226,6 +232,45 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
     def initial_document(self, vod: Vod) -> str:
         return f"오늘의 콘텐츠: {vod.title}\n\n"
 
+    def _generate_with_checkpoint(
+        self,
+        generator: AITimelineGenerator,
+        vod: Vod,
+        transcript: Transcript,
+        progress: ProgressCallback,
+        cancelled: CancelCallback,
+        preview: PreviewCallback | None,
+        *,
+        granularity: str,
+    ) -> GeneratedTimeline:
+        checkpoint_path = analysis_data_dir(vod.vod_id) / TIMELINE_CHECKPOINT_FILENAME
+        checkpoint_key = timeline_checkpoint_key(
+            vod,
+            transcript,
+            self.config.gemini_model,
+            granularity,
+        )
+        resume = load_timeline_generation_state(checkpoint_path, checkpoint_key)
+        if resume is None:
+            checkpoint_path.unlink(missing_ok=True)
+        timeline = generator.generate(
+            vod,
+            transcript,
+            progress,
+            cancelled,
+            preview=preview,
+            checkpoint_key=checkpoint_key,
+            resume_state=resume,
+            checkpoint=lambda state: save_timeline_generation_state(
+                checkpoint_path,
+                state,
+            ),
+        )
+        self.last_result_warning = str(getattr(generator, "last_warning", "") or "")
+        if not self.last_result_warning:
+            checkpoint_path.unlink(missing_ok=True)
+        return timeline
+
     def analyze_media(
         self,
         vod: Vod,
@@ -252,10 +297,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 self.config.whisper_model,
                 self.config.whisper_device,
             )
-            prompt = (
-                f"한국어 인터넷 방송입니다. 스트리머는 {vod.streamer_name}이고 "
-                f"영상 제목은 {vod.title}입니다."
-            )
+            prompt = build_whisper_prompt(vod, live=False)
             transcript = transcriber.transcribe(
                 source_path,
                 initial_prompt=prompt,
@@ -269,16 +311,21 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             if preview is not None:
                 preview("transcript", transcript_preview_document(transcript.segments))
 
-        timeline = generator.generate(
+        timeline = self._generate_with_checkpoint(
+            generator,
             vod,
             transcript,
             progress,
             cancelled,
-            preview=preview,
+            preview,
+            granularity=self.config.topic_granularity,
         )
         self._capture_usage(generator)
         suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
-        progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
+        if self.last_result_warning:
+            progress(100, f"{self.last_result_warning}{suffix}")
+        else:
+            progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
         return timeline.to_document()
 
     def regroup_vod(
@@ -292,17 +339,10 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         """Regenerate topic boundaries from the cached transcript only."""
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
-        cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
-        transcript = load_vod_transcript_cache(
-            cache_path,
-            vod.vod_id,
-            vod.url,
-            self.config.whisper_model,
-        )
+        transcript = load_cached_transcript(vod)
         if transcript is None:
             raise RuntimeError(
-                "완료된 로컬 자막이 없어 주제를 다시 묶을 수 없습니다. "
-                "먼저 영상 AI 분석을 완료하세요."
+                "복구할 로컬 자막이 없습니다. 먼저 영상 또는 라이브 AI 분석을 시작하세요."
             )
         generator = GeminiTimelineGenerator(
             self.config.gemini_api_key,
@@ -315,16 +355,21 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             f"저장된 자막 {len(transcript.segments):,}개로 주제 경계를 다시 판정합니다 · "
             "Whisper는 실행하지 않습니다.",
         )
-        timeline = generator.generate(
+        timeline = self._generate_with_checkpoint(
+            generator,
             vod,
             transcript,
             progress,
             cancelled,
-            preview=preview,
+            preview,
+            granularity=topic_granularity,
         )
         self._capture_usage(generator)
         suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
-        progress(100, f"주제 다시 묶기가 완료되었습니다{suffix}.")
+        if self.last_result_warning:
+            progress(100, f"{self.last_result_warning}{suffix}")
+        else:
+            progress(100, f"주제 다시 묶기가 완료되었습니다{suffix}.")
         return timeline.to_document()
 
     def analyze_vod(
@@ -362,10 +407,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 self.config.whisper_model,
                 self.config.whisper_device,
             )
-            prompt = (
-                f"한국어 인터넷 방송입니다. 스트리머는 {vod.streamer_name}이고 "
-                f"영상 제목은 {vod.title}입니다. 인명과 고유명사를 문맥에 맞게 적으세요."
-            )
+            prompt = build_whisper_prompt(vod, live=False)
 
             def transcription_progress(percent: int, message: str) -> None:
                 normalized = max(0, min(68, percent))
@@ -410,16 +452,21 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             progress(80 + int((normalized / 29) * 19), message)
 
         progress(80, f"{self.provider_name} 타임라인 정리를 준비합니다…")
-        timeline = generator.generate(
+        timeline = self._generate_with_checkpoint(
+            generator,
             vod,
             transcript,
             generation_progress,
             cancelled,
-            preview=preview,
+            preview,
+            granularity=self.config.topic_granularity,
         )
         self._capture_usage(generator)
         suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
-        progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
+        if self.last_result_warning:
+            progress(100, f"{self.last_result_warning}{suffix}")
+        else:
+            progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
         return timeline.to_document()
 
     def analyze_live(
@@ -442,14 +489,17 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         )
         generator = self._new_generator()
         self._preflight(generator, progress, stop_requested)
-        prompt = (
-            f"한국어 인터넷 라이브 방송입니다. 스트리머는 {vod.streamer_name}이고 "
-            f"방송 제목은 {vod.title}입니다. 인명과 고유명사를 문맥에 맞게 적으세요."
+        prompt = build_whisper_prompt(vod, live=True)
+        live_mode = live_ai_mode(self.config.live_ai_mode)
+        progress(
+            0,
+            f"라이브 Gemini 모드: {live_mode.label} · "
+            f"예상 시간당 약 {live_mode.estimated_calls_per_hour}회 + 종료 시 최종 1회",
         )
         candidates: list[TimelineEntry] = []
         titles: list[str] = []
         last_summary_end = source.runtime_seconds
-        next_summary_at = source.runtime_seconds + LIVE_FIRST_SUMMARY_SECONDS
+        next_summary_at = source.runtime_seconds + live_mode.first_summary_seconds
         last_snapshot: Transcript | None = None
 
         def emit_timeline() -> None:
@@ -476,7 +526,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 else latest_end - LIVE_TOPIC_CONFIRMATION_SECONDS
             )
             if stable_end <= last_summary_end and candidates:
-                next_summary_at = latest_end + LIVE_SUMMARY_INTERVAL_SECONDS
+                next_summary_at = latest_end + live_mode.interval_seconds
                 return
             window_start = max(
                 source.runtime_seconds,
@@ -503,7 +553,10 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     previous_entries=deduplicate_entries(candidates)[-8:],
                 )
             except Exception as error:
-                next_summary_at = latest_end + LIVE_FIRST_SUMMARY_SECONDS
+                next_summary_at = latest_end + min(
+                    live_mode.first_summary_seconds,
+                    live_mode.interval_seconds,
+                )
                 progress(
                     0,
                     f"실시간 자막은 계속 작성 중 · {self.provider_name} 임시 정리 재시도 예정: {error}",
@@ -513,7 +566,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 titles.append(partial.content_title)
             candidates = deduplicate_entries(candidates + partial.entries)
             last_summary_end = stable_end
-            next_summary_at = latest_end + LIVE_SUMMARY_INTERVAL_SECONDS
+            next_summary_at = latest_end + live_mode.interval_seconds
             emit_timeline()
 
         def on_update(snapshot: Transcript) -> None:
@@ -542,12 +595,14 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 0,
                 f"누적 자막 전체를 {self.provider_name}이(가) 최종 타임라인으로 정리합니다…",
             )
-            fallback = generator.generate(
+            fallback = self._generate_with_checkpoint(
+                generator,
                 vod,
                 transcript,
                 progress,
                 lambda: False,
-                preview=None,
+                None,
+                granularity=self.config.topic_granularity,
             )
             if preview is not None:
                 preview("live_timeline", fallback.to_document())
@@ -578,7 +633,7 @@ def _save_live_transcript_snapshot(
     source: object,
     transcript: Transcript,
 ) -> None:
-    destination = analysis_data_dir(vod.vod_id) / "live-transcript.json"
+    destination = analysis_data_dir(vod.vod_id) / LIVE_TRANSCRIPT_FILENAME
     payload = {
         "source": {
             "kind": "soop_live",
@@ -595,3 +650,142 @@ def _save_live_transcript_snapshot(
         encoding="utf-8",
     )
     temporary.replace(destination)
+
+
+def build_whisper_prompt(vod: Vod, *, live: bool) -> str:
+    media = "라이브 방송" if live else "다시보기"
+    prompt = (
+        f"한국어 인터넷 {media}입니다. 스트리머는 {vod.streamer_name}이고 "
+        f"제목은 {vod.title}입니다. 인명과 고유명사를 문맥에 맞게 적으세요."
+    )
+    glossary = " ".join(vod.streamer_glossary.split())[:2_000]
+    if glossary:
+        prompt += f" 자주 쓰는 고유명사 표기는 다음과 같습니다: {glossary}"
+    return prompt
+
+
+def timeline_checkpoint_key(
+    vod: Vod,
+    transcript: Transcript,
+    model_name: str,
+    granularity: str,
+) -> str:
+    digest = hashlib.sha256()
+    metadata = {
+        "vod_id": vod.vod_id,
+        "url": vod.url,
+        "transcript_model": transcript.model,
+        "gemini_model": model_name,
+        "granularity": granularity,
+        "duration": transcript.duration_seconds,
+        "glossary": vod.streamer_glossary,
+    }
+    digest.update(json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    for segment in transcript.segments:
+        digest.update(
+            f"\n{segment.segment_id}|{segment.start:.3f}|{segment.end:.3f}|{segment.text}".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def save_timeline_generation_state(
+    path: str | Path,
+    state: TimelineGenerationState,
+) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+
+
+def load_timeline_generation_state(
+    path: str | Path,
+    expected_key: str,
+) -> TimelineGenerationState | None:
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        return None
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        state = TimelineGenerationState.from_dict(payload)
+        if not state.checkpoint_key or state.checkpoint_key != expected_key:
+            return None
+        return state
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def has_pending_timeline_finalization(vod_id: str) -> bool:
+    path = analysis_data_dir(vod_id) / TIMELINE_CHECKPOINT_FILENAME
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(payload, dict) and payload.get("stage") == "final_pending"
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def load_live_transcript_cache(
+    path: str | Path,
+    vod: Vod,
+    expected_model: str | None,
+) -> Transcript | None:
+    cache_path = Path(path)
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        source = payload.get("source", {})
+        if not isinstance(source, dict) or source.get("kind") != "soop_live":
+            return None
+        if str(source.get("url", "")) != vod.url:
+            return None
+        transcript = Transcript.from_dict(payload["transcript"])
+        if (expected_model and transcript.model != expected_model) or not transcript.segments:
+            return None
+        return transcript
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def load_cached_transcript(
+    vod: Vod,
+    expected_model: str | None = None,
+) -> Transcript | None:
+    root = analysis_data_dir(vod.vod_id)
+    if vod.source_kind == "live":
+        return load_live_transcript_cache(
+            root / LIVE_TRANSCRIPT_FILENAME,
+            vod,
+            expected_model,
+        )
+    cache_path = root / "transcript.json"
+    if expected_model:
+        return load_vod_transcript_cache(
+            cache_path,
+            vod.vod_id,
+            vod.url,
+            expected_model,
+        )
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        expected_source = {
+            "kind": "soop_vod",
+            "vod_id": vod.vod_id,
+            "url": vod.url,
+        }
+        if payload.get("source") != expected_source:
+            return None
+        transcript = Transcript.from_dict(payload["transcript"])
+        return transcript if transcript.segments else None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None

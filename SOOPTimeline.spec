@@ -33,6 +33,8 @@ for package in (
     "ctranslate2",
     "faster_whisper",
     "google.genai",
+    "nvidia.cublas",
+    "nvidia.cudnn",
     "onnxruntime",
     "qtwebview2",
     "tokenizers",

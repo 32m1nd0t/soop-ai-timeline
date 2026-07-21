@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStyle,
+    QSystemTrayIcon,
     QTabBar,
     QTabWidget,
     QTableWidget,
@@ -33,8 +36,18 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..database import Database
 from ..models import STATE_LABELS, Vod, VodState
-from ..services.analyzer import LocalWhisperGeminiAnalyzer, TimelineAnalyzer
+from ..services.analyzer import (
+    LocalWhisperGeminiAnalyzer,
+    TimelineAnalyzer,
+    has_pending_timeline_finalization,
+    load_cached_transcript,
+)
 from ..services.ai_provider import estimate_timeline_calls
+from ..services.cache_manager import (
+    cleanup_expired_caches,
+    has_vod_cache,
+    remove_vod_cache,
+)
 from ..services.channel_id import normalize_channel_id
 from ..services.discovery import SoopVodDiscovery
 from ..services.diagnostics import build_diagnostic_report, create_diagnostic_bundle
@@ -43,6 +56,16 @@ from ..services.live_stream import LiveAudioSource
 from ..services.manual_link import (
     ResolvedVodLink,
     parse_soop_link,
+)
+from ..services.preferences import (
+    CACHE_RETENTION_SETTING,
+    DISCOVERY_INTERVAL_SETTING,
+    NEW_VOD_NOTIFICATION_SETTING,
+    PRIVACY_NOTICE_SETTING,
+    PRIVACY_NOTICE_VERSION,
+    normalized_cache_retention,
+    normalized_discovery_interval,
+    setting_enabled,
 )
 from ..services.transcription import format_timestamp
 from ..services.timeline_validation import parse_duration_text
@@ -58,10 +81,8 @@ from .regroup_worker import TimelineRegroupWorker
 from .settings_dialog import AnalysisSettingsDialog
 from .style_worker import TimelineStyleWorker
 from .timeline_editor import TimelineDocumentEditor
+from .transcript_viewer_dialog import TranscriptViewerDialog
 from .version_history_dialog import TimelineVersionHistoryDialog
-
-
-AUTO_REFRESH_MS = 3 * 60 * 60 * 1_000
 
 
 class MainWindow(QMainWindow):
@@ -82,6 +103,12 @@ class MainWindow(QMainWindow):
         self._close_after_analysis = False
         self._update_reply: QNetworkReply | None = None
         self._update_check_silent = True
+        self._stale_live_sessions = self.database.recover_stale_live_sessions()
+        cleanup_expired_caches(
+            normalized_cache_retention(
+                self.database.get_setting(CACHE_RETENTION_SETTING, "0")
+            )
+        )
 
         self.update_network = QNetworkAccessManager(self)
         self.update_timeout = QTimer(self)
@@ -109,17 +136,70 @@ class MainWindow(QMainWindow):
         self.discovery.finished.connect(self._on_discovery_finished)
 
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(AUTO_REFRESH_MS)
         self.refresh_timer.timeout.connect(self.refresh_discovery)
-        self.refresh_timer.start()
+        self._configure_refresh_timer()
+
+        self.tray_icon: QSystemTrayIcon | None = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self.tray_icon = QSystemTrayIcon(icon, self)
+            self.tray_icon.setToolTip("SOOP AI 타임라인")
+            self.tray_icon.show()
 
         self.load_streamers()
         self.load_vods()
+        if self.database.get_setting(PRIVACY_NOTICE_SETTING, "") == PRIVACY_NOTICE_VERSION:
+            self._schedule_startup_tasks()
+        else:
+            QTimer.singleShot(100, self._show_first_run_privacy_notice)
+
+    def _schedule_startup_tasks(self) -> None:
         QTimer.singleShot(1_200, self._initial_refresh)
         if self._analysis_queue:
             QTimer.singleShot(1_800, self._resume_persisted_analysis)
         if automatic_update_check_enabled(self.database):
             QTimer.singleShot(2_500, lambda: self.check_for_updates(silent=True))
+        if self._stale_live_sessions:
+            QTimer.singleShot(
+                500,
+                lambda: self.status_label.setText(
+                    f"비정상 종료된 라이브 세션 {len(self._stale_live_sessions):,}개를 "
+                    "복구 대상으로 표시했습니다. 저장 자막 다시 정리를 사용할 수 있습니다."
+                ),
+            )
+
+    def _show_first_run_privacy_notice(self) -> None:
+        message = QMessageBox(self)
+        message.setWindowTitle("처음 사용 전 데이터 처리 안내")
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText(
+            "영상·오디오 파일은 저장하지 않으며 Whisper 음성 인식은 이 PC에서 처리합니다."
+        )
+        message.setInformativeText(
+            "타임스탬프가 포함된 자막, 영상 제목, 스트리머 이름과 단어 사전은 "
+            "타임라인 생성을 위해 Google Gemini API로 전송됩니다. 로컬에는 자막·AI "
+            "중간 결과·타임라인 문서가 저장됩니다. 저작권자 또는 스트리머의 허용 범위와 "
+            "SOOP 약관을 확인한 영상에만 사용하세요. 설정에서 캐시를 삭제할 수 있습니다."
+        )
+        accept_button = message.addButton("확인하고 시작", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton("종료", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() is not accept_button:
+            self.close()
+            return
+        self.database.set_setting(PRIVACY_NOTICE_SETTING, PRIVACY_NOTICE_VERSION)
+        self._schedule_startup_tasks()
+
+    def _configure_refresh_timer(self) -> None:
+        minutes = normalized_discovery_interval(
+            self.database.get_setting(DISCOVERY_INTERVAL_SETTING, "180")
+        )
+        self.refresh_timer.stop()
+        if minutes > 0:
+            self.refresh_timer.setInterval(minutes * 60 * 1_000)
+            self.refresh_timer.start()
 
     def _build_dashboard(self) -> QWidget:
         root_widget = QWidget()
@@ -284,7 +364,11 @@ class MainWindow(QMainWindow):
         remove_button = QPushButton("삭제")
         remove_button.setObjectName("dangerButton")
         remove_button.clicked.connect(self.remove_streamer)
+        glossary_button = QPushButton("단어 사전")
+        glossary_button.setToolTip("스트리머별 인명·게임명·고유명사 표기를 등록합니다.")
+        glossary_button.clicked.connect(self.edit_streamer_glossary)
         button_row.addWidget(add_button, 1)
+        button_row.addWidget(glossary_button)
         button_row.addWidget(remove_button)
         layout.addLayout(button_row)
 
@@ -343,7 +427,12 @@ class MainWindow(QMainWindow):
                 text += "  ·  확인 오류"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, streamer.id)
-            item.setToolTip(streamer.last_error or "")
+            tooltip_parts = []
+            if streamer.glossary:
+                tooltip_parts.append(f"단어 사전:\n{streamer.glossary}")
+            if streamer.last_error:
+                tooltip_parts.append(f"최근 확인 오류:\n{streamer.last_error}")
+            item.setToolTip("\n\n".join(tooltip_parts))
             self.streamer_list.addItem(item)
 
     def load_vods(self) -> None:
@@ -416,18 +505,84 @@ class MainWindow(QMainWindow):
         if current is None:
             QMessageBox.information(self, "선택 필요", "삭제할 스트리머를 선택하세요.")
             return
+        streamer_id = int(current.data(Qt.ItemDataRole.UserRole))
+        vod_ids = self.database.list_vod_ids_for_streamer(streamer_id)
+        active_vod_ids = (
+            set(self._analysis_jobs)
+            | set(self._analysis_queue)
+            | set(self._live_jobs)
+            | set(self._style_jobs)
+            | set(self._regroup_jobs)
+        )
+        if active_vod_ids.intersection(vod_ids):
+            QMessageBox.information(
+                self,
+                "AI 작업 진행 중",
+                "이 스트리머의 AI 작업이 끝난 뒤 삭제하세요.",
+            )
+            return
         answer = QMessageBox.question(
             self,
             "스트리머 삭제",
-            "이 스트리머와 저장된 VOD·타임라인 기록을 삭제할까요?",
+            "이 스트리머와 저장된 VOD·타임라인 기록, 로컬 자막 캐시를 삭제할까요?\n"
+            "삭제한 기록과 캐시는 프로그램에서 복구할 수 없습니다.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.database.remove_streamer(int(current.data(Qt.ItemDataRole.UserRole)))
+        for vod_id in vod_ids:
+            editor = self._editor_tabs.pop(vod_id, None)
+            if editor is not None:
+                editor.blockSignals(True)
+                editor.close()
+                index = self.tabs.indexOf(editor)
+                if index >= 0:
+                    self.tabs.removeTab(index)
+                editor.deleteLater()
+        self.database.remove_streamer(streamer_id)
+        removed_caches = sum(1 for vod_id in vod_ids if remove_vod_cache(vod_id))
         self.load_streamers()
         self.load_vods()
+        self.status_label.setText(
+            f"스트리머 기록과 자막 캐시 {removed_caches:,}개를 삭제했습니다."
+        )
+
+    def edit_streamer_glossary(self) -> None:
+        current = self.streamer_list.currentItem()
+        if current is None:
+            QMessageBox.information(self, "선택 필요", "단어 사전을 편집할 스트리머를 선택하세요.")
+            return
+        streamer_id = int(current.data(Qt.ItemDataRole.UserRole))
+        streamer = next(
+            (
+                item
+                for item in self.database.list_streamers()
+                if item.id == streamer_id
+            ),
+            None,
+        )
+        if streamer is None:
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self,
+            f"{streamer.display_name} 단어 사전",
+            "인명·게임명·고유명사를 한 줄에 하나씩 입력하세요.\n"
+            "예: 마이곰이\n월드 오브 워크래프트\n약칭 = 정식 표기",
+            streamer.glossary,
+        )
+        if not accepted:
+            return
+        if len(text.strip()) > 5_000:
+            QMessageBox.information(
+                self,
+                "단어 사전 길이 초과",
+                "Gemini 사용량을 과도하게 늘리지 않도록 단어 사전은 5,000자까지 저장할 수 있습니다.",
+            )
+            return
+        self.database.update_streamer_glossary(streamer_id, text)
+        self.load_streamers()
+        self.status_label.setText(f"{streamer.display_name} 단어 사전을 저장했습니다.")
 
     def resolve_manual_link(self) -> None:
         if self._manual_link_job is not None:
@@ -558,7 +713,9 @@ class MainWindow(QMainWindow):
         self.discovery.refresh(streamers)
 
     def _initial_refresh(self) -> None:
-        if self.database.list_streamers(enabled_only=True):
+        if normalized_discovery_interval(
+            self.database.get_setting(DISCOVERY_INTERVAL_SETTING, "180")
+        ) > 0 and self.database.list_streamers(enabled_only=True):
             self.refresh_discovery()
 
     def _on_discovery_started(self, count: int) -> None:
@@ -588,6 +745,18 @@ class MainWindow(QMainWindow):
             )
         else:
             self.status_label.setText(f"신규 영상 {self._actual_new_count}개를 추가했습니다.")
+        if self._actual_new_count > 0 and setting_enabled(
+            self.database.get_setting(NEW_VOD_NOTIFICATION_SETTING, "1")
+        ):
+            if self.tray_icon is not None:
+                self.tray_icon.showMessage(
+                    "SOOP 신규 다시보기",
+                    f"자동 확인 목록에서 새 영상 {self._actual_new_count:,}개를 찾았습니다.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    6_000,
+                )
+            else:
+                QApplication.beep()
 
     def selected_vod_ids(self) -> list[str]:
         selected: list[str] = []
@@ -648,11 +817,80 @@ class MainWindow(QMainWindow):
         editor.regroup_requested.connect(self.start_topic_regroup)
         editor.snapshot_requested.connect(self._snapshot_timeline)
         editor.version_history_requested.connect(self.show_version_history)
+        editor.transcript_requested.connect(self.show_cached_transcript)
+        editor.cache_delete_requested.connect(self.delete_vod_cache)
         self._editor_tabs[vod_id] = editor
+        self._refresh_editor_cache_state(vod_id)
         title = vod.title if len(vod.title) <= 22 else f"{vod.title[:21]}…"
         index = self.tabs.addTab(editor, title)
         self.tabs.setTabToolTip(index, vod.title)
         self.tabs.setCurrentIndex(index)
+
+    def _refresh_editor_cache_state(self, vod_id: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        vod = self.database.get_vod(vod_id)
+        if editor is None or vod is None:
+            return
+        transcript_available = load_cached_transcript(vod) is not None
+        editor.set_cached_transcript_available(
+            transcript_available,
+            has_vod_cache(vod_id),
+        )
+        editor.set_final_pending(has_pending_timeline_finalization(vod_id))
+
+    def _refresh_all_editor_cache_states(self) -> None:
+        for vod_id in list(self._editor_tabs):
+            self._refresh_editor_cache_state(vod_id)
+
+    @Slot(str)
+    def show_cached_transcript(self, vod_id: str) -> None:
+        vod = self.database.get_vod(vod_id)
+        if vod is None:
+            return
+        transcript = load_cached_transcript(vod)
+        if transcript is None:
+            QMessageBox.information(
+                self,
+                "저장 자막 없음",
+                "완료된 Whisper 자막이 없습니다. 분석을 시작하거나 완료한 뒤 다시 확인하세요.",
+            )
+            self._refresh_editor_cache_state(vod_id)
+            return
+        TranscriptViewerDialog(vod, transcript, self).exec()
+
+    @Slot(str)
+    def delete_vod_cache(self, vod_id: str) -> None:
+        if (
+            vod_id in self._analysis_jobs
+            or vod_id in self._analysis_queue
+            or vod_id in self._live_jobs
+            or vod_id in self._regroup_jobs
+        ):
+            QMessageBox.information(
+                self,
+                "AI 작업 진행 중",
+                "분석 또는 자막 재정리가 끝난 뒤 캐시를 삭제하세요.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "이 영상 자막 캐시 삭제",
+            "Whisper 자막과 AI 중간 결과를 삭제할까요?\n"
+            "현재 타임라인 문서는 유지됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = remove_vod_cache(vod_id)
+        self._refresh_editor_cache_state(vod_id)
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.status_label.setText(
+                "자막 캐시를 삭제했습니다."
+                if removed
+                else "삭제할 자막 캐시가 없습니다."
+            )
 
     def _save_timeline(self, vod_id: str, text: str) -> None:
         if vod_id in self._live_jobs:
@@ -704,11 +942,18 @@ class MainWindow(QMainWindow):
         self.load_vods()
 
     def open_analysis_settings(self) -> None:
-        dialog = AnalysisSettingsDialog(self.database, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog = AnalysisSettingsDialog(
+            self.database,
+            self,
+            cache_actions_enabled=not self._active_jobs(),
+        )
+        result = dialog.exec()
+        self._refresh_all_editor_cache_states()
+        if result != QDialog.DialogCode.Accepted:
             return
         self.analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
         self.styler = AITimelineStyler.from_database(self.database)
+        self._configure_refresh_timer()
         for editor in self._editor_tabs.values():
             editor.set_analyzer_availability(
                 self.analyzer.available,
@@ -1057,6 +1302,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             "라이브 수신과 AI 최종 타임라인 정리가 완료되었습니다."
         )
+        self._refresh_editor_cache_state(vod_id)
         self.load_vods()
 
     @Slot(str, str)
@@ -1071,6 +1317,7 @@ class MainWindow(QMainWindow):
             )
             editor.status_label.setText(f"라이브 분석 실패: {message}")
         self.database.set_vod_state(vod_id, VodState.FAILED.value)
+        self._refresh_editor_cache_state(vod_id)
         self.status_label.setText("라이브 실시간 분석에 실패했습니다.")
         self.load_vods()
         QMessageBox.critical(self, "라이브 분석 실패", message)
@@ -1082,6 +1329,7 @@ class MainWindow(QMainWindow):
             editor.set_live_running(False)
             editor.status_label.setText("라이브 분석을 중단했습니다.")
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self._refresh_editor_cache_state(vod_id)
         self.load_vods()
 
     @Slot()
@@ -1257,7 +1505,15 @@ class MainWindow(QMainWindow):
             editor.analysis_progress.setVisible(False)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
-        self.status_label.setText("주제 다시 묶기가 완료되었습니다.")
+        self._refresh_editor_cache_state(vod_id)
+        if has_pending_timeline_finalization(vod_id):
+            self.status_label.setText(
+                "구간별 임시 타임라인을 저장했습니다. Gemini 한도 복구 후 최종 정리를 재시도하세요."
+            )
+            if editor is not None:
+                editor.status_label.setText(self.status_label.text())
+        else:
+            self.status_label.setText("주제 다시 묶기가 완료되었습니다.")
 
     @Slot(str, str)
     def _regroup_failed(self, vod_id: str, message: str) -> None:
@@ -1266,6 +1522,7 @@ class MainWindow(QMainWindow):
             editor.set_regroup_running(False)
             editor.analysis_progress.setVisible(False)
             editor.status_label.setText(f"주제 다시 묶기 실패: {message}")
+        self._refresh_editor_cache_state(vod_id)
         QMessageBox.critical(self, "주제 다시 묶기 실패", message)
 
     @Slot(str)
@@ -1275,6 +1532,7 @@ class MainWindow(QMainWindow):
             editor.set_regroup_running(False)
             editor.analysis_progress.setVisible(False)
             editor.status_label.setText("주제 다시 묶기를 취소했습니다.")
+        self._refresh_editor_cache_state(vod_id)
 
     @Slot()
     def _regroup_thread_finished(self) -> None:
@@ -1318,7 +1576,15 @@ class MainWindow(QMainWindow):
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
         self.database.remove_analysis_queue(vod_id)
-        self.status_label.setText("AI 타임라인 생성이 완료되었습니다. 결과를 검수하세요.")
+        self._refresh_editor_cache_state(vod_id)
+        if has_pending_timeline_finalization(vod_id):
+            self.status_label.setText(
+                "구간별 임시 타임라인을 저장했습니다. Gemini 한도 복구 후 최종 정리를 재시도하세요."
+            )
+            if editor is not None:
+                editor.status_label.setText(self.status_label.text())
+        else:
+            self.status_label.setText("AI 타임라인 생성이 완료되었습니다. 결과를 검수하세요.")
         self.load_vods()
 
     @Slot(str, str)
@@ -1329,6 +1595,7 @@ class MainWindow(QMainWindow):
             editor.status_label.setText(f"분석 실패: {message}")
         self.database.set_vod_state(vod_id, VodState.FAILED.value)
         self.database.remove_analysis_queue(vod_id)
+        self._refresh_editor_cache_state(vod_id)
         self.status_label.setText("AI 분석에 실패했습니다.")
         self.load_vods()
         QMessageBox.critical(self, "AI 분석 실패", message)
@@ -1341,6 +1608,7 @@ class MainWindow(QMainWindow):
             editor.status_label.setText("분석을 취소했습니다.")
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
         self.database.remove_analysis_queue(vod_id)
+        self._refresh_editor_cache_state(vod_id)
         self.status_label.setText("AI 분석을 취소했습니다.")
         self.load_vods()
 

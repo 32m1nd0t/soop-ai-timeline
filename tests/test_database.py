@@ -93,6 +93,42 @@ class DatabaseTests(unittest.TestCase):
         self.database.remove_analysis_queue("9901")
         self.assertEqual(self.database.list_analysis_queue(), [])
 
+    def test_streamer_glossary_is_available_on_vod(self):
+        streamer = self.database.add_streamer("glossary-user", "단어사전")
+        self.database.update_streamer_glossary(
+            streamer.id,
+            "마이곰이\n월드 오브 워크래프트",
+        )
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "8801",
+                    "title": "고유명사 테스트",
+                    "url": "https://vod.sooplive.com/player/8801",
+                }
+            ],
+        )
+        vod = self.database.get_vod("8801")
+        self.assertIn("마이곰이", vod.streamer_glossary)
+        self.assertEqual(
+            self.database.list_streamers(enabled_only=True)[0].glossary,
+            "마이곰이\n월드 오브 워크래프트",
+        )
+
+    def test_stale_live_session_is_marked_failed_for_recovery(self):
+        vod = self.database.upsert_external_vod(
+            vod_id="live-stale",
+            channel_id="live-user",
+            streamer_name="라이브",
+            title="중단된 라이브",
+            url="https://play.sooplive.com/live-user/1",
+            source_kind="live",
+            state=VodState.ANALYZING.value,
+        )
+        self.assertEqual(self.database.recover_stale_live_sessions(), [vod.vod_id])
+        self.assertEqual(self.database.get_vod(vod.vod_id).state, VodState.FAILED.value)
+
 
 if __name__ == "__main__":
     unittest.main()

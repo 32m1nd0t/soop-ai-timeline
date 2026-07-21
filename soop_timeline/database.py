@@ -31,7 +31,8 @@ class Database:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 added_at TEXT NOT NULL,
                 last_checked_at TEXT,
-                last_error TEXT
+                last_error TEXT,
+                glossary TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS vods (
@@ -94,6 +95,14 @@ class Database:
             self.connection.execute(
                 "ALTER TABLE vods ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'vod'"
             )
+        streamer_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(streamers)").fetchall()
+        }
+        if "glossary" not in streamer_columns:
+            self.connection.execute(
+                "ALTER TABLE streamers ADD COLUMN glossary TEXT NOT NULL DEFAULT ''"
+            )
         self.connection.commit()
 
     def close(self) -> None:
@@ -153,6 +162,13 @@ class Database:
         self.connection.execute("DELETE FROM streamers WHERE id = ?", (streamer_id,))
         self.connection.commit()
 
+    def list_vod_ids_for_streamer(self, streamer_id: int) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT vod_id FROM vods WHERE streamer_id = ?",
+            (streamer_id,),
+        ).fetchall()
+        return [str(row["vod_id"]) for row in rows]
+
     def list_streamers(self, enabled_only: bool = False) -> list[Streamer]:
         sql = "SELECT * FROM streamers"
         params: tuple[object, ...] = ()
@@ -169,6 +185,13 @@ class Database:
         self.connection.execute(
             "UPDATE streamers SET display_name = ? WHERE id = ?",
             (display_name.strip(), streamer_id),
+        )
+        self.connection.commit()
+
+    def update_streamer_glossary(self, streamer_id: int, glossary: str) -> None:
+        self.connection.execute(
+            "UPDATE streamers SET glossary = ? WHERE id = ?",
+            (glossary.strip()[:5_000], streamer_id),
         )
         self.connection.commit()
 
@@ -310,7 +333,8 @@ class Database:
             SELECT
                 v.*,
                 s.channel_id,
-                s.display_name AS streamer_name
+                s.display_name AS streamer_name,
+                s.glossary AS streamer_glossary
             FROM vods v
             JOIN streamers s ON s.id = v.streamer_id
             {where}
@@ -327,7 +351,8 @@ class Database:
     def get_vod(self, vod_id: str) -> Vod | None:
         row = self.connection.execute(
             """
-            SELECT v.*, s.channel_id, s.display_name AS streamer_name
+            SELECT v.*, s.channel_id, s.display_name AS streamer_name,
+                   s.glossary AS streamer_glossary
             FROM vods v JOIN streamers s ON s.id = v.streamer_id
             WHERE v.vod_id = ?
             """,
@@ -495,6 +520,28 @@ class Database:
             )
         return pending
 
+    def recover_stale_live_sessions(self) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT vod_id FROM vods WHERE source_kind = 'live' AND state = ?",
+            (VodState.ANALYZING.value,),
+        ).fetchall()
+        vod_ids = [str(row["vod_id"]) for row in rows]
+        if vod_ids:
+            placeholders = ",".join("?" for _ in vod_ids)
+            now = utc_now()
+            with self.connection:
+                self.connection.execute(
+                    f"UPDATE vods SET state = ?, updated_at = ? "
+                    f"WHERE vod_id IN ({placeholders})",
+                    (VodState.FAILED.value, now, *vod_ids),
+                )
+                self.connection.execute(
+                    f"UPDATE timeline_documents SET status = ?, updated_at = ? "
+                    f"WHERE vod_id IN ({placeholders})",
+                    (VodState.FAILED.value, now, *vod_ids),
+                )
+        return vod_ids
+
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.connection.execute(
             "SELECT value FROM settings WHERE key = ?", (key,)
@@ -521,6 +568,7 @@ class Database:
             added_at=row["added_at"],
             last_checked_at=row["last_checked_at"],
             last_error=row["last_error"],
+            glossary=str(row["glossary"] or ""),
         )
 
     @staticmethod
@@ -539,4 +587,5 @@ class Database:
             discovered_at=row["discovered_at"],
             updated_at=row["updated_at"],
             source_kind=row["source_kind"],
+            streamer_glossary=str(row["streamer_glossary"] or ""),
         )

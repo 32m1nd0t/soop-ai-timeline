@@ -4,10 +4,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from soop_timeline.models import Vod
-from soop_timeline.services.analyzer import AnalyzerConfig, LocalWhisperGeminiAnalyzer
+from soop_timeline.services.analyzer import (
+    AnalyzerConfig,
+    LocalWhisperGeminiAnalyzer,
+    build_whisper_prompt,
+    load_cached_transcript,
+    load_timeline_generation_state,
+    save_timeline_generation_state,
+)
 from soop_timeline.services.gemini_timeline import (
     GeneratedTimeline,
     TimelineEntry,
+    TimelineGenerationState,
     build_chunk_prompt,
     build_final_prompt,
     deduplicate_entries,
@@ -49,6 +57,22 @@ def sample_transcript() -> Transcript:
 
 
 class AnalysisPipelineTests(unittest.TestCase):
+    def test_timeline_checkpoint_round_trip_and_key_validation(self):
+        state = TimelineGenerationState(
+            "key-1",
+            2,
+            ["제목"],
+            [TimelineEntry("s1", 10, "요약", "주제", "new")],
+            stage="final_pending",
+            last_error="quota",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "timeline.partial.json"
+            save_timeline_generation_state(path, state)
+            restored = load_timeline_generation_state(path, "key-1")
+            self.assertEqual(restored.to_dict(), state.to_dict())
+            self.assertIsNone(load_timeline_generation_state(path, "other-key"))
+
     def test_transcript_is_split_with_overlap(self):
         windows = split_transcript(
             sample_transcript().segments,
@@ -118,6 +142,22 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertIn("가장 이른 후보의 segment_id", final_prompt)
         self.assertIn("후보 주변 원문 근거", final_prompt)
 
+    def test_prompts_treat_transcript_as_untrusted_and_use_glossary(self):
+        vod = sample_vod()
+        vod.streamer_glossary = "마이곰이\n와우 = 월드 오브 워크래프트"
+        chunk_prompt = build_chunk_prompt(vod, sample_transcript().segments)
+        final_prompt = build_final_prompt(
+            vod,
+            ["와우 토크"],
+            [TimelineEntry("s000000", 0, "와우 이야기")],
+            sample_transcript().segments,
+        )
+        for prompt in (chunk_prompt, final_prompt):
+            self.assertIn("마이곰이", prompt)
+            self.assertIn("비신뢰 데이터", prompt)
+            self.assertIn("<glossary>", prompt)
+        self.assertIn("마이곰이", build_whisper_prompt(vod, live=False))
+
     def test_gemini_emits_growing_timeline_previews(self):
         from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
 
@@ -160,6 +200,89 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertTrue(all(stage == "timeline" for stage, _ in previews))
         self.assertLess(len(previews[0][1]), len(previews[-1][1]))
         self.assertEqual(result.content_title, "테스트 콘텐츠")
+
+    def test_gemini_final_failure_keeps_checkpoint_and_resumes_final_only(self):
+        from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
+
+        window_payloads = [
+            {
+                "content_title": "방송 시작",
+                "entries": [
+                    {
+                        "segment_id": "s000000",
+                        "decision": "new",
+                        "topic_key": "시작",
+                        "summary": "방송 시작",
+                    }
+                ],
+            },
+            {
+                "content_title": "꿈과 게임",
+                "entries": [
+                    {
+                        "segment_id": "s000001",
+                        "decision": "new",
+                        "topic_key": "꿈",
+                        "summary": "꿈 이야기",
+                    },
+                    {
+                        "segment_id": "s000002",
+                        "decision": "new",
+                        "topic_key": "게임",
+                        "summary": "게임 시작",
+                    },
+                ],
+            },
+        ]
+        checkpoints: list[TimelineGenerationState] = []
+        generator = GeminiTimelineGenerator("test-key")
+        with patch.object(
+            generator,
+            "_request_json",
+            side_effect=[*window_payloads, RuntimeError("quota per day exceeded")],
+        ):
+            draft = generator.generate(
+                sample_vod(),
+                sample_transcript(),
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+                checkpoint_key="checkpoint-key",
+                checkpoint=checkpoints.append,
+            )
+        self.assertTrue(generator.last_warning)
+        self.assertEqual(checkpoints[-1].stage, "final_pending")
+        self.assertEqual(checkpoints[-1].completed_windows, 2)
+        self.assertGreaterEqual(len(draft.entries), 2)
+
+        final_payload = {
+            "content_title": "최종 콘텐츠",
+            "entries": [
+                {
+                    "segment_id": "s000000",
+                    "decision": "new",
+                    "topic_key": "시작",
+                    "summary": "방송 시작",
+                },
+                {
+                    "segment_id": "s000002",
+                    "decision": "new",
+                    "topic_key": "게임",
+                    "summary": "게임 시작",
+                },
+            ],
+        }
+        resumed = GeminiTimelineGenerator("test-key")
+        with patch.object(resumed, "_request_json", return_value=final_payload) as request:
+            result = resumed.generate(
+                sample_vod(),
+                sample_transcript(),
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+                checkpoint_key="checkpoint-key",
+                resume_state=checkpoints[-1],
+            )
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(result.content_title, "최종 콘텐츠")
 
     def test_analyzer_reuses_cached_transcript(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -308,8 +431,10 @@ class AnalysisPipelineTests(unittest.TestCase):
                 stop_requested=lambda: False,
                 preview=lambda stage, text: previews.append((stage, text)),
             )
+            recovered = load_cached_transcript(live_vod)
 
         self.assertIn("01:00:00 방송 시작", result)
+        self.assertEqual(len(recovered.segments), 2)
         self.assertEqual(result.splitlines()[0], "오늘의 콘텐츠: 최종 라이브")
         self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))
 

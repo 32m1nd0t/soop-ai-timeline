@@ -9,7 +9,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 Push-Location -LiteralPath $projectRoot
 try {
-    & $python -m pip install -e ".[build]"
+    & $python -m pip install -e ".[build,gpu-windows]"
     & $python -m PyInstaller --noconfirm --clean "SOOPTimeline.spec"
 }
 finally {

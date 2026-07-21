@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QDesktopServices,
+    QFocusEvent,
     QKeySequence,
     QMouseEvent,
     QShortcut,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -32,7 +34,13 @@ from PySide6.QtWidgets import (
 from ..models import Vod
 from ..services.text_editing import find_literal_matches, replace_literal_all
 from ..services.timeline_blocks import COMMENT_LIMIT, block_label, split_timeline
-from ..services.timeline_timestamp import format_timestamp_seconds, timestamp_at_position
+from ..services.timeline_timestamp import (
+    adjust_timestamp_on_current_line,
+    format_timestamp_seconds,
+    merge_current_timeline_line_with_previous,
+    shift_all_timestamps,
+    timestamp_at_position,
+)
 from ..services.timeline_validation import (
     format_issue_report,
     parse_duration_text,
@@ -43,6 +51,11 @@ from .review_player import SoopReviewPlayer
 
 class TimelineTextEdit(QPlainTextEdit):
     timestamp_activated = Signal(int)
+    focused = Signal()
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        super().focusInEvent(event)
+        self.focused.emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         cursor = self.cursorForPosition(event.position().toPoint())
@@ -133,6 +146,8 @@ class TimelineDocumentEditor(QWidget):
     regroup_requested = Signal(str, str)
     snapshot_requested = Signal(str, str, str)
     version_history_requested = Signal(str)
+    transcript_requested = Signal(str)
+    cache_delete_requested = Signal(str)
 
     def __init__(
         self,
@@ -157,6 +172,11 @@ class TimelineDocumentEditor(QWidget):
         self._last_ai_usage = ""
         self._last_committed_text = text
         self._manual_snapshot_taken = False
+        self._cached_transcript_available = False
+        self._cache_present = False
+        self._final_pending = False
+        self._last_focused_editor: TimelineTextEdit | None = None
+        self._last_cursor_global_position = 0
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -274,6 +294,17 @@ class TimelineDocumentEditor(QWidget):
                 str(self.granularity_combo.currentData()),
             )
         )
+        self.finalize_retry_button = QPushButton("최종 정리 재시도")
+        self.finalize_retry_button.setToolTip(
+            "저장된 구간 결과를 재사용하므로 완료된 Gemini 구간을 다시 호출하지 않습니다."
+        )
+        self.finalize_retry_button.clicked.connect(
+            lambda: self.regroup_requested.emit(
+                self.vod.vod_id,
+                str(self.granularity_combo.currentData()),
+            )
+        )
+        self.finalize_retry_button.setVisible(False)
         self.insert_time_button = QPushButton("현재 재생시간 삽입")
         self.insert_time_button.setToolTip("검수 플레이어 현재 위치를 새 타임라인 줄로 삽입 (Ctrl+Shift+T)")
         self.insert_time_button.clicked.connect(self.insert_current_timestamp)
@@ -288,16 +319,58 @@ class TimelineDocumentEditor(QWidget):
         self.import_button.clicked.connect(self.import_txt)
         self.export_button = QPushButton("TXT 저장")
         self.export_button.clicked.connect(self.export_txt)
+        self.transcript_button = QPushButton("저장 자막 보기")
+        self.transcript_button.clicked.connect(
+            lambda: self.transcript_requested.emit(self.vod.vod_id)
+        )
+        self.cache_delete_button = QPushButton("자막 캐시 삭제")
+        self.cache_delete_button.clicked.connect(
+            lambda: self.cache_delete_requested.emit(self.vod.vod_id)
+        )
         tools_row.addWidget(tools_label)
         tools_row.addWidget(self.granularity_combo)
         tools_row.addWidget(self.regroup_button)
-        tools_row.addWidget(self.insert_time_button)
+        tools_row.addWidget(self.finalize_retry_button)
         tools_row.addWidget(self.validate_button)
         tools_row.addWidget(self.history_button)
         tools_row.addStretch(1)
-        tools_row.addWidget(self.import_button)
-        tools_row.addWidget(self.export_button)
         root.addLayout(tools_row)
+
+        storage_tools = QHBoxLayout()
+        storage_label = QLabel("자막·파일")
+        storage_label.setObjectName("muted")
+        storage_tools.addWidget(storage_label)
+        storage_tools.addWidget(self.transcript_button)
+        storage_tools.addWidget(self.cache_delete_button)
+        storage_tools.addStretch(1)
+        storage_tools.addWidget(self.import_button)
+        storage_tools.addWidget(self.export_button)
+        root.addLayout(storage_tools)
+
+        timestamp_tools = QHBoxLayout()
+        timestamp_label = QLabel("타임스탬프 보정")
+        timestamp_label.setObjectName("muted")
+        minus_button = QPushButton("현재 줄 -5초")
+        minus_button.clicked.connect(lambda: self.adjust_current_timestamp(-5))
+        plus_button = QPushButton("현재 줄 +5초")
+        plus_button.clicked.connect(lambda: self.adjust_current_timestamp(5))
+        merge_button = QPushButton("이전 주제와 합치기")
+        merge_button.clicked.connect(self.merge_current_with_previous)
+        self.global_offset_input = QSpinBox()
+        self.global_offset_input.setRange(-3_600, 3_600)
+        self.global_offset_input.setSuffix("초")
+        self.global_offset_input.setToolTip("모든 타임라인 줄의 시각에 더할 값")
+        apply_offset_button = QPushButton("전체 시각 보정")
+        apply_offset_button.clicked.connect(self.apply_global_timestamp_offset)
+        timestamp_tools.addWidget(timestamp_label)
+        timestamp_tools.addWidget(self.insert_time_button)
+        timestamp_tools.addWidget(minus_button)
+        timestamp_tools.addWidget(plus_button)
+        timestamp_tools.addWidget(merge_button)
+        timestamp_tools.addStretch(1)
+        timestamp_tools.addWidget(self.global_offset_input)
+        timestamp_tools.addWidget(apply_offset_button)
+        root.addLayout(timestamp_tools)
 
         self.find_replace_bar = self._build_find_replace_bar()
         self.find_replace_bar.setVisible(False)
@@ -459,16 +532,16 @@ class TimelineDocumentEditor(QWidget):
     def set_analyzer_availability(self, available: bool, reason: str = "") -> None:
         self._analyzer_available = available
         self.analyze_button.setEnabled(available)
-        self.regroup_button.setEnabled(available and not self._is_live)
-        self.regroup_button.setVisible(not self._is_live)
-        self.granularity_combo.setVisible(not self._is_live)
+        self.regroup_button.setEnabled(available and self._cached_transcript_available)
+        self.regroup_button.setVisible(True)
+        self.granularity_combo.setVisible(True)
         self.analyze_button.setVisible(not self._is_live)
         self.analyze_button.setToolTip("" if available else reason)
         if self._is_live:
             self.notice.setText(
                 "라이브 연결 시 화면의 방송 경과시간을 시작 기준으로 사용합니다. "
-                "약 15초 단위로 로컬 Whisper 자막이 표시되고, Gemini의 임시 "
-                "타임라인은 첫 1분 이후 약 3분 간격으로 갱신됩니다. "
+                "약 15초 단위로 로컬 Whisper 자막이 표시되고, Gemini 임시 "
+                "타임라인은 설정에서 선택한 절약 주기로 갱신됩니다. "
                 "SOOP 라이브에는 오디오 전용 주소가 없어 저화질 스트림을 "
                 "메모리에서 수신하되 오디오만 해독하며 파일은 저장하지 않습니다."
             )
@@ -483,6 +556,31 @@ class TimelineDocumentEditor(QWidget):
             self.notice.setText(
                 f"AI 분석을 사용하려면 설정을 완료하세요. {reason}".strip()
             )
+
+    def set_cached_transcript_available(
+        self,
+        available: bool,
+        cache_present: bool | None = None,
+    ) -> None:
+        self._cached_transcript_available = available
+        self._cache_present = available if cache_present is None else cache_present
+        self.transcript_button.setEnabled(available)
+        self.cache_delete_button.setEnabled(self._cache_present)
+        self.regroup_button.setEnabled(available and self._analyzer_available)
+        self.regroup_button.setText(
+            "저장 자막 다시 정리" if self._is_live else "주제 다시 묶기"
+        )
+        if not available:
+            self.regroup_button.setToolTip(
+                "저장된 Whisper 자막이 생긴 뒤 사용할 수 있습니다."
+            )
+
+    def set_final_pending(self, pending: bool) -> None:
+        self._final_pending = pending
+        self.finalize_retry_button.setVisible(pending)
+        self.finalize_retry_button.setEnabled(
+            pending and self._analyzer_available and self._cached_transcript_available
+        )
 
     def set_style_availability(self, available: bool, reason: str = "") -> None:
         self._style_available = available
@@ -524,7 +622,17 @@ class TimelineDocumentEditor(QWidget):
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
         self.style_button.setEnabled(not running and self._style_available)
-        self.regroup_button.setEnabled(not running and self._analyzer_available)
+        self.regroup_button.setEnabled(
+            not running and self._analyzer_available and self._cached_transcript_available
+        )
+        self.finalize_retry_button.setEnabled(
+            not running
+            and self._final_pending
+            and self._analyzer_available
+            and self._cached_transcript_available
+        )
+        self.transcript_button.setEnabled(not running and self._cached_transcript_available)
+        self.cache_delete_button.setEnabled(not running and self._cache_present)
         if running:
             self.preview_editor.clear()
             self.preview_count.setText("0자")
@@ -550,6 +658,17 @@ class TimelineDocumentEditor(QWidget):
         self.ready_button.setEnabled(not running)
         self.style_button.setEnabled(not running and self._style_available)
         self.preview_card.setVisible(running or self.preview_card.isVisible())
+        self.regroup_button.setEnabled(
+            not running and self._analyzer_available and self._cached_transcript_available
+        )
+        self.finalize_retry_button.setEnabled(
+            not running
+            and self._final_pending
+            and self._analyzer_available
+            and self._cached_transcript_available
+        )
+        self.transcript_button.setEnabled(not running and self._cached_transcript_available)
+        self.cache_delete_button.setEnabled(not running and self._cache_present)
         if running:
             self.preview_title.setText("실시간 음성 인식 자막 · 첫 구간 수신 중")
             self.preview_editor.clear()
@@ -569,9 +688,19 @@ class TimelineDocumentEditor(QWidget):
         self.style_button.setEnabled(not running and self._style_available)
         self.style_button.setText("문체 교정 중…" if running else "AI 문체 교정")
         self.analyze_button.setEnabled(not running and self._analyzer_available)
-        self.regroup_button.setEnabled(not running and self._analyzer_available)
+        self.regroup_button.setEnabled(
+            not running and self._analyzer_available and self._cached_transcript_available
+        )
+        self.finalize_retry_button.setEnabled(
+            not running
+            and self._final_pending
+            and self._analyzer_available
+            and self._cached_transcript_available
+        )
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.transcript_button.setEnabled(not running and self._cached_transcript_available)
+        self.cache_delete_button.setEnabled(not running and self._cache_present)
         if running:
             self.status_label.setText(
                 "Gemini가 타임스탬프를 유지하며 문체만 건조하게 교정합니다…"
@@ -620,6 +749,72 @@ class TimelineDocumentEditor(QWidget):
 
     def set_text(self, text: str) -> None:
         self._replace_blocks(split_timeline(text))
+
+    def adjust_current_timestamp(self, offset_seconds: int) -> None:
+        original = self.text()
+        updated, changed = adjust_timestamp_on_current_line(
+            original,
+            self._global_cursor_position(),
+            offset_seconds,
+        )
+        if not changed:
+            self.status_label.setText("커서가 있는 줄의 시작 타임스탬프를 찾지 못했습니다.")
+            return
+        self._apply_document_tool(
+            original,
+            updated,
+            f"현재 줄 시각 {offset_seconds:+d}초 보정 전",
+            f"현재 줄 타임스탬프를 {offset_seconds:+d}초 보정했습니다.",
+        )
+
+    def apply_global_timestamp_offset(self) -> None:
+        offset = self.global_offset_input.value()
+        if offset == 0:
+            self.status_label.setText("전체 시각에 적용할 초 값을 입력하세요.")
+            return
+        original = self.text()
+        updated, count = shift_all_timestamps(original, offset)
+        if count == 0:
+            self.status_label.setText("보정할 타임라인 타임스탬프가 없습니다.")
+            return
+        self._apply_document_tool(
+            original,
+            updated,
+            f"전체 시각 {offset:+d}초 보정 전",
+            f"타임스탬프 {count:,}개를 {offset:+d}초 보정했습니다.",
+        )
+
+    def merge_current_with_previous(self) -> None:
+        original = self.text()
+        updated, changed = merge_current_timeline_line_with_previous(
+            original,
+            self._global_cursor_position(),
+        )
+        if not changed:
+            self.status_label.setText(
+                "합칠 타임라인 줄에 커서를 두세요. 바로 앞에도 타임라인 줄이 있어야 합니다."
+            )
+            return
+        self._apply_document_tool(
+            original,
+            updated,
+            "이전 주제와 합치기 전",
+            "현재 타임라인을 이전 주제와 합쳤습니다.",
+        )
+
+    def _apply_document_tool(
+        self,
+        original: str,
+        updated: str,
+        reason: str,
+        message: str,
+    ) -> None:
+        if original == updated:
+            return
+        self.snapshot_requested.emit(self.vod.vod_id, reason, original)
+        self.set_text(updated)
+        self._emit_document_changed()
+        self.status_label.setText(message)
 
     def toggle_find_replace(self) -> None:
         if self.find_replace_bar.isVisible():
@@ -718,9 +913,13 @@ class TimelineDocumentEditor(QWidget):
         consumed = 0
         for block in self._blocks:
             if block.editor.hasFocus():
-                return consumed + block.editor.textCursor().position()
+                self._last_focused_editor = block.editor
+                self._last_cursor_global_position = (
+                    consumed + block.editor.textCursor().position()
+                )
+                return self._last_cursor_global_position
             consumed += len(block.text())
-        return 0
+        return max(0, min(len(self.text()), self._last_cursor_global_position))
 
     def _select_search_match(self, index: int) -> None:
         if not 0 <= index < len(self._search_matches):
@@ -904,8 +1103,24 @@ class TimelineDocumentEditor(QWidget):
     def _focused_text_editor(self) -> TimelineTextEdit | None:
         for block in self._blocks:
             if block.editor.hasFocus():
+                self._last_focused_editor = block.editor
                 return block.editor
+        if self._last_focused_editor is not None and any(
+            block.editor is self._last_focused_editor for block in self._blocks
+        ):
+            return self._last_focused_editor
         return self._blocks[0].editor if self._blocks else None
+
+    def _remember_editor_cursor(self, target: TimelineTextEdit) -> None:
+        consumed = 0
+        for block in self._blocks:
+            if block.editor is target:
+                self._last_focused_editor = target
+                self._last_cursor_global_position = (
+                    consumed + target.textCursor().position()
+                )
+                return
+            consumed += len(block.text())
 
     def review_player_toggle_playback(self) -> None:
         if not self._is_live and self.review_player.isVisible():
@@ -916,12 +1131,26 @@ class TimelineDocumentEditor(QWidget):
             self.review_player.seek_relative(seconds)
 
     def set_regroup_running(self, running: bool) -> None:
-        self.regroup_button.setEnabled(not running and self._analyzer_available)
-        self.regroup_button.setText("주제 재판정 중…" if running else "주제 다시 묶기")
+        self.regroup_button.setEnabled(
+            not running and self._analyzer_available and self._cached_transcript_available
+        )
+        self.regroup_button.setText(
+            "자막 재정리 중…"
+            if running
+            else ("저장 자막 다시 정리" if self._is_live else "주제 다시 묶기")
+        )
+        self.finalize_retry_button.setEnabled(
+            not running
+            and self._final_pending
+            and self._analyzer_available
+            and self._cached_transcript_available
+        )
         self.analyze_button.setEnabled(not running and self._analyzer_available)
         self.style_button.setEnabled(not running and self._style_available)
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.transcript_button.setEnabled(not running and self._cached_transcript_available)
+        self.cache_delete_button.setEnabled(not running and self._cache_present)
 
     def apply_regroup_result(self, text: str) -> None:
         self.set_text(text)
@@ -1048,6 +1277,7 @@ class TimelineDocumentEditor(QWidget):
             consumed += block_length
 
     def _replace_blocks(self, parts: list[str]) -> None:
+        remembered_position = self._last_cursor_global_position
         self._rebuilding = True
         while self.blocks_layout.count() > 1:
             item = self.blocks_layout.takeAt(0)
@@ -1062,11 +1292,31 @@ class TimelineDocumentEditor(QWidget):
             block.text_changed.connect(self._on_block_changed)
             block.copy_requested.connect(self.copy_block)
             block.timestamp_activated.connect(self.seek_to_timestamp)
+            block.editor.cursorPositionChanged.connect(
+                lambda editor=block.editor: self._remember_editor_cursor(editor)
+            )
+            block.editor.focused.connect(
+                lambda editor=block.editor: self._remember_editor_cursor(editor)
+            )
             self.blocks_layout.insertWidget(index, block)
             block.setVisible(True)
             self._blocks.append(block)
 
         self._rebuilding = False
+        self._last_focused_editor = None
+        self._last_cursor_global_position = max(
+            0,
+            min(len(self.text()), remembered_position),
+        )
+        consumed = 0
+        for block in self._blocks:
+            if self._last_cursor_global_position <= consumed + len(block.text()):
+                self._last_focused_editor = block.editor
+                cursor = block.editor.textCursor()
+                cursor.setPosition(self._last_cursor_global_position - consumed)
+                block.editor.setTextCursor(cursor)
+                break
+            consumed += len(block.text())
         self._update_summary()
         if hasattr(self, "find_input"):
             self._refresh_find_matches(reset=False)

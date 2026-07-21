@@ -1,11 +1,14 @@
 import unittest
+from unittest.mock import patch
 
 from soop_timeline.services.ai_provider import (
     AI_PROVIDER_SPECS,
     AIUsage,
+    AIRequestFailure,
     StructuredAIProvider,
     StructuredAIResponse,
     estimate_timeline_calls,
+    classify_ai_error,
     normalize_ai_provider,
     strict_json_schema,
 )
@@ -59,6 +62,50 @@ class AIProviderTests(unittest.TestCase):
         message = provider.test_connection(force=True)
         self.assertIn("연결 성공", message)
         self.assertEqual(provider.usage, AIUsage(calls=1, input_tokens=12, output_tokens=3))
+
+    def test_errors_are_classified_without_retrying_auth_or_daily_quota(self):
+        class ProviderError(RuntimeError):
+            def __init__(self, code, message):
+                super().__init__(message)
+                self.code = code
+
+        auth = classify_ai_error(ProviderError(401, "API key not valid"))
+        quota = classify_ai_error(
+            ProviderError(429, "GenerateRequestsPerDayPerProject quota exceeded")
+        )
+        rate = classify_ai_error(ProviderError(429, "too many requests"))
+        self.assertEqual(auth.category, "auth")
+        self.assertFalse(auth.retryable)
+        self.assertEqual(quota.category, "quota")
+        self.assertFalse(quota.retryable)
+        self.assertEqual(rate.category, "rate_limit")
+        self.assertTrue(rate.retryable)
+
+    def test_transient_failure_retries_but_permanent_failure_stops(self):
+        class SequenceProvider(FakeProvider):
+            def __init__(self, errors):
+                super().__init__("key", "model")
+                self.errors = list(errors)
+                self.calls = 0
+
+            def _perform_request(self, prompt, schema, *, purpose):
+                self.calls += 1
+                if self.errors:
+                    raise self.errors.pop(0)
+                return StructuredAIResponse({"status": "ok"})
+
+        transient = SequenceProvider([TimeoutError("timed out")])
+        with patch("soop_timeline.services.ai_provider._interruptible_backoff"):
+            self.assertEqual(
+                transient.request_json("x", {"type": "object"}, lambda: False),
+                {"status": "ok"},
+            )
+        self.assertEqual(transient.calls, 2)
+
+        permanent = SequenceProvider([RuntimeError("API key not valid")])
+        with self.assertRaises(AIRequestFailure):
+            permanent.request_json("x", {"type": "object"}, lambda: False)
+        self.assertEqual(permanent.calls, 1)
 
 
 if __name__ == "__main__":

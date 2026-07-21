@@ -35,32 +35,54 @@ def main() -> int:
     app.setFont(QFont("Malgun Gothic", 10))
     app.setStyleSheet(APP_STYLE)
 
-    if "--smoke-test" in sys.argv:
+    smoke_test = "--smoke-test" in sys.argv
+    gpu_smoke_test = "--gpu-smoke-test" in sys.argv
+    if smoke_test or gpu_smoke_test:
         try:
             _verify_packaged_dependencies()
+            if gpu_smoke_test:
+                _verify_gpu_runtime()
         except Exception:
             report_path = app_data_dir() / "package-smoke-error.txt"
             report_path.write_text(traceback.format_exc(), encoding="utf-8")
             return 2
+        if gpu_smoke_test:
+            (app_data_dir() / "gpu-smoke-ok.txt").write_text(
+                "CUDA 12 cuBLAS/cuDNN 9 and faster-whisper runtime detected.\n",
+                encoding="utf-8",
+            )
+            return 0
 
     database = Database(database_path())
+    if smoke_test:
+        from .services.preferences import PRIVACY_NOTICE_SETTING, PRIVACY_NOTICE_VERSION
+
+        database.set_setting(PRIVACY_NOTICE_SETTING, PRIVACY_NOTICE_VERSION)
     app.aboutToQuit.connect(database.close)
 
     window = MainWindow(database)
     window.show()
     if startup_vod_id:
         QTimer.singleShot(0, lambda: window.open_timeline(startup_vod_id))
-    if "--smoke-test" in sys.argv:
+    if smoke_test:
         QTimer.singleShot(800, app.quit)
     return app.exec()
 
 
 def _verify_packaged_dependencies() -> None:
+    import importlib.util
+
     import av  # noqa: F401
     import keyring
     from faster_whisper import BatchedInferencePipeline, WhisperModel  # noqa: F401
     from google import genai  # noqa: F401
     from google.genai import types
+    from .services.transcription import configure_nvidia_runtime_paths
+
+    for package in ("nvidia.cublas", "nvidia.cudnn"):
+        if importlib.util.find_spec(package) is None:
+            raise RuntimeError(f"패키지에 {package} CUDA 런타임이 포함되지 않았습니다.")
+    configure_nvidia_runtime_paths()
     keyring.get_keyring()
     types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -70,3 +92,11 @@ def _verify_packaged_dependencies() -> None:
             "required": ["ok"],
         },
     )
+
+
+def _verify_gpu_runtime() -> None:
+    from .services.transcription import detect_whisper_runtime
+
+    runtime = detect_whisper_runtime("cuda")
+    if runtime.device != "cuda":
+        raise RuntimeError("CUDA GPU 런타임 확인에 실패했습니다.")

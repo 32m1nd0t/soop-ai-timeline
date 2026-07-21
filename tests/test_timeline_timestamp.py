@@ -1,8 +1,11 @@
 import unittest
 
 from soop_timeline.services.timeline_timestamp import (
+    adjust_timestamp_on_current_line,
     format_timestamp_seconds,
+    merge_current_timeline_line_with_previous,
     parse_timestamp,
+    shift_all_timestamps,
     timestamp_at_position,
 )
 from soop_timeline.ui.review_player import (
@@ -13,6 +16,31 @@ from soop_timeline.ui.review_player import (
 
 
 class TimelineTimestampTests(unittest.TestCase):
+    def test_adjusts_current_and_all_timeline_timestamps(self):
+        text = "오늘의 콘텐츠: 테스트\n\n00:00:03 시작\n00:10:00 다음 주제\n"
+        updated, changed = adjust_timestamp_on_current_line(
+            text,
+            text.index("시작"),
+            -5,
+        )
+        self.assertTrue(changed)
+        self.assertIn("00:00:00 시작", updated)
+
+        shifted, count = shift_all_timestamps(updated, 10)
+        self.assertEqual(count, 2)
+        self.assertIn("00:00:10 시작", shifted)
+        self.assertIn("00:10:10 다음 주제", shifted)
+
+    def test_merges_current_summary_with_previous_timestamp(self):
+        text = "오늘의 콘텐츠: 테스트\n\n00:01:00 꿈 이야기\n00:03:00 시청자 반응\n"
+        merged, changed = merge_current_timeline_line_with_previous(
+            text,
+            text.index("시청자"),
+        )
+        self.assertTrue(changed)
+        self.assertIn("00:01:00 꿈 이야기 · 시청자 반응", merged)
+        self.assertNotIn("00:03:00", merged)
+
     def test_parses_full_and_short_timestamps(self):
         self.assertEqual(parse_timestamp("01:56:07"), 6_967)
         self.assertEqual(parse_timestamp("09:24"), 564)
