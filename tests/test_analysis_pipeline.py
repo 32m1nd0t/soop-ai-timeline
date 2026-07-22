@@ -21,9 +21,14 @@ from soop_timeline.services.gemini_timeline import (
     deduplicate_entries,
     entries_from_payload,
     format_entry_text,
+    snap_entries_to_words,
     split_transcript,
 )
-from soop_timeline.services.transcription import Transcript, TranscriptSegment
+from soop_timeline.services.transcription import (
+    Transcript,
+    TranscriptSegment,
+    TranscriptWord,
+)
 from soop_timeline.services.vod_stream import VodAudioPart, VodAudioSource
 from soop_timeline.services.live_stream import LiveAudioSource
 
@@ -110,6 +115,36 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual(
             format_entry_text(entries[1]), '"자 이제 시작합니다" 신작 점프맵 첫 도전'
         )
+
+    def test_snap_moves_quoted_entry_to_the_spoken_word(self):
+        words = (
+            TranscriptWord(1200.0, 1200.3, "응"),
+            TranscriptWord(1200.5, 1200.9, "그건"),
+            TranscriptWord(1201.0, 1201.4, "그렇고"),
+            TranscriptWord(1205.4, 1205.8, "어제"),
+            TranscriptWord(1205.9, 1206.2, "진짜"),
+            TranscriptWord(1206.3, 1206.7, "이상한"),
+            TranscriptWord(1206.8, 1207.1, "꿈"),
+        )
+        # The chosen segment starts at 1200.0 but the topic opens 5.4s later.
+        entry = TimelineEntry(
+            "s1", 1200.0, '"어제 진짜 이상한 꿈"', quote="어제 진짜 이상한 꿈"
+        )
+        snapped = snap_entries_to_words([entry], words)
+        self.assertEqual(len(snapped), 1)
+        self.assertAlmostEqual(snapped[0].start, 1205.4, places=3)
+
+    def test_snap_falls_back_safely(self):
+        words = (TranscriptWord(10.0, 10.4, "안녕"),)
+        # No word timings at all -> unchanged.
+        plain = TimelineEntry("s1", 100.0, "요약만", quote="")
+        self.assertEqual(snap_entries_to_words([plain], ())[0].start, 100.0)
+        # Quote not present near the entry -> unchanged.
+        mismatch = TimelineEntry("s2", 10.0, '"없는 말"', quote="전혀 다른 말입니다")
+        self.assertEqual(snap_entries_to_words([mismatch], words)[0].start, 10.0)
+        # No quote -> unchanged even with word timings available.
+        no_quote = TimelineEntry("s3", 10.0, "요약", quote="")
+        self.assertEqual(snap_entries_to_words([no_quote], words)[0].start, 10.0)
 
     def test_entry_display_uses_plain_summary_without_quote(self):
         entry = TimelineEntry("s1", 10, "루딘한테 극딜하는 혜지")

@@ -140,12 +140,22 @@ class TranscriptSegment:
     text: str
 
 
+@dataclass(slots=True, frozen=True)
+class TranscriptWord:
+    start: float
+    end: float
+    text: str
+
+
 @dataclass(slots=True)
 class Transcript:
     model: str
     language: str
     duration_seconds: float
     segments: list[TranscriptSegment]
+    # Flat, time-ordered word timings used to snap timeline starts to the exact
+    # moment a quote is spoken. Empty for transcripts made before this existed.
+    words: tuple[TranscriptWord, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -153,6 +163,7 @@ class Transcript:
             "language": self.language,
             "duration_seconds": self.duration_seconds,
             "segments": [asdict(segment) for segment in self.segments],
+            "words": [asdict(word) for word in self.words],
         }
 
     @classmethod
@@ -168,12 +179,41 @@ class Transcript:
             for item in raw_segments
             if isinstance(item, dict)
         ]
+        raw_words = value.get("words", [])
+        words = (
+            tuple(
+                TranscriptWord(
+                    start=float(item["start"]),
+                    end=float(item["end"]),
+                    text=str(item["text"]),
+                )
+                for item in raw_words
+                if isinstance(item, dict)
+            )
+            if isinstance(raw_words, list)
+            else ()
+        )
         return cls(
             model=str(value.get("model", "")),
             language=str(value.get("language", "ko")),
             duration_seconds=float(value.get("duration_seconds", 0.0)),
             segments=segments,
+            words=words,
         )
+
+
+def _extract_words(raw_segment: object) -> list[TranscriptWord]:
+    """Read faster-whisper per-word timings from a raw segment (times as-is)."""
+    raw_words = getattr(raw_segment, "words", None) or []
+    result: list[TranscriptWord] = []
+    for word in raw_words:
+        text = str(getattr(word, "word", "") or "").strip()
+        if not text:
+            continue
+        start = max(0.0, float(getattr(word, "start", 0.0) or 0.0))
+        end = max(start, float(getattr(word, "end", 0.0) or 0.0))
+        result.append(TranscriptWord(start, end, text))
+    return result
 
 
 @dataclass(slots=True)
@@ -261,11 +301,13 @@ class FasterWhisperTranscriber:
             vad_filter=True,
             condition_on_previous_text=True,
             initial_prompt=initial_prompt,
+            word_timestamps=True,
         )
 
         duration = float(getattr(info, "duration", 0.0) or 0.0)
         language = str(getattr(info, "language", "ko") or "ko")
         segments: list[TranscriptSegment] = []
+        words: list[TranscriptWord] = []
         last_percent = -1
         last_preview_at = 0.0
         eta = EtaEstimator(duration)
@@ -282,6 +324,7 @@ class FasterWhisperTranscriber:
                         text=text,
                     )
                 )
+                words.extend(_extract_words(raw))
                 now = time.monotonic()
                 if preview is not None and (
                     len(segments) == 1
@@ -316,6 +359,7 @@ class FasterWhisperTranscriber:
             language=language,
             duration_seconds=duration,
             segments=segments,
+            words=tuple(words),
         )
 
     def transcribe_stream(
@@ -420,6 +464,9 @@ class FasterWhisperTranscriber:
             for segment in resume_segments
             if segment.text.strip()
         ]
+        accepted_words: list[TranscriptWord] = (
+            list(resume.words) if resume is not None else []
+        )
         lower_boundary = resume_boundary
         eta = EtaEstimator(source.total_duration_seconds)
         try:
@@ -459,7 +506,7 @@ class FasterWhisperTranscriber:
                         current.end_seconds + next_item.start_seconds
                     ) / 2.0
 
-                for start, end, text in relative_segments:
+                for start, end, text, rel_words in relative_segments:
                     absolute_start = max(
                         current.start_seconds,
                         min(current.end_seconds, current.start_seconds + start),
@@ -474,6 +521,18 @@ class FasterWhisperTranscriber:
                     if has_next and midpoint >= upper_boundary:
                         continue
                     accepted.append((absolute_start, absolute_end, text))
+                    for word in rel_words:
+                        word_start = max(
+                            current.start_seconds,
+                            min(current.end_seconds, current.start_seconds + word.start),
+                        )
+                        word_end = max(
+                            word_start,
+                            min(current.end_seconds, current.start_seconds + word.end),
+                        )
+                        accepted_words.append(
+                            TranscriptWord(word_start, word_end, word.text)
+                        )
 
                 if preview is not None and accepted:
                     preview(
@@ -497,6 +556,7 @@ class FasterWhisperTranscriber:
                                 for index, (start, end, text) in enumerate(accepted)
                                 if text.strip()
                             ],
+                            words=tuple(accepted_words),
                         )
                     )
 
@@ -547,6 +607,7 @@ class FasterWhisperTranscriber:
             language=language,
             duration_seconds=duration,
             segments=segments,
+            words=tuple(accepted_words),
         )
 
     def transcribe_live(
@@ -614,6 +675,7 @@ class FasterWhisperTranscriber:
 
         language = "ko"
         accepted: list[tuple[float, float, str]] = []
+        accepted_words: list[TranscriptWord] = []
         lower_boundary = source.runtime_seconds
         latest_end = source.runtime_seconds
         started_at = time.monotonic()
@@ -635,7 +697,7 @@ class FasterWhisperTranscriber:
                     lambda: False,
                 )
                 language = detected_language or language
-                for start, end, text in relative_segments:
+                for start, end, text, rel_words in relative_segments:
                     absolute_start = max(
                         item.start_seconds,
                         min(item.end_seconds, item.start_seconds + start),
@@ -648,6 +710,18 @@ class FasterWhisperTranscriber:
                     if midpoint + 1e-6 < lower_boundary:
                         continue
                     accepted.append((absolute_start, absolute_end, text))
+                    for word in rel_words:
+                        word_start = max(
+                            item.start_seconds,
+                            min(item.end_seconds, item.start_seconds + word.start),
+                        )
+                        word_end = max(
+                            word_start,
+                            min(item.end_seconds, item.start_seconds + word.end),
+                        )
+                        accepted_words.append(
+                            TranscriptWord(word_start, word_end, word.text)
+                        )
 
                 latest_end = max(latest_end, item.end_seconds)
                 lower_boundary = max(
@@ -668,6 +742,7 @@ class FasterWhisperTranscriber:
                         for index, (start, end, text) in enumerate(accepted)
                         if text.strip()
                     ],
+                    words=tuple(accepted_words),
                 )
                 if preview is not None and snapshot.segments:
                     preview(
@@ -706,6 +781,7 @@ class FasterWhisperTranscriber:
             language=language,
             duration_seconds=latest_end,
             segments=segments,
+            words=tuple(accepted_words),
         )
         if preview is not None and segments:
             preview("live_transcript", transcript_preview_document(segments))
@@ -724,7 +800,7 @@ class FasterWhisperTranscriber:
         initial_prompt: str,
         batch_size: int,
         cancelled: CancelCallback,
-    ) -> tuple[list[tuple[float, float, str]], str]:
+    ) -> tuple[list[tuple[float, float, str, list[TranscriptWord]]], str]:
         if cancelled():
             raise AnalysisCancelled("분석을 취소했습니다.")
         audio = chunk.as_float32()
@@ -737,8 +813,9 @@ class FasterWhisperTranscriber:
             initial_prompt=initial_prompt,
             without_timestamps=False,
             batch_size=batch_size,
+            word_timestamps=True,
         )
-        segments: list[tuple[float, float, str]] = []
+        segments: list[tuple[float, float, str, list[TranscriptWord]]] = []
         for raw in raw_segments:
             if cancelled():
                 raise AnalysisCancelled("분석을 취소했습니다.")
@@ -749,6 +826,7 @@ class FasterWhisperTranscriber:
                         max(0.0, float(raw.start)),
                         max(0.0, float(raw.end)),
                         text,
+                        _extract_words(raw),
                     )
                 )
         language = str(getattr(info, "language", "ko") or "ko")

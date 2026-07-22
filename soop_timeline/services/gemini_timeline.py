@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import bisect
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import Callable, Iterable
 
@@ -19,6 +20,7 @@ from .transcription import (
     ProgressCallback,
     Transcript,
     TranscriptSegment,
+    TranscriptWord,
     format_timestamp,
 )
 
@@ -51,6 +53,67 @@ def format_entry_text(entry: TimelineEntry) -> str:
             return f'"{quote}" {summary}'
         return f'"{quote}"'
     return summary
+
+
+def find_phrase_start_time(
+    quote: str,
+    words: list[TranscriptWord],
+    min_chars: int = 4,
+) -> float | None:
+    """Return when `quote` is actually spoken within `words`, or None if unsure."""
+    needle = "".join(ch.lower() for ch in quote if ch.isalnum())
+    if len(needle) < min_chars or not words:
+        return None
+    hay_chars: list[str] = []
+    char_time: list[float] = []
+    for word in words:
+        for ch in word.text:
+            if ch.isalnum():
+                hay_chars.append(ch.lower())
+                char_time.append(word.start)
+    hay = "".join(hay_chars)
+    if not hay:
+        return None
+    # Shrink the quote from the end so ASR differences in the tail still match.
+    for length in range(len(needle), min_chars - 1, -1):
+        position = hay.find(needle[:length])
+        if position >= 0:
+            return char_time[position]
+    return None
+
+
+def snap_entries_to_words(
+    entries: list[TimelineEntry],
+    words: tuple[TranscriptWord, ...],
+    before_seconds: float = 45.0,
+    after_seconds: float = 90.0,
+) -> list[TimelineEntry]:
+    """Move each quoted entry's start to when its quote is actually spoken.
+
+    Purely local post-processing: it uses Whisper word timings and the quote the
+    model already returned (nothing extra is sent to Gemini). Falls back to the
+    original segment start when there are no word timings, no quote, or no
+    confident match, so a start is only ever made more accurate, never worse.
+    """
+    if not words:
+        return entries
+    ordered = sorted(words, key=lambda item: item.start)
+    starts = [item.start for item in ordered]
+    snapped: list[TimelineEntry] = []
+    for entry in entries:
+        quote = entry.quote.strip()
+        if not quote:
+            snapped.append(entry)
+            continue
+        low = bisect.bisect_left(starts, entry.start - before_seconds)
+        high = bisect.bisect_right(starts, entry.start + after_seconds)
+        matched = find_phrase_start_time(quote, ordered[low:high])
+        if matched is None:
+            snapped.append(entry)
+        else:
+            snapped.append(replace(entry, start=matched))
+    snapped.sort(key=lambda item: (item.start, item.segment_id))
+    return snapped
 
 
 @dataclass(slots=True)
@@ -338,10 +401,11 @@ class AITimelineGenerator:
             progress(99, self.last_warning)
             return GeneratedTimeline(
                 content_title=titles[0] if titles else vod.title,
-                entries=candidates,
+                entries=snap_entries_to_words(candidates, transcript.words),
             )
         final_entries = entries_from_payload(final_payload, segment_lookup)
         final_entries = deduplicate_entries(final_entries) or candidates
+        final_entries = snap_entries_to_words(final_entries, transcript.words)
         content_title = str(final_payload.get("content_title", "")).strip()
         if not content_title:
             content_title = titles[0] if titles else vod.title
