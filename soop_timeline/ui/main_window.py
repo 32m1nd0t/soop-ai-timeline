@@ -52,6 +52,7 @@ from ..services.cache_manager import (
 from ..services.channel_id import normalize_channel_id
 from ..services.discovery import SoopVodDiscovery
 from ..services.diagnostics import build_diagnostic_report, create_diagnostic_bundle
+from ..services.gemini_line_rewrite import AITimelineLineRewriter
 from ..services.gemini_style import AITimelineStyler
 from ..services.live_stream import LiveAudioSource
 from ..services.manual_link import (
@@ -76,6 +77,7 @@ from ..services.update_checker import (
     parse_update_manifest,
 )
 from .analysis_worker import AnalysisWorker
+from .line_rewrite_worker import TimelineLineRewriteWorker
 from .live_worker import LiveAnalysisWorker
 from .manual_link_worker import ManualLinkWorker
 from .regroup_worker import TimelineRegroupWorker
@@ -98,6 +100,7 @@ class MainWindow(QMainWindow):
         self._analysis_jobs: dict[str, tuple[QThread, AnalysisWorker]] = {}
         self._live_jobs: dict[str, tuple[QThread, LiveAnalysisWorker]] = {}
         self._style_jobs: dict[str, tuple[QThread, TimelineStyleWorker]] = {}
+        self._line_rewrite_jobs: dict[str, tuple[QThread, TimelineLineRewriteWorker]] = {}
         self._regroup_jobs: dict[str, tuple[QThread, TimelineRegroupWorker]] = {}
         self._manual_link_job: tuple[QThread, ManualLinkWorker] | None = None
         self._analysis_queue: list[str] = self.database.recover_analysis_queue()
@@ -818,6 +821,7 @@ class MainWindow(QMainWindow):
         editor.analysis_cancel_requested.connect(self.cancel_analysis)
         editor.reanalyze_as_vod_requested.connect(self.reanalyze_live_as_vod)
         editor.style_requested.connect(self.start_style_correction)
+        editor.line_rewrite_requested.connect(self.start_line_rewrite)
         editor.regroup_requested.connect(self.start_topic_regroup)
         editor.snapshot_requested.connect(self._snapshot_timeline)
         editor.version_history_requested.connect(self.show_version_history)
@@ -1466,6 +1470,104 @@ class MainWindow(QMainWindow):
         if not vod_id:
             return
         self._style_jobs.pop(vod_id, None)
+
+    @Slot(str, str, str, int)
+    def start_line_rewrite(
+        self,
+        vod_id: str,
+        mode: str,
+        line: str,
+        next_seconds: int,
+    ) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        vod = self.database.get_vod(vod_id)
+        if editor is None or vod is None:
+            return
+        if (
+            vod_id in self._analysis_jobs
+            or vod_id in self._analysis_queue
+            or vod_id in self._live_jobs
+            or vod_id in self._regroup_jobs
+            or vod_id in self._style_jobs
+        ):
+            editor.status_label.setText(
+                "진행 중인 AI 작업이 끝난 뒤 줄 변환을 사용할 수 있습니다."
+            )
+            return
+        if vod_id in self._line_rewrite_jobs:
+            editor.status_label.setText("이미 이 탭에서 줄 변환이 진행 중입니다.")
+            return
+
+        rewriter = AITimelineLineRewriter.from_database(self.database)
+        if not rewriter.available:
+            QMessageBox.information(
+                self,
+                "AI 설정 필요",
+                rewriter.unavailable_reason,
+            )
+            self.open_analysis_settings()
+            rewriter = AITimelineLineRewriter.from_database(self.database)
+            if not rewriter.available:
+                return
+
+        transcript = load_cached_transcript(vod)
+        if transcript is None:
+            editor.status_label.setText(
+                "저장 자막이 없어 줄을 변환할 수 없습니다. 먼저 AI 분석을 실행하세요."
+            )
+            return
+
+        thread = QThread(self)
+        thread.setProperty("vod_id", vod_id)
+        worker = TimelineLineRewriteWorker(
+            rewriter,
+            vod_id,
+            mode,
+            line,
+            next_seconds,
+            transcript,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._line_rewrite_succeeded)
+        worker.usage_changed.connect(self._ai_usage_changed)
+        worker.failed.connect(self._line_rewrite_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._line_rewrite_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._line_rewrite_jobs[vod_id] = (thread, worker)
+        editor.set_line_rewrite_running(True, mode)
+        thread.start()
+
+    @Slot(str, str, str)
+    def _line_rewrite_succeeded(
+        self,
+        vod_id: str,
+        original_line: str,
+        new_line: str,
+    ) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is None:
+            return
+        editor.set_line_rewrite_running(False)
+        editor.apply_line_rewrite(original_line, new_line)
+
+    @Slot(str, str)
+    def _line_rewrite_failed(self, vod_id: str, message: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.set_line_rewrite_running(False)
+            editor.status_label.setText(f"줄 변환 실패: {message}")
+
+    @Slot()
+    def _line_rewrite_thread_finished(self) -> None:
+        thread = self.sender()
+        vod_id = str(thread.property("vod_id") or "") if thread is not None else ""
+        if not vod_id:
+            return
+        self._line_rewrite_jobs.pop(vod_id, None)
 
     @Slot(str, str)
     def start_topic_regroup(self, vod_id: str, granularity: str) -> None:

@@ -20,6 +20,39 @@ class TimestampHit:
     text: str
 
 
+@dataclass(frozen=True, slots=True)
+class TimelineLineHit:
+    line: str
+    seconds: int
+    next_seconds: int
+
+
+def timeline_line_at_position(text: str, cursor_position: int) -> TimelineLineHit | None:
+    """Return the timeline line under the cursor plus the next entry's start."""
+    position = max(0, min(len(text), int(cursor_position)))
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end].rstrip("\r")
+    match = LINE_TIMESTAMP_PATTERN.match(line)
+    if match is None:
+        return None
+    seconds = parse_timestamp(match.group("timestamp"))
+    if seconds is None:
+        return None
+    next_seconds = -1
+    for other in text[line_end:].splitlines():
+        other_match = LINE_TIMESTAMP_PATTERN.match(other.rstrip("\r"))
+        if other_match is None:
+            continue
+        other_seconds = parse_timestamp(other_match.group("timestamp"))
+        if other_seconds is not None and other_seconds > seconds:
+            next_seconds = other_seconds
+            break
+    return TimelineLineHit(line=line, seconds=seconds, next_seconds=next_seconds)
+
+
 def parse_timestamp(value: str) -> int | None:
     match = TIMESTAMP_PATTERN.fullmatch(value.strip())
     if match is None:

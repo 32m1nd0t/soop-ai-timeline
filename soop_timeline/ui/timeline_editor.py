@@ -40,6 +40,7 @@ from ..services.timeline_timestamp import (
     merge_current_timeline_line_with_previous,
     parse_timestamp,
     shift_all_timestamps,
+    timeline_line_at_position,
     timestamp_at_position,
 )
 from ..services.timeline_validation import (
@@ -145,6 +146,7 @@ class TimelineDocumentEditor(QWidget):
     analysis_cancel_requested = Signal(str)
     reanalyze_as_vod_requested = Signal(str)
     style_requested = Signal(str)
+    line_rewrite_requested = Signal(str, str, str, int)
     regroup_requested = Signal(str, str)
     snapshot_requested = Signal(str, str, str)
     version_history_requested = Signal(str)
@@ -177,6 +179,7 @@ class TimelineDocumentEditor(QWidget):
         self._cached_transcript_available = False
         self._cache_present = False
         self._final_pending = False
+        self._line_rewrite_running = False
         self._last_focused_editor: TimelineTextEdit | None = None
         self._last_cursor_global_position = 0
 
@@ -318,6 +321,23 @@ class TimelineDocumentEditor(QWidget):
             )
         )
         self.finalize_retry_button.setVisible(False)
+        self.quote_line_button = QPushButton("이 줄 → 직접 인용")
+        self.quote_line_button.setToolTip(
+            "커서가 있는 타임라인 줄을 그 구간 자막에서 고른 실제 발언 인용으로 바꿉니다. "
+            "단어 시각이 있으면 타임스탬프도 발언 시점으로 보정됩니다."
+        )
+        self.quote_line_button.setEnabled(False)
+        self.quote_line_button.clicked.connect(
+            lambda: self._request_line_rewrite("quote")
+        )
+        self.summary_line_button = QPushButton("이 줄 → 요약")
+        self.summary_line_button.setToolTip(
+            "커서가 있는 타임라인 줄(인용 등)을 저장 자막을 참고해 건조한 제목형 요약으로 바꿉니다."
+        )
+        self.summary_line_button.setEnabled(False)
+        self.summary_line_button.clicked.connect(
+            lambda: self._request_line_rewrite("summary")
+        )
         self.insert_time_button = QPushButton("현재 재생시간 삽입")
         self.insert_time_button.setToolTip(
             "타임스탬프를 더블클릭해 선택한 상태면 그 자리를 현재 재생시간으로 보정하고, "
@@ -347,6 +367,8 @@ class TimelineDocumentEditor(QWidget):
         tools_row.addWidget(self.granularity_combo)
         tools_row.addWidget(self.regroup_button)
         tools_row.addWidget(self.finalize_retry_button)
+        tools_row.addWidget(self.quote_line_button)
+        tools_row.addWidget(self.summary_line_button)
         tools_row.addWidget(self.validate_button)
         tools_row.addWidget(self.history_button)
         tools_row.addStretch(1)
@@ -594,6 +616,7 @@ class TimelineDocumentEditor(QWidget):
         self.regroup_button.setText(
             "저장 자막 다시 정리" if self._is_live else "주제 다시 묶기"
         )
+        self._update_line_rewrite_buttons()
         if not available:
             self.regroup_button.setToolTip(
                 "저장된 Whisper 자막이 생긴 뒤 사용할 수 있습니다."
@@ -613,6 +636,53 @@ class TimelineDocumentEditor(QWidget):
             "Whisper 재분석 없이 현재 타임라인만 건조한 제목형으로 교정합니다."
             if available
             else reason
+        )
+        self._update_line_rewrite_buttons()
+
+    def _update_line_rewrite_buttons(self) -> None:
+        enabled = (
+            not self._line_rewrite_running
+            and self._style_available
+            and self._cached_transcript_available
+        )
+        self.quote_line_button.setEnabled(enabled)
+        self.summary_line_button.setEnabled(enabled)
+
+    def set_line_rewrite_running(self, running: bool, mode: str = "") -> None:
+        self._line_rewrite_running = running
+        self._update_line_rewrite_buttons()
+        if running:
+            target = "직접 인용" if mode == "quote" else "요약"
+            self.status_label.setText(f"AI가 현재 줄을 {target} 형태로 바꾸는 중…")
+
+    def _request_line_rewrite(self, mode: str) -> None:
+        hit = timeline_line_at_position(self.text(), self._global_cursor_position())
+        if hit is None:
+            self.status_label.setText("변환할 타임라인 줄에 커서를 두세요.")
+            return
+        self.line_rewrite_requested.emit(
+            self.vod.vod_id, mode, hit.line, hit.next_seconds
+        )
+
+    def apply_line_rewrite(self, original_line: str, new_line: str) -> None:
+        original = self.text()
+        lines = original.splitlines()
+        try:
+            index = lines.index(original_line)
+        except ValueError:
+            self.status_label.setText(
+                "줄이 이미 수정되어 AI 변환 결과를 적용하지 않았습니다."
+            )
+            return
+        lines[index] = new_line
+        updated = "\n".join(lines)
+        if original.endswith("\n"):
+            updated += "\n"
+        self._apply_document_tool(
+            original,
+            updated,
+            "AI 줄 변환 전",
+            f"현재 줄을 변환했습니다 → {new_line}",
         )
 
     def set_analysis_progress(self, percent: int, message: str) -> None:
