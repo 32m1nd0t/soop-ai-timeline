@@ -87,22 +87,28 @@ if ((!Number.isFinite(duration) || duration <= 0) && seekableEnd <= 0) {{
 const availableEnd = Number.isFinite(duration) && duration > 0
     ? duration
     : seekableEnd;
-if (availableEnd > 0 && target > availableEnd + 2) {{
-    return {{
-        ok: false,
-        reason: 'target-outside-media',
-        duration: availableEnd
-    }};
-}}
 
 try {{
+    // Don't pre-reject against our own duration read (it can lag while a long
+    // VOD is still loading). Attempt the seek and verify where we actually
+    // landed: if the player clamps far from the target, that region isn't
+    // available yet (or lives in a later SOOP part).
     video.currentTime = target;
     video.muted = false;
     try {{ await video.play(); }} catch (_) {{}}
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const landed = Number(video.currentTime);
+    if (Number.isFinite(landed) && Math.abs(landed - target) > 5) {{
+        return {{
+            ok: false,
+            reason: 'target-not-ready',
+            landed: landed,
+            duration: availableEnd
+        }};
+    }}
     return {{
         ok: true,
-        currentTime: Number(video.currentTime),
+        currentTime: landed,
         duration: availableEnd,
         paused: Boolean(video.paused),
         muted: Boolean(video.muted)
@@ -183,6 +189,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_in_flight = False
         self._activate_attempts = 0
         self._suppress_activate = False
+        self._not_ready_hits = 0
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -277,6 +284,7 @@ class SoopReviewPlayer(QFrame):
         self._pending_seconds = value
         self._seek_generation += 1
         self._seek_attempts = 0
+        self._not_ready_hits = 0
         label = format_timestamp_seconds(value)
         self.time_label.setText(f"이동 중 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동합니다…")
@@ -392,13 +400,23 @@ class SoopReviewPlayer(QFrame):
             return
         payload = result.get("result")
         if not isinstance(payload, dict) or not bool(payload.get("ok")):
-            if isinstance(payload, dict) and payload.get("reason") == "target-outside-media":
-                self._retry_timer.stop()
-                self._pending_seconds = None
-                self.time_label.setText("영상 범위를 벗어난 시간")
-                self.status_changed.emit(
-                    "선택한 타임스탬프가 실제 영상 길이를 벗어났습니다."
-                )
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            if reason == "target-not-ready":
+                # The seek clamped short of the target. Give a long VOD a few
+                # seconds to load the region, then stop: SOOP splits long
+                # broadcasts into parts and the embed only holds the current
+                # part, so later timestamps can't be reached in-app.
+                self._not_ready_hits += 1
+                if self._not_ready_hits >= 6:
+                    self._retry_timer.stop()
+                    self._pending_seconds = None
+                    label = format_timestamp_seconds(seconds)
+                    self.time_label.setText(f"구간 밖 · {label}")
+                    self.status_changed.emit(
+                        "이 시간대로 이동하지 못했습니다. 긴 방송은 여러 파트로 나뉘어 "
+                        "있어 내부 플레이어가 뒷부분 파트로는 이동하지 못할 수 있습니다. "
+                        "‘외부로 열기’로 SOOP에서 확인하세요."
+                    )
             return
 
         self._pending_seconds = None
