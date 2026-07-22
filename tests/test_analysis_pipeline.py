@@ -21,6 +21,7 @@ from soop_timeline.services.gemini_timeline import (
     GeneratedTimeline,
     TimelineEntry,
     TimelineGenerationState,
+    build_overall_summary,
     build_chunk_prompt,
     build_final_prompt,
     deduplicate_entries,
@@ -29,6 +30,7 @@ from soop_timeline.services.gemini_timeline import (
     find_phrase_start_time,
     format_entry_text,
     preserve_broadcast_ending_quotes,
+    resolve_overall_summary,
     snap_entries_to_words,
     split_transcript,
     validate_and_snap_quotes,
@@ -343,6 +345,50 @@ class AnalysisPipelineTests(unittest.TestCase):
             "오늘의 콘텐츠: 테스트 콘텐츠\n\n01:02:05 시청자와 꿈 이야기\n",
         )
 
+    def test_overall_summary_covers_representative_broadcast_topics(self):
+        entries = [
+            TimelineEntry("s0", 0, "방송 시작", "방송 시작"),
+            TimelineEntry("s1", 60, "리롤드 게임의 중독성과 조작 난이도", "리롤드"),
+            TimelineEntry("s2", 600, "건월드 게임 특징과 멀티플레이 고민", "건월드"),
+            TimelineEntry("s3", 1_200, "다이어트 식단 관리와 운동", "다이어트"),
+            TimelineEntry("s4", 1_800, "월드컵 결승전 시청 계획", "월드컵"),
+            TimelineEntry("s5", 2_000, "방송 종료", "방송 종료"),
+        ]
+
+        result = build_overall_summary(sample_vod(), [], entries)
+
+        self.assertIn("리롤드", result)
+        self.assertIn("건월드", result)
+        self.assertIn("다이어트", result)
+        self.assertIn("월드컵", result)
+        self.assertNotIn("방송 시작", result)
+        self.assertNotIn("방송 종료", result)
+
+    def test_copied_video_or_single_topic_title_is_replaced_locally(self):
+        entries = [
+            TimelineEntry("s1", 10, "꿈 이야기", "꿈"),
+            TimelineEntry("s2", 300, "게임 시작", "게임"),
+        ]
+
+        result = resolve_overall_summary(
+            sample_vod().title,
+            sample_vod(),
+            ["꿈 토크", "게임 플레이"],
+            entries,
+        )
+
+        self.assertEqual(result, "꿈 이야기 · 게임 시작")
+        self.assertNotEqual(result, sample_vod().title)
+        self.assertEqual(
+            resolve_overall_summary(
+                "꿈 이야기",
+                sample_vod(),
+                ["꿈 토크", "게임 플레이"],
+                entries,
+            ),
+            "꿈 이야기 · 게임 시작",
+        )
+
     def test_gemini_prompts_require_concise_title_style(self):
         chunk_prompt = build_chunk_prompt(sample_vod(), sample_transcript().segments)
         final_prompt = build_final_prompt(
@@ -359,6 +405,10 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertIn("현재 방송", prompt)
             self.assertIn("summary는 비웁니다", prompt)
         self.assertIn("문체 규칙에 맞게 간결하고 자연스럽게", final_prompt)
+        self.assertIn("전체 방송 한 줄 요약", final_prompt)
+        self.assertIn("시작·중간·후반", final_prompt)
+        self.assertIn("영상 제목이나 구간별 콘텐츠 제목 하나를 그대로 복사하지", final_prompt)
+        self.assertIn("영상 제목을 복사하지 말고", chunk_prompt)
 
     def test_topic_prompts_keep_previous_context_and_merge_subtopics(self):
         previous = [TimelineEntry("old", 100, "와우 시절과 현재 선호 비교")]
@@ -443,6 +493,46 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertTrue(all(stage == "timeline" for stage, _ in previews))
         self.assertLess(len(previews[0][1]), len(previews[-1][1]))
         self.assertEqual(result.content_title, "테스트 콘텐츠")
+
+    def test_generator_replaces_copied_title_without_extra_gemini_call(self):
+        from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
+
+        payloads = [
+            {
+                "content_title": sample_vod().title,
+                "entries": [
+                    {"segment_id": "s000000", "summary": "방송을 시작함"},
+                ],
+            },
+            {
+                "content_title": sample_vod().title,
+                "entries": [
+                    {"segment_id": "s000001", "summary": "꿈 이야기"},
+                    {"segment_id": "s000002", "summary": "게임 시작"},
+                ],
+            },
+            {
+                "content_title": sample_vod().title,
+                "entries": [
+                    {"segment_id": "s000000", "summary": "방송을 시작함"},
+                    {"segment_id": "s000001", "summary": "꿈 이야기"},
+                    {"segment_id": "s000002", "summary": "게임 시작"},
+                ],
+            },
+        ]
+        generator = GeminiTimelineGenerator("test-key")
+
+        with patch.object(generator, "_request_json", side_effect=payloads) as request:
+            result = generator.generate(
+                sample_vod(),
+                sample_transcript(),
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(result.content_title, "꿈 이야기 · 게임 시작")
+        self.assertNotEqual(result.content_title, sample_vod().title)
 
     def test_gemini_final_failure_keeps_checkpoint_and_resumes_final_only(self):
         from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator

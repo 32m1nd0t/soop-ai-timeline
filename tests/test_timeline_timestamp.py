@@ -73,6 +73,7 @@ class TimelineTimestampTests(unittest.TestCase):
     def test_seek_script_targets_soop_video_and_requested_time(self):
         script = build_seek_script(7_433)
         self.assertIn("const target = 7433", script)
+        self.assertIn("const seekTolerance = 1.5", script)
         # The replay is chosen by media presence, not the first <video> element.
         self.assertIn("__pickVod", script)
         self.assertIn("video.currentTime = target", script)
@@ -86,6 +87,9 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("#player .progress", script)
         self.assertIn("strategy: 'soop-progress'", script)
         self.assertIn("correctedLocal = localCurrent + correction", script)
+        self.assertIn("secondsPerPixel: total / rect.width", script)
+        self.assertIn("__soopFineCorrectionWindow(globalTotal)", script)
+        self.assertIn("Math.min(300, (total / rect.width) * 2)", script)
         self.assertIn("globalTotal > availableEnd + 15", script)
 
     def test_seek_script_prefers_precise_direct_seek_inside_first_part(self):
@@ -101,12 +105,27 @@ class TimelineTimestampTests(unittest.TestCase):
     def test_seek_verification_only_reads_clock(self):
         script = build_seek_verification_script(12_282)
         self.assertIn("const clocks = __readSoopClocks()", script)
+        self.assertIn("const seekTolerance = 1.5", script)
         self.assertIn("strategy: 'clock-verification'", script)
         self.assertNotIn(
             "const dispatched = __dispatchSoopSeek(target, globalTotal)",
             script,
         )
-        self.assertNotIn("video.currentTime = target", script)
+        self.assertNotIn("video.currentTime", script)
+
+    def test_seek_verification_can_issue_only_a_local_fine_correction(self):
+        script = build_seek_verification_script(
+            12_282,
+            allow_correction=True,
+        )
+        self.assertIn("video.currentTime = correctedLocal", script)
+        self.assertIn("correctionIssued: true", script)
+        self.assertIn("strategy: 'clock-fine-correction'", script)
+        self.assertIn("__soopFineCorrectionWindow(clocks.total)", script)
+        self.assertNotIn(
+            "const dispatched = __dispatchSoopSeek(target, globalTotal)",
+            script,
+        )
 
     def test_pending_seek_switches_retries_to_read_only_verification(self):
         class StubWebView:
@@ -126,13 +145,86 @@ class TimelineTimestampTests(unittest.TestCase):
             _seek_attempts=0,
             _seek_generation=1,
             _seek_command_sent=True,
+            _fine_correction_sent=True,
             _duration_seconds=24_357,
             web_view=web_view,
         )
         SoopReviewPlayer._attempt_seek(player)
         self.assertTrue(player._seek_in_flight)
         self.assertIn("strategy: 'clock-verification'", web_view.script)
-        self.assertNotIn("video.currentTime = target", web_view.script)
+        self.assertNotIn("video.currentTime", web_view.script)
+
+    def test_pending_seek_allows_one_local_fine_correction(self):
+        class StubWebView:
+            is_ready = True
+
+            def __init__(self):
+                self.script = ""
+
+            def evaluate_js(self, script, callback):
+                self.script = script
+
+        web_view = StubWebView()
+        player = SimpleNamespace(
+            _dom_loaded=True,
+            _pending_seconds=12_282,
+            _seek_in_flight=False,
+            _seek_attempts=0,
+            _seek_generation=1,
+            _seek_command_sent=True,
+            _fine_correction_sent=False,
+            _duration_seconds=24_357,
+            web_view=web_view,
+        )
+        SoopReviewPlayer._attempt_seek(player)
+        self.assertTrue(player._seek_in_flight)
+        self.assertIn("video.currentTime = correctedLocal", web_view.script)
+        self.assertNotIn(
+            "const dispatched = __dispatchSoopSeek(target, globalTotal)",
+            web_view.script,
+        )
+
+    def test_initial_fine_correction_marks_both_commands_as_sent(self):
+        class Recorder:
+            def __init__(self):
+                self.values = []
+
+            def setText(self, value):
+                self.values.append(value)
+
+            def emit(self, value):
+                self.values.append(value)
+
+        label = Recorder()
+        status = Recorder()
+        player = SimpleNamespace(
+            _seek_in_flight=True,
+            _seek_generation=2,
+            _pending_seconds=12_282,
+            _seek_command_sent=False,
+            _fine_correction_sent=False,
+            _seek_attempts=7,
+            time_label=label,
+            status_changed=status,
+        )
+        SoopReviewPlayer._handle_seek_result(
+            player,
+            2,
+            12_282,
+            {
+                "success": True,
+                "result": {
+                    "ok": False,
+                    "reason": "target-not-ready",
+                    "issued": True,
+                    "correctionIssued": True,
+                },
+            },
+        )
+        self.assertTrue(player._seek_command_sent)
+        self.assertTrue(player._fine_correction_sent)
+        self.assertEqual(player._seek_attempts, 0)
+        self.assertTrue(any("한 번 정밀 보정" in value for value in status.values))
 
     def test_issued_seek_is_never_sent_again_while_landing(self):
         class Recorder:

@@ -54,7 +54,10 @@ STYLE_SCHEMA = {
     "properties": {
         "content_title": {
             "type": "string",
-            "description": "건조하고 중립적인 짧은 콘텐츠 제목",
+            "description": (
+                "모든 타임라인 항목의 주요 흐름을 종합한 건조하고 중립적인 "
+                "전체 방송 한 줄 요약"
+            ),
         },
         "entries": {
             "type": "array",
@@ -211,6 +214,7 @@ def build_style_prompt(parsed: ParsedTimelineDocument) -> str:
 - 항목을 추가·삭제·병합·분할하거나 순서를 바꾸지 않습니다.
 - 원문에 없는 사실과 감정을 추측하지 않습니다.
 - 큰따옴표("…")로 감싼 스트리머 직접 인용은 말투·종결어미 그대로 두고 문체를 바꾸지 않습니다. 큰따옴표 밖의 메모만 건조하게 교정합니다.
+- content_title은 현재 제목이나 특정 한 항목만 반복하지 말고, 아래 모든 항목에서 확인되는 처음·중간·후반의 주요 흐름을 종합한 한 줄 요약으로 씁니다.
 
 {DRY_TIMELINE_STYLE_GUIDE}
 

@@ -91,6 +91,7 @@ class GeminiStyleTests(unittest.TestCase):
         self.assertIn("항목을 추가·삭제·병합·분할", prompt)
         self.assertIn("line_0000 | 00:01:02", prompt)
         self.assertIn("MBTI 검사 재진행", prompt)
+        self.assertIn("처음·중간·후반의 주요 흐름", prompt)
 
     def test_styler_rewrites_document_without_a_network_call(self):
         styler = GeminiTimelineStyler("test-key")

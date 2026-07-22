@@ -186,7 +186,8 @@ class MainWindow(QMainWindow):
             "타임스탬프가 포함된 자막, 영상 제목, 스트리머 이름과 단어 사전은 "
             "타임라인 생성을 위해 Google Gemini API로 전송됩니다. 로컬에는 자막·AI "
             "중간 결과·타임라인 문서가 저장됩니다. 저작권자 또는 스트리머의 허용 범위와 "
-            "SOOP 약관을 확인한 영상에만 사용하세요. 설정에서 캐시를 삭제할 수 있습니다."
+            "SOOP 약관을 확인한 영상에만 사용하세요. 이 앱은 SOOP 비공식 도구이며 "
+            "SOOP과 제휴·승인 관계가 없습니다. 설정에서 캐시를 삭제할 수 있습니다."
         )
         accept_button = message.addButton("확인하고 시작", QMessageBox.ButtonRole.AcceptRole)
         message.addButton("종료", QMessageBox.ButtonRole.RejectRole)

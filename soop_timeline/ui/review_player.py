@@ -91,10 +91,27 @@ function __readSoopClocks() {
     };
 }
 
-function __dispatchSoopSeek(target, total) {
-    const progress = document.querySelector('#player .progress')
+function __pickSoopProgress() {
+    return document.querySelector('#player .progress')
         || document.querySelector('.progress')
         || document.querySelector('.progress_track');
+}
+
+function __soopFineCorrectionWindow(total) {
+    const progress = __pickSoopProgress();
+    const rect = progress && progress.getBoundingClientRect();
+    if (!rect || !Number.isFinite(rect.width) || rect.width <= 0
+        || !Number.isFinite(total) || total <= 0) {
+        return 180;
+    }
+    // A small embedded player can represent almost one minute per pixel on a
+    // long replay. Cover two pixels of rounding, while preventing an unrelated
+    // media part from receiving a very large local correction.
+    return Math.max(30, Math.min(300, (total / rect.width) * 2));
+}
+
+function __dispatchSoopSeek(target, total) {
+    const progress = __pickSoopProgress();
     if (!progress || !Number.isFinite(total) || total <= 0) {
         return { ok: false, reason: 'progress-not-ready' };
     }
@@ -140,7 +157,11 @@ function __dispatchSoopSeek(target, total) {
     for (const type of ['pointerup', 'mouseup', 'click']) {
         emit(type, 0);
     }
-    return { ok: true, ratio };
+    return {
+        ok: true,
+        ratio,
+        secondsPerPixel: total / rect.width
+    };
 }
 """
 
@@ -151,6 +172,7 @@ def build_seek_script(seconds: int, expected_duration: int | None = None) -> str
     return (_PICK_VIDEO_FN + _SOOP_GLOBAL_TIME_FN + f"""
 const target = {target};
 const expectedTotal = {expected_total};
+const seekTolerance = 1.5;
 const video = __pickVod();
 if (!video) {{
     return {{ ok: false, reason: 'video-not-found' }};
@@ -201,7 +223,8 @@ if (firstPartIsActive && target < availableEnd - 1) {{
         try {{ await video.play(); }} catch (_) {{}}
         await new Promise((resolve) => setTimeout(resolve, 350));
         const landed = Number(video.currentTime);
-        if (Number.isFinite(landed) && Math.abs(landed - target) <= 5) {{
+        if (Number.isFinite(landed)
+            && Math.abs(landed - target) <= seekTolerance) {{
             return {{
                 ok: true,
                 strategy: 'active-part-current-time',
@@ -239,22 +262,25 @@ if (globalTotal > 0) {{
         }} catch (_) {{}}
         let clocksAfter = __readSoopClocks();
         let landedGlobal = clocksAfter.current;
+        let correctionIssued = false;
         // The full progress bar is only about one pixel per 20 seconds on a
         // six-hour replay. Once SOOP has switched to the correct part, correct
         // that pixel rounding against the active part's local currentTime.
+        const correctionWindow = __soopFineCorrectionWindow(globalTotal);
         if (Number.isFinite(landedGlobal)
-            && Math.abs(landedGlobal - target) <= 30) {{
+            && Math.abs(landedGlobal - target) <= correctionWindow) {{
             const localCurrent = Number(activeVideo.currentTime);
             const localDuration = Number(activeVideo.duration);
             const correction = target - landedGlobal;
             const correctedLocal = localCurrent + correction;
-            if (Math.abs(correction) > 1
+            if (Math.abs(correction) > 0.5
                 && Number.isFinite(localCurrent)
                 && Number.isFinite(localDuration)
                 && correctedLocal >= 0
                 && correctedLocal <= localDuration) {{
                 try {{
                     activeVideo.currentTime = correctedLocal;
+                    correctionIssued = true;
                     await new Promise((resolve) => setTimeout(resolve, 300));
                     clocksAfter = __readSoopClocks();
                     landedGlobal = clocksAfter.current;
@@ -262,10 +288,11 @@ if (globalTotal > 0) {{
             }}
         }}
         if (Number.isFinite(landedGlobal)
-            && Math.abs(landedGlobal - target) <= 5) {{
+            && Math.abs(landedGlobal - target) <= seekTolerance) {{
             return {{
                 ok: true,
                 strategy: 'soop-progress',
+                correctionIssued,
                 currentTime: landedGlobal,
                 duration: globalTotal,
                 paused: Boolean(activeVideo.paused),
@@ -276,6 +303,7 @@ if (globalTotal > 0) {{
             ok: false,
             reason: 'target-not-ready',
             issued: true,
+            correctionIssued,
             landed: landedGlobal,
             duration: globalTotal,
             strategy: 'soop-progress'
@@ -301,7 +329,8 @@ try {{
     try {{ await video.play(); }} catch (_) {{}}
     await new Promise((resolve) => setTimeout(resolve, 350));
     const landed = Number(video.currentTime);
-    if (Number.isFinite(landed) && Math.abs(landed - target) > 5) {{
+    if (Number.isFinite(landed)
+        && Math.abs(landed - target) > seekTolerance) {{
         return {{
             ok: false,
             reason: 'target-not-ready',
@@ -329,16 +358,63 @@ try {{
 """).strip()
 
 
-def build_seek_verification_script(seconds: int) -> str:
-    """Read the SOOP global clock without issuing another seek command."""
+def build_seek_verification_script(
+    seconds: int,
+    *,
+    allow_correction: bool = False,
+) -> str:
+    """Verify the SOOP clock and optionally issue one local fine correction."""
     target = max(0, int(seconds))
-    return (_SOOP_GLOBAL_TIME_FN + f"""
+    correction_script = ""
+    prefix = _SOOP_GLOBAL_TIME_FN
+    if allow_correction:
+        prefix = _PICK_VIDEO_FN + prefix
+        correction_script = """
+const correctionWindow = __soopFineCorrectionWindow(clocks.total);
+if (Math.abs(clocks.current - target) <= correctionWindow) {
+    const video = __pickVod();
+    const localCurrent = Number(video && video.currentTime);
+    const localDuration = Number(video && video.duration);
+    const correction = target - clocks.current;
+    const correctedLocal = localCurrent + correction;
+    if (video
+        && Number.isFinite(localCurrent)
+        && Number.isFinite(localDuration)
+        && correctedLocal >= 0
+        && correctedLocal <= localDuration) {
+        try {
+            video.currentTime = correctedLocal;
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            const correctedClocks = __readSoopClocks();
+            if (Number.isFinite(correctedClocks.current)
+                && Math.abs(correctedClocks.current - target) <= seekTolerance) {
+                return {
+                    ok: true,
+                    strategy: 'clock-fine-correction',
+                    correctionIssued: true,
+                    currentTime: correctedClocks.current,
+                    duration: correctedClocks.total
+                };
+            }
+            return {
+                ok: false,
+                reason: 'seek-still-pending',
+                correctionIssued: true,
+                currentTime: correctedClocks.current,
+                duration: correctedClocks.total
+            };
+        } catch (_) {}
+    }
+}
+"""
+    return (prefix + f"""
 const target = {target};
+const seekTolerance = 1.5;
 const clocks = __readSoopClocks();
 if (!Number.isFinite(clocks.current)) {{
     return {{ ok: false, reason: 'seek-still-pending' }};
 }}
-if (Math.abs(clocks.current - target) <= 5) {{
+if (Math.abs(clocks.current - target) <= seekTolerance) {{
     return {{
         ok: true,
         strategy: 'clock-verification',
@@ -346,6 +422,7 @@ if (Math.abs(clocks.current - target) <= 5) {{
         duration: clocks.total
     }};
 }}
+{correction_script}
 return {{
     ok: false,
     reason: 'seek-still-pending',
@@ -494,6 +571,7 @@ class SoopReviewPlayer(QFrame):
         self._activate_generation = 0
         self._suppress_activate = False
         self._seek_command_sent = False
+        self._fine_correction_sent = False
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -596,6 +674,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_generation += 1
         self._seek_attempts = 0
         self._seek_command_sent = False
+        self._fine_correction_sent = False
         label = format_timestamp_seconds(value)
         self.time_label.setText(f"이동 중 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동합니다…")
@@ -610,6 +689,7 @@ class SoopReviewPlayer(QFrame):
         self._dom_loaded = False
         self._suppress_activate = False
         self._seek_command_sent = False
+        self._fine_correction_sent = False
         self._seek_attempts = 0
         self.time_label.setText("새로고침 중…")
         self.web_view.reload()
@@ -662,6 +742,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_attempts = 0
         self._seek_in_flight = False
         self._seek_command_sent = False
+        self._fine_correction_sent = False
         self._suppress_activate = False
         if self.web_view.is_ready:
             self.web_view.evaluate_js(build_close_script())
@@ -713,6 +794,7 @@ class SoopReviewPlayer(QFrame):
                     "타임스탬프를 다시 더블클릭하세요."
                 )
             self._seek_command_sent = False
+            self._fine_correction_sent = False
             return
 
         self._seek_attempts += 1
@@ -720,7 +802,10 @@ class SoopReviewPlayer(QFrame):
         generation = self._seek_generation
         seconds = self._pending_seconds
         script = (
-            build_seek_verification_script(seconds)
+            build_seek_verification_script(
+                seconds,
+                allow_correction=not self._fine_correction_sent,
+            )
             if self._seek_command_sent
             else build_seek_script(seconds, self._duration_seconds)
         )
@@ -741,14 +826,31 @@ class SoopReviewPlayer(QFrame):
         if not isinstance(result, dict) or not bool(result.get("success")):
             return
         payload = result.get("result")
+        correction_issued = (
+            bool(payload.get("correctionIssued"))
+            if isinstance(payload, dict)
+            else False
+        )
+        if correction_issued:
+            self._fine_correction_sent = True
         if not isinstance(payload, dict) or not bool(payload.get("ok")):
             reason = payload.get("reason") if isinstance(payload, dict) else None
             issued = bool(payload.get("issued")) if isinstance(payload, dict) else False
-            if reason == "target-not-ready" and issued:
-                # The actual seek was already issued. From now on the timer
-                # only reads SOOP's global clock and never sends the same seek
-                # again, preventing a one-to-two-second playback loop.
+            if issued:
+                # A coarse global seek is sent at most once, even when its
+                # immediate result also needed the one allowed fine correction.
                 self._seek_command_sent = True
+            if correction_issued:
+                self._seek_attempts = 0
+                label = format_timestamp_seconds(seconds)
+                self.time_label.setText(f"정밀 위치 보정 중 · {label}")
+                self.status_changed.emit(
+                    "재생 위치를 한 번 정밀 보정했습니다. 도착 시각을 확인하고 있습니다…"
+                )
+            elif reason == "target-not-ready" and issued:
+                # The actual seek was already issued. From now on the timer
+                # never sends the same global seek again. It may issue one
+                # bounded local fine correction, preventing playback loops.
                 self._seek_attempts = 0
                 label = format_timestamp_seconds(seconds)
                 self.time_label.setText(f"이동 후 로딩 중 · {label}")
@@ -766,6 +868,7 @@ class SoopReviewPlayer(QFrame):
         self._pending_seconds = None
         self._retry_timer.stop()
         self._seek_command_sent = False
+        self._fine_correction_sent = False
         label = format_timestamp_seconds(seconds)
         self.time_label.setText(f"재생 위치 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동했습니다.")

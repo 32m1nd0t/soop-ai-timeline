@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import json
+from importlib import metadata
 import os
 from pathlib import Path
 import tempfile
 
 import qtwebview2
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -13,6 +16,113 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 datas = []
 binaries = []
 hiddenimports = []
+
+project_root = Path.cwd()
+for document_name in ("PRIVACY.md", "THIRD_PARTY_NOTICES.md"):
+    document_path = project_root / document_name
+    if not document_path.is_file():
+        raise SystemExit(f"SOOPTimeline.spec: missing distribution document {document_path}")
+    datas.append((str(document_path), "."))
+
+
+def _distribution_key(value):
+    return str(value).strip().lower().replace("_", "-")
+
+
+def _safe_distribution_name(value):
+    return "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in str(value)
+    )
+
+
+def _collect_runtime_license_files():
+    environment = default_environment()
+    queue = [
+        "soop-timeline",
+        "nvidia-cublas-cu12",
+        "nvidia-cudnn-cu12",
+        "pyinstaller",
+    ]
+    seen = set()
+    component_lines = [
+        "SOOP AI Timeline bundled third-party components",
+        "Generated from the release build environment.",
+        "",
+        "Package\tVersion\tDeclared license",
+    ]
+    license_count = 0
+    while queue:
+        requested_name = queue.pop(0)
+        key = _distribution_key(requested_name)
+        if key in seen:
+            continue
+        try:
+            distribution = metadata.distribution(requested_name)
+        except metadata.PackageNotFoundError:
+            print(f"[SOOPTimeline.spec] license metadata missing: {requested_name}")
+            continue
+        seen.add(key)
+        package_name = distribution.metadata.get("Name", requested_name)
+        classifiers = [
+            classifier.removeprefix("License :: ")
+            for classifier in distribution.metadata.get_all("Classifier") or []
+            if classifier.startswith("License :: ")
+        ]
+        license_text = str(distribution.metadata.get("License") or "").strip()
+        declared_license = (
+            distribution.metadata.get("License-Expression")
+            or "; ".join(classifiers)
+            or (license_text.splitlines()[0] if license_text else "")
+            or "See bundled license files and project metadata"
+        )
+        component_lines.append(
+            f"{package_name}\t{distribution.version}\t{declared_license}"
+        )
+
+        safe_name = _safe_distribution_name(package_name)
+        for relative_file in distribution.files or []:
+            relative_path = Path(str(relative_file))
+            filename = relative_path.name.lower()
+            if not (
+                filename.startswith(("license", "copying", "notice", "authors"))
+                or "thirdpartynotice" in filename.replace("_", "")
+            ):
+                continue
+            source = Path(distribution.locate_file(relative_file)).resolve()
+            if not source.is_file():
+                continue
+            destination = Path("third_party_licenses") / safe_name / relative_path.parent
+            datas.append((str(source), str(destination)))
+            license_count += 1
+
+        for requirement_text in distribution.requires or []:
+            try:
+                requirement = Requirement(requirement_text)
+            except Exception:
+                continue
+            if requirement.marker:
+                try:
+                    if not requirement.marker.evaluate(environment):
+                        continue
+                except Exception:
+                    # An optional dependency marker can depend on build-only
+                    # context such as ``extra``. Do not pull it into the runtime
+                    # notice closure unless its marker can be evaluated here.
+                    continue
+            queue.append(requirement.name)
+
+    index_dir = Path(tempfile.mkdtemp(prefix="soop-timeline-licenses-"))
+    index_path = index_dir / "third_party_components.txt"
+    index_path.write_text("\n".join(component_lines) + "\n", encoding="utf-8")
+    datas.append((str(index_path), "."))
+    print(
+        f"[SOOPTimeline.spec] bundled {license_count} license/notice files "
+        f"for {len(seen)} Python distributions"
+    )
+
+
+_collect_runtime_license_files()
 
 update_manifest_url = os.environ.get(
     "SOOP_TIMELINE_UPDATE_MANIFEST_URL",

@@ -20,6 +20,7 @@ from .gemini_timeline import (
     GeminiTimelineGenerator,
     TimelineGenerationState,
     TimelineEntry,
+    build_overall_summary,
     deduplicate_entries,
 )
 from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
@@ -521,7 +522,11 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             preview(
                 "live_timeline",
                 GeneratedTimeline(
-                    content_title=titles[0] if titles else vod.title,
+                    content_title=build_overall_summary(
+                        vod,
+                        titles,
+                        candidates,
+                    ),
                     entries=deduplicate_entries(candidates),
                 ).to_document(),
             )

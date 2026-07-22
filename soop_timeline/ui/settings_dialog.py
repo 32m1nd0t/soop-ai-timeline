@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -11,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -270,6 +274,26 @@ class AnalysisSettingsDialog(QDialog):
         update_hint.setObjectName("muted")
         root.addWidget(update_hint)
 
+        document_row = QHBoxLayout()
+        privacy_button = QPushButton("데이터 처리 안내")
+        privacy_button.clicked.connect(
+            lambda: self._show_distribution_document(
+                "데이터 처리 안내",
+                "PRIVACY.md",
+            )
+        )
+        notices_button = QPushButton("제3자 라이선스")
+        notices_button.clicked.connect(
+            lambda: self._show_distribution_document(
+                "제3자 소프트웨어 고지",
+                "THIRD_PARTY_NOTICES.md",
+            )
+        )
+        document_row.addWidget(privacy_button)
+        document_row.addWidget(notices_button)
+        document_row.addStretch(1)
+        root.addLayout(document_row)
+
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -279,6 +303,35 @@ class AnalysisSettingsDialog(QDialog):
         self.buttons.accepted.connect(self._save)
         self.buttons.rejected.connect(self.reject)
         outer.addWidget(self.buttons)
+
+    def _show_distribution_document(self, title: str, filename: str) -> None:
+        bundle_root = Path(
+            getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2])
+        )
+        document_path = bundle_root / filename
+        try:
+            document_text = document_path.read_text(encoding="utf-8-sig")
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "문서를 열 수 없음",
+                f"{filename}을(를) 읽지 못했습니다.\n{error}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(780, 620)
+        layout = QVBoxLayout(dialog)
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(document_text)
+        layout.addWidget(viewer, 1)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.button(QDialogButtonBox.StandardButton.Close).setText("닫기")
+        close_buttons.rejected.connect(dialog.reject)
+        layout.addWidget(close_buttons)
+        dialog.exec()
 
     def _start_connection_test(self) -> None:
         if self._test_thread is not None:
