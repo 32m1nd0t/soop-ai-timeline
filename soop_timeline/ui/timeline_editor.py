@@ -38,6 +38,7 @@ from ..services.timeline_timestamp import (
     adjust_timestamp_on_current_line,
     format_timestamp_seconds,
     merge_current_timeline_line_with_previous,
+    parse_timestamp,
     shift_all_timestamps,
     timestamp_at_position,
 )
@@ -318,7 +319,10 @@ class TimelineDocumentEditor(QWidget):
         )
         self.finalize_retry_button.setVisible(False)
         self.insert_time_button = QPushButton("현재 재생시간 삽입")
-        self.insert_time_button.setToolTip("검수 플레이어 현재 위치를 새 타임라인 줄로 삽입 (Ctrl+Shift+T)")
+        self.insert_time_button.setToolTip(
+            "타임스탬프를 더블클릭해 선택한 상태면 그 자리를 현재 재생시간으로 보정하고, "
+            "선택이 없으면 새 타임라인 줄로 삽입합니다 (Ctrl+Shift+T)"
+        )
         self.insert_time_button.clicked.connect(self.insert_current_timestamp)
         self.insert_time_button.setVisible(not self._is_live)
         self.validate_button = QPushButton("타임라인 검사")
@@ -1111,15 +1115,26 @@ class TimelineDocumentEditor(QWidget):
         if editor is None:
             return
         cursor = editor.textCursor()
+        label = format_timestamp_seconds(seconds)
+        # A double-clicked timestamp stays selected; correcting then replaces that
+        # timestamp in place and keeps it highlighted, instead of adding a new line.
+        selected = cursor.selectedText().strip()
+        if selected and parse_timestamp(selected) is not None:
+            start = cursor.selectionStart()
+            cursor.insertText(label)
+            cursor.setPosition(start)
+            cursor.setPosition(start + len(label), QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.setFocus()
+            self.status_label.setText(f"선택한 타임스탬프를 {label}(으)로 보정했습니다.")
+            return
         if cursor.block().text().strip():
             cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
             cursor.insertText("\n")
-        cursor.insertText(f"{format_timestamp_seconds(seconds)} ")
+        cursor.insertText(f"{label} ")
         editor.setTextCursor(cursor)
         editor.setFocus()
-        self.status_label.setText(
-            f"현재 재생시간 {format_timestamp_seconds(seconds)}을(를) 삽입했습니다."
-        )
+        self.status_label.setText(f"현재 재생시간 {label}을(를) 삽입했습니다.")
 
     def _focused_text_editor(self) -> TimelineTextEdit | None:
         for block in self._blocks:
