@@ -25,6 +25,8 @@ class TimelineLineHit:
     line: str
     seconds: int
     next_seconds: int
+    start: int
+    end: int
 
 
 def timeline_line_at_position(text: str, cursor_position: int) -> TimelineLineHit | None:
@@ -50,7 +52,36 @@ def timeline_line_at_position(text: str, cursor_position: int) -> TimelineLineHi
         if other_seconds is not None and other_seconds > seconds:
             next_seconds = other_seconds
             break
-    return TimelineLineHit(line=line, seconds=seconds, next_seconds=next_seconds)
+    return TimelineLineHit(
+        line=line,
+        seconds=seconds,
+        next_seconds=next_seconds,
+        start=line_start,
+        end=line_end,
+    )
+
+
+def replace_timeline_line_at_position(
+    text: str,
+    line_start: int,
+    original_line: str,
+    replacement_line: str,
+) -> tuple[str, bool]:
+    """Replace exactly the requested line, never another identical occurrence."""
+    start = int(line_start)
+    if start < 0 or start > len(text):
+        return text, False
+    end = text.find("\n", start)
+    if end < 0:
+        end = len(text)
+    raw_line = text[start:end]
+    carriage_return = "\r" if raw_line.endswith("\r") else ""
+    if raw_line.rstrip("\r") != original_line:
+        return text, False
+    return (
+        text[:start] + replacement_line + carriage_return + text[end:],
+        True,
+    )
 
 
 def parse_timestamp(value: str) -> int | None:

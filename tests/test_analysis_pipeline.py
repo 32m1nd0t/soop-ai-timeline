@@ -1,4 +1,6 @@
+import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -6,7 +8,10 @@ from unittest.mock import patch
 from soop_timeline.models import Vod
 from soop_timeline.services.analyzer import (
     AnalyzerConfig,
+    LIVE_TRANSCRIPT_FILENAME,
+    LIVE_TRANSCRIPT_JOURNAL_FILENAME,
     LocalWhisperGeminiAnalyzer,
+    _LiveTranscriptJournal,
     build_whisper_prompt,
     load_cached_transcript,
     load_timeline_generation_state,
@@ -19,12 +24,18 @@ from soop_timeline.services.gemini_timeline import (
     build_chunk_prompt,
     build_final_prompt,
     deduplicate_entries,
+    enforce_broadcast_ending_quotes,
     entries_from_payload,
+    find_phrase_start_time,
     format_entry_text,
+    preserve_broadcast_ending_quotes,
     snap_entries_to_words,
     split_transcript,
+    validate_and_snap_quotes,
 )
 from soop_timeline.services.transcription import (
+    AnalysisCancelled,
+    LiveTranscriptUpdate,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -92,7 +103,7 @@ class AnalysisPipelineTests(unittest.TestCase):
                     "segment_id": "s000001",
                     "decision": "new",
                     "topic_key": "꿈",
-                    "quote": "어제 진짜 이상한 꿈 꿨거든요",
+                    "quote": "꿈 이야기를 합니다",
                     "summary": "",
                 },
                 # Quote plus genuine extra context.
@@ -100,21 +111,76 @@ class AnalysisPipelineTests(unittest.TestCase):
                     "segment_id": "s000002",
                     "decision": "new",
                     "topic_key": "게임",
-                    "quote": "자 이제 시작합니다",
+                    "quote": "게임을 시작합니다",
                     "summary": "신작 점프맵 첫 도전",
                 },
             ]
         }
         entries = entries_from_payload(payload, lookup)
         self.assertEqual(len(entries), 2)
-        self.assertEqual(entries[0].quote, "어제 진짜 이상한 꿈 꿨거든요")
+        self.assertEqual(entries[0].quote, "꿈 이야기를 합니다")
         self.assertEqual(entries[0].summary, "")
         self.assertEqual(
-            format_entry_text(entries[0]), '"어제 진짜 이상한 꿈 꿨거든요"'
+            format_entry_text(entries[0]), '"꿈 이야기를 합니다"'
         )
         self.assertEqual(
-            format_entry_text(entries[1]), '"자 이제 시작합니다" 신작 점프맵 첫 도전'
+            format_entry_text(entries[1]), '"게임을 시작합니다" 신작 점프맵 첫 도전'
         )
+
+    def test_fabricated_quote_is_downgraded_to_transcript_text(self):
+        transcript = sample_transcript()
+        payload = {
+            "entries": [
+                {
+                    "segment_id": "s000001",
+                    "decision": "new",
+                    "topic_key": "꿈",
+                    "quote": "자막에 전혀 없는 창작 문장입니다",
+                    "summary": "",
+                }
+            ]
+        }
+        entries = entries_from_payload(
+            payload,
+            {segment.segment_id: segment for segment in transcript.segments},
+        )
+        self.assertEqual(entries[0].quote, "")
+        self.assertEqual(entries[0].summary, "꿈 이야기를 합니다")
+        self.assertNotIn('"', format_entry_text(entries[0]))
+
+    def test_quote_match_never_accepts_only_a_four_character_prefix(self):
+        words = [TranscriptWord(10.0, 10.5, "오늘방송은 완전히 다른 내용")]
+        self.assertIsNone(
+            find_phrase_start_time("오늘방송에서 신작 게임을 시작합니다", words)
+        )
+
+    def test_quote_match_tolerates_one_whisper_spelling_difference(self):
+        words = [
+            TranscriptWord(10.0, 11.0, "어제 진짜 이상한 꿈을 꿨다니까")
+        ]
+        self.assertEqual(
+            find_phrase_start_time(
+                "어제 진짜 이상한 꿈을 꿧다니까",
+                words,
+                reference_time=10.0,
+            ),
+            10.0,
+        )
+
+    def test_quote_cannot_join_transcript_segments_separated_by_a_long_gap(self):
+        segments = [
+            TranscriptSegment("s1", 10.0, 12.0, "오늘은 사과"),
+            TranscriptSegment("s2", 70.0, 72.0, "게임을 합니다"),
+        ]
+        entry = TimelineEntry(
+            "s1",
+            10.0,
+            "사과 게임 이야기",
+            quote="오늘은 사과 게임을 합니다",
+        )
+        result = validate_and_snap_quotes([entry], segments)[0]
+        self.assertEqual(result.quote, "")
+        self.assertEqual(result.summary, "사과 게임 이야기")
 
     def test_snap_moves_quoted_entry_to_the_spoken_word(self):
         words = (
@@ -152,6 +218,101 @@ class AnalysisPipelineTests(unittest.TestCase):
         # A summary that merely repeats the quote is not shown twice.
         duplicated = TimelineEntry("s2", 20, '"안녕하세요"', quote="안녕하세요")
         self.assertEqual(format_entry_text(duplicated), '"안녕하세요"')
+
+    def test_current_broadcast_ending_is_forced_to_a_transcript_quote(self):
+        segment = TranscriptSegment(
+            "ending",
+            7_200,
+            7_208,
+            "자 오늘 방송은 여기까지 하겠습니다. 다들 고마워요.",
+        )
+        payload = {
+            "entries": [
+                {
+                    "segment_id": "ending",
+                    "decision": "new",
+                    "topic_key": "방송 마무리",
+                    "summary": "방송 종료 및 마지막 인사",
+                    "quote": "",
+                }
+            ]
+        }
+
+        result = entries_from_payload(payload, {segment.segment_id: segment})
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].summary, "")
+        self.assertEqual(
+            result[0].quote,
+            "자 오늘 방송은 여기까지 하겠습니다.",
+        )
+        self.assertEqual(
+            format_entry_text(result[0]),
+            '"자 오늘 방송은 여기까지 하겠습니다."',
+        )
+
+    def test_negated_or_game_end_is_not_forced_to_a_broadcast_quote(self):
+        segments = [
+            TranscriptSegment(
+                "not-ending",
+                100,
+                108,
+                "오늘 방송은 아직 종료할 생각은 없어요.",
+            ),
+            TranscriptSegment(
+                "game-ending",
+                200,
+                208,
+                "이제 게임을 종료할게요.",
+            ),
+        ]
+        entries = [
+            TimelineEntry(
+                "not-ending",
+                100,
+                "방송 종료를 부정함",
+                "방송 종료",
+            ),
+            TimelineEntry(
+                "game-ending",
+                200,
+                "게임 종료",
+                "게임 종료",
+            ),
+        ]
+
+        result = enforce_broadcast_ending_quotes(entries, segments)
+
+        self.assertEqual([entry.quote for entry in result], ["", ""])
+        self.assertEqual(
+            [entry.summary for entry in result],
+            ["방송 종료를 부정함", "게임 종료"],
+        )
+
+    def test_final_cleanup_cannot_drop_a_verified_broadcast_signoff(self):
+        segments = [
+            TranscriptSegment("topic", 100, 110, "게임 이야기를 합니다."),
+            TranscriptSegment(
+                "ending",
+                500,
+                510,
+                "이제 방송 끌게요. 다들 잘 자요.",
+            ),
+        ]
+        final_entries = [TimelineEntry("topic", 100, "게임 이야기", "게임")]
+        chunk_entries = [
+            TimelineEntry("ending", 500, "방송 마무리", "방송 종료")
+        ]
+
+        result = preserve_broadcast_ending_quotes(
+            final_entries,
+            chunk_entries,
+            segments,
+        )
+
+        self.assertEqual([entry.segment_id for entry in result], ["topic", "ending"])
+        self.assertEqual(result[-1].summary, "")
+        self.assertEqual(result[-1].quote, "이제 방송 끌게요.")
 
     def test_transcript_is_split_with_overlap(self):
         windows = split_transcript(
@@ -195,6 +356,8 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertIn("타임라인 소제목", prompt)
             self.assertIn("존댓말 종결어미와 마침표를 사용하지 않습니다", prompt)
             self.assertIn("여름·겨울 여행 환경과 선호 비교", prompt)
+            self.assertIn("현재 방송", prompt)
+            self.assertIn("summary는 비웁니다", prompt)
         self.assertIn("문체 규칙에 맞게 간결하고 자연스럽게", final_prompt)
 
     def test_topic_prompts_keep_previous_context_and_merge_subtopics(self):
@@ -517,6 +680,286 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual(len(recovered.segments), 2)
         self.assertEqual(result.splitlines()[0], "오늘의 콘텐츠: 최종 라이브")
         self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))
+
+    def test_live_gemini_wait_does_not_block_new_whisper_updates(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="라이브 테스트",
+            page_url=live_vod.url,
+            runtime_seconds=3_600,
+            stream_url="https://example.test/live.m3u8",
+        )
+        first = TranscriptSegment("s000000", 3_600, 3_665, "첫 주제")
+        second = TranscriptSegment("s000001", 3_670, 3_730, "둘째 주제")
+        generator_started = threading.Event()
+        second_update_sent = threading.Event()
+
+        class FakeTranscriber:
+            def transcribe_live(self, source, update, **kwargs):
+                del source, kwargs
+                update(
+                    LiveTranscriptUpdate(
+                        "large-v3-turbo",
+                        "ko",
+                        first.end,
+                        (first,),
+                    )
+                )
+                if not generator_started.wait(2.0):
+                    raise RuntimeError("Gemini worker did not start")
+                update(
+                    LiveTranscriptUpdate(
+                        "large-v3-turbo",
+                        "ko",
+                        second.end,
+                        (second,),
+                    )
+                )
+                second_update_sent.set()
+                return Transcript(
+                    "large-v3-turbo",
+                    "ko",
+                    second.end,
+                    [first, second],
+                )
+
+        class FakeGenerator:
+            def summarize_live_window(
+                self,
+                vod,
+                segments,
+                cancelled,
+                previous_entries=None,
+            ):
+                del vod, cancelled, previous_entries
+                generator_started.set()
+                if not second_update_sent.wait(2.0):
+                    raise RuntimeError("Whisper was blocked by Gemini")
+                return GeneratedTimeline(
+                    "라이브",
+                    [TimelineEntry(segments[0].segment_id, segments[0].start, "첫 주제")],
+                )
+
+            def finalize_live_entries(self, vod, titles, entries, segments, cancelled):
+                del vod, titles, segments, cancelled
+                return GeneratedTimeline("최종 라이브", entries)
+
+        analyzer = LocalWhisperGeminiAnalyzer(
+            AnalyzerConfig(gemini_api_key="test", live_ai_mode="frequent"),
+            transcriber_factory=lambda model, device: FakeTranscriber(),
+            generator_factory=lambda key, model: FakeGenerator(),
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            result = analyzer.analyze_live(
+                live_vod,
+                source,
+                progress=lambda *args: None,
+                stop_requested=lambda: False,
+            )
+
+        self.assertTrue(second_update_sent.is_set())
+        self.assertIn("첫 주제", result)
+
+    def test_fast_live_shutdown_saves_transcript_without_new_gemini_calls(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="라이브 테스트",
+            page_url=live_vod.url,
+            runtime_seconds=3_600,
+            stream_url="https://example.test/live.m3u8",
+        )
+        segment = TranscriptSegment("s000000", 3_600, 3_610, "저장할 자막")
+        transcript = Transcript(
+            "large-v3-turbo",
+            "ko",
+            segment.end,
+            [segment],
+        )
+
+        class FakeTranscriber:
+            def transcribe_live(self, source, update, **kwargs):
+                del source, kwargs
+                update(
+                    LiveTranscriptUpdate(
+                        transcript.model,
+                        transcript.language,
+                        transcript.duration_seconds,
+                        (segment,),
+                    )
+                )
+                return transcript
+
+        class NoCallGenerator:
+            def summarize_live_window(self, *args, **kwargs):
+                raise AssertionError("fast shutdown must not summarize")
+
+            def finalize_live_entries(self, *args, **kwargs):
+                raise AssertionError("fast shutdown must not finalize")
+
+        analyzer = LocalWhisperGeminiAnalyzer(
+            AnalyzerConfig(gemini_api_key="test"),
+            transcriber_factory=lambda model, device: FakeTranscriber(),
+            generator_factory=lambda key, model: NoCallGenerator(),
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            with self.assertRaises(AnalysisCancelled):
+                analyzer.analyze_live(
+                    live_vod,
+                    source,
+                    progress=lambda *args: None,
+                    stop_requested=lambda: True,
+                    finalize_requested=lambda: False,
+                )
+            recovered = load_cached_transcript(live_vod)
+            self.assertEqual([item.text for item in recovered.segments], ["저장할 자막"])
+            self.assertFalse(
+                (Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME).exists()
+            )
+
+    def test_live_transcript_journal_appends_only_new_items_and_recovers(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="라이브 테스트",
+            page_url=live_vod.url,
+            runtime_seconds=3_600,
+            stream_url="https://example.test/live.m3u8",
+        )
+        first = Transcript(
+            "large-v3-turbo",
+            "ko",
+            3_615,
+            [TranscriptSegment("s000000", 3_600, 3_610, "첫 구간")],
+            (TranscriptWord(3_600, 3_601, "첫"),),
+        )
+        second = Transcript(
+            "large-v3-turbo",
+            "ko",
+            3_630,
+            [
+                *first.segments,
+                TranscriptSegment("s000001", 3_620, 3_630, "둘째 구간"),
+            ],
+            (*first.words, TranscriptWord(3_620, 3_621, "둘째")),
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            journal = _LiveTranscriptJournal(live_vod, source)
+            journal.append_update(
+                LiveTranscriptUpdate(
+                    first.model,
+                    first.language,
+                    first.duration_seconds,
+                    tuple(first.segments),
+                    first.words,
+                )
+            )
+            journal.append_update(
+                LiveTranscriptUpdate(
+                    second.model,
+                    second.language,
+                    second.duration_seconds,
+                    (second.segments[-1],),
+                    (second.words[-1],),
+                )
+            )
+            lines = (Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(len(lines), 3)
+            second_append = json.loads(lines[2])
+            self.assertEqual(
+                [item["segment_id"] for item in second_append["segments"]],
+                ["s000001"],
+            )
+            self.assertEqual(
+                [item["text"] for item in second_append["words"]],
+                ["둘째"],
+            )
+            recovered = load_cached_transcript(live_vod)
+            self.assertEqual([item.text for item in recovered.segments], ["첫 구간", "둘째 구간"])
+
+            journal.finalize(second)
+            self.assertTrue((Path(directory) / LIVE_TRANSCRIPT_FILENAME).is_file())
+            self.assertFalse(
+                (Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME).exists()
+            )
+            self.assertEqual(len(load_cached_transcript(live_vod).segments), 2)
+
+    def test_eight_hour_live_journal_keeps_each_record_incremental(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="장시간 라이브 테스트",
+            page_url=live_vod.url,
+            runtime_seconds=0,
+            stream_url="https://example.test/live.m3u8",
+        )
+        chunk_count = (8 * 60 * 60) // 15
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            journal = _LiveTranscriptJournal(live_vod, source)
+            for index in range(chunk_count):
+                start = float(index * 15)
+                journal.append_update(
+                    LiveTranscriptUpdate(
+                        "large-v3-turbo",
+                        "ko",
+                        start + 15,
+                        (
+                            TranscriptSegment(
+                                f"s{index:06d}",
+                                start,
+                                start + 5,
+                                f"구간 {index}",
+                            ),
+                        ),
+                    )
+                )
+
+            path = Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), chunk_count + 1)
+            for line_number in (1, chunk_count // 2, chunk_count):
+                record = json.loads(lines[line_number])
+                self.assertEqual(len(record["segments"]), 1)
+            recovered = load_cached_transcript(live_vod)
+            self.assertIsNotNone(recovered)
+            self.assertEqual(len(recovered.segments), chunk_count)
+            self.assertEqual(recovered.segments[-1].segment_id, "s001919")
 
 
 if __name__ == "__main__":

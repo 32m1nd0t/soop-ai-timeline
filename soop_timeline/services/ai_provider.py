@@ -109,6 +109,7 @@ CancelCallback = Callable[[], bool]
 # attempts and honour the server-provided Retry-After delay before giving up.
 MAX_REQUEST_ATTEMPTS = 5
 MAX_RETRY_BACKOFF_SECONDS = 60.0
+GEMINI_REQUEST_TIMEOUT_MS = 120_000
 
 _validated_connections: set[str] = set()
 _validation_lock = threading.Lock()
@@ -252,7 +253,10 @@ class GeminiProvider(StructuredAIProvider):
         from google.genai import types
 
         if self._client is None:
-            self._client = genai.Client(api_key=self.api_key)
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
+            )
         client = self._client
         config = types.GenerateContentConfig(
             system_instruction=UNTRUSTED_MEDIA_SYSTEM_INSTRUCTION,

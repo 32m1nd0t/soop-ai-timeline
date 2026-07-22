@@ -1,10 +1,13 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from soop_timeline.services.ai_provider import (
     AI_PROVIDER_SPECS,
     AIUsage,
     AIRequestFailure,
+    GEMINI_REQUEST_TIMEOUT_MS,
+    GeminiProvider,
     StructuredAIProvider,
     StructuredAIResponse,
     estimate_timeline_calls,
@@ -151,6 +154,33 @@ class AIProviderTests(unittest.TestCase):
         with self.assertRaises(AIRequestFailure):
             permanent.request_json("x", {"type": "object"}, lambda: False)
         self.assertEqual(permanent.calls, 1)
+
+    def test_gemini_client_has_a_bounded_request_timeout(self):
+        captured = {}
+
+        class FakeModels:
+            def generate_content(self, **kwargs):
+                captured["request"] = kwargs
+                return SimpleNamespace(text='{"status":"ok"}', usage_metadata=None)
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                captured["client"] = kwargs
+                self.models = FakeModels()
+
+        provider = GeminiProvider("key", "model")
+        with patch("google.genai.Client", FakeClient):
+            response = provider._perform_request(
+                "test",
+                {"type": "object"},
+                purpose="timeout_test",
+            )
+
+        self.assertEqual(response.payload, {"status": "ok"})
+        self.assertEqual(
+            captured["client"]["http_options"].timeout,
+            GEMINI_REQUEST_TIMEOUT_MS,
+        )
 
 
 if __name__ == "__main__":

@@ -320,6 +320,70 @@ class VodStreamTests(unittest.TestCase):
         )
         updates = []
         transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
+        stop_requested = lambda: False
+        with patch.object(
+            transcriber,
+            "_prepare_backend",
+            return_value=backend,
+        ) as prepare_backend, patch(
+            "soop_timeline.services.live_stream.iter_live_audio_chunks",
+            return_value=iter(chunks),
+        ):
+            result = transcriber.transcribe_live(
+                source,
+                initial_prompt="테스트",
+                progress=lambda *args: None,
+                stop_requested=stop_requested,
+                update=lambda transcript: updates.append(transcript),
+            )
+
+        self.assertIs(prepare_backend.call_args.args[1], stop_requested)
+        self.assertEqual([item.text for item in result.segments], ["첫 발화", "다음 발화"])
+        self.assertEqual([item.start for item in result.segments], [3_601, 3_615])
+        self.assertGreaterEqual(len(updates), 2)
+
+    def test_live_transcription_deduplicates_overlap_and_emits_only_new_text(self):
+        chunks = [
+            AudioChunk(1, 0, bytes(15 * 16_000 * 2)),
+            AudioChunk(1, 13, bytes(15 * 16_000 * 2)),
+        ]
+
+        class DuplicatePipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def transcribe(self, audio, **kwargs):
+                del audio, kwargs
+                self.calls += 1
+                relative_start = 14.2 if self.calls == 1 else 1.2
+                return iter(
+                    [
+                        SimpleNamespace(
+                            start=relative_start,
+                            end=relative_start + 0.6,
+                            text="중복 발화",
+                        )
+                    ]
+                ), SimpleNamespace(language="ko")
+
+        backend = _WhisperBackend(
+            runtime=WhisperRuntime("cuda", "float16", "테스트 GPU"),
+            model=object(),
+            batched_pipeline=DuplicatePipeline(),
+        )
+        source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="라이브",
+            page_url="https://play.sooplive.com/sample/98765",
+            runtime_seconds=0,
+            stream_url="https://example.test/live.m3u8",
+        )
+        updates = []
+        previews = []
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
         with patch.object(transcriber, "_prepare_backend", return_value=backend), patch(
             "soop_timeline.services.live_stream.iter_live_audio_chunks",
             return_value=iter(chunks),
@@ -329,12 +393,17 @@ class VodStreamTests(unittest.TestCase):
                 initial_prompt="테스트",
                 progress=lambda *args: None,
                 stop_requested=lambda: False,
-                update=lambda transcript: updates.append(transcript),
+                preview=lambda stage, text: previews.append((stage, text)),
+                update=updates.append,
             )
 
-        self.assertEqual([item.text for item in result.segments], ["첫 발화", "다음 발화"])
-        self.assertEqual([item.start for item in result.segments], [3_601, 3_615])
-        self.assertGreaterEqual(len(updates), 2)
+        self.assertEqual([item.text for item in result.segments], ["중복 발화"])
+        self.assertEqual(
+            [item.text for update in updates for item in update.segments],
+            ["중복 발화"],
+        )
+        self.assertEqual([stage for stage, _ in previews], ["live_transcript_append"])
+        self.assertEqual("".join(text for _, text in previews), "00:00:14 중복 발화\n")
 
 
 if __name__ == "__main__":

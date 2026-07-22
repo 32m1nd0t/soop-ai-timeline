@@ -18,6 +18,7 @@ TITLE_PATTERN = re.compile(r"^\s*오늘의\s*콘텐츠\s*:\s*(?P<title>.*)$")
 ENTRY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{1,3}:[0-5]\d:[0-5]\d)\s+(?P<summary>\S.*)$"
 )
+DIRECT_QUOTE_PATTERN = re.compile(r'"[^"\n]+"')
 
 
 DRY_TIMELINE_STYLE_GUIDE = """
@@ -114,8 +115,12 @@ class ParsedTimelineDocument:
 
         result = list(self.lines)
         for entry in self.entries:
+            replacement = preserve_direct_quotes(
+                entry.summary,
+                replacements[entry.line_id],
+            )
             result[entry.line_index] = (
-                f"{entry.timestamp} {replacements[entry.line_id]}"
+                f"{entry.timestamp} {replacement}"
             )
 
         title = normalize_title(str(payload.get("content_title", "")))
@@ -173,6 +178,20 @@ def normalize_title(value: str) -> str:
     title = " ".join(value.split()).strip()
     title = re.sub(r"^오늘의\s*콘텐츠\s*:\s*", "", title)
     return title.rstrip(" .")
+
+
+def preserve_direct_quotes(original: str, replacement: str) -> str:
+    """Prevent a style-only AI response from adding or editing direct quotes."""
+    original_quotes = DIRECT_QUOTE_PATTERN.findall(original)
+    replacement_quotes = DIRECT_QUOTE_PATTERN.findall(replacement)
+    if original.count('"') != replacement.count('"'):
+        return original
+    if not original_quotes:
+        return original if replacement_quotes else replacement
+    if len(original_quotes) != len(replacement_quotes):
+        return original
+    quote_iterator = iter(original_quotes)
+    return DIRECT_QUOTE_PATTERN.sub(lambda _: next(quote_iterator), replacement)
 
 
 def build_style_prompt(parsed: ParsedTimelineDocument) -> str:

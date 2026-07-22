@@ -15,7 +15,13 @@ from .gemini_style import (
 )
 from .gemini_timeline import find_phrase_start_time
 from .timeline_timestamp import LINE_TIMESTAMP_PATTERN, parse_timestamp
-from .transcription import AnalysisCancelled, Transcript, format_timestamp
+from .transcription import (
+    AnalysisCancelled,
+    Transcript,
+    TranscriptSegment,
+    TranscriptWord,
+    format_timestamp,
+)
 
 QUOTE_MODE = "quote"
 SUMMARY_MODE = "summary"
@@ -35,22 +41,35 @@ LINE_REWRITE_SCHEMA = {
 }
 
 
-def _normalize_chars(value: str) -> str:
-    return "".join(ch.lower() for ch in value if ch.isalnum())
-
-
 def build_transcript_excerpt(
     transcript: Transcript,
     seconds: int,
     next_seconds: int,
 ) -> tuple[str, float]:
     """Return the transcript excerpt for one topic plus its upper time bound."""
+    segments, upper = _transcript_excerpt_segments(
+        transcript,
+        seconds,
+        next_seconds,
+    )
+    lines = [
+        f"[{format_timestamp(segment.start)}] {segment.text.strip()}"
+        for segment in segments
+    ]
+    return "\n".join(lines), upper
+
+
+def _transcript_excerpt_segments(
+    transcript: Transcript,
+    seconds: int,
+    next_seconds: int,
+) -> tuple[list[TranscriptSegment], float]:
     lower = max(0.0, float(seconds) - 20.0)
     if next_seconds > seconds:
         upper = float(next_seconds)
     else:
         upper = float(seconds) + DEFAULT_TOPIC_SPAN_SECONDS
-    lines: list[str] = []
+    selected: list[TranscriptSegment] = []
     total = 0
     for segment in transcript.segments:
         if segment.start < lower:
@@ -61,8 +80,8 @@ def build_transcript_excerpt(
         total += len(line) + 1
         if total > EXCERPT_CHAR_LIMIT:
             break
-        lines.append(line)
-    return "\n".join(lines), upper
+        selected.append(segment)
+    return selected, upper
 
 
 def build_quote_prompt(timestamp: str, content: str, excerpt: str) -> str:
@@ -153,7 +172,15 @@ class AITimelineLineRewriter:
         if not content:
             raise RuntimeError("변환할 내용이 없는 줄입니다.")
 
-        excerpt, upper = build_transcript_excerpt(transcript, seconds, next_seconds)
+        excerpt_segments, upper = _transcript_excerpt_segments(
+            transcript,
+            seconds,
+            next_seconds,
+        )
+        excerpt = "\n".join(
+            f"[{format_timestamp(segment.start)}] {segment.text.strip()}"
+            for segment in excerpt_segments
+        )
         if not excerpt:
             raise RuntimeError("이 구간의 저장 자막을 찾지 못했습니다.")
         if is_cancelled():
@@ -170,7 +197,15 @@ class AITimelineLineRewriter:
             quote = quote.strip('"“”').strip()
             if not quote:
                 raise RuntimeError("AI가 인용문을 반환하지 않았습니다.")
-            if _normalize_chars(quote) not in _normalize_chars(excerpt):
+            segment_match = find_phrase_start_time(
+                quote,
+                [
+                    TranscriptWord(segment.start, segment.end, segment.text)
+                    for segment in excerpt_segments
+                ],
+                reference_time=seconds,
+            )
+            if segment_match is None:
                 raise RuntimeError(
                     "AI가 자막에 없는 문장을 반환해 적용하지 않았습니다. 다시 시도해 보세요."
                 )
@@ -181,7 +216,12 @@ class AITimelineLineRewriter:
                     for word in transcript.words
                     if seconds - 45.0 <= word.start <= upper + 45.0
                 ]
-                matched = find_phrase_start_time(quote, window)
+                matched = find_phrase_start_time(
+                    quote,
+                    window,
+                    reference_time=seconds,
+                    allow_verified_prefix=True,
+                )
                 if matched is not None:
                     label = format_timestamp(matched)
             return f'{label} "{quote}"'

@@ -93,6 +93,31 @@ class DatabaseTests(unittest.TestCase):
         self.database.remove_analysis_queue("9901")
         self.assertEqual(self.database.list_analysis_queue(), [])
 
+    def test_reset_vod_work_keeps_video_but_clears_generated_records(self):
+        streamer = self.database.add_streamer("reset-user", "초기화")
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "reset-1",
+                    "title": "유지할 영상",
+                    "url": "https://vod.sooplive.com/player/reset-1",
+                }
+            ],
+        )
+        self.database.save_timeline("reset-1", "오늘의 콘텐츠: 기존")
+        self.database.create_timeline_revision("reset-1", "이전 버전", "테스트")
+        self.database.enqueue_analysis("reset-1")
+
+        self.database.reset_vod_work("reset-1")
+
+        self.assertIsNotNone(self.database.get_vod("reset-1"))
+        self.assertEqual(self.database.get_vod("reset-1").state, VodState.NEW.value)
+        self.assertIsNone(self.database.get_timeline("reset-1"))
+        self.assertEqual(self.database.list_timeline_revisions("reset-1"), [])
+        self.assertEqual(self.database.list_analysis_queue(), [])
+        self.assertIn("reset-1", [vod.vod_id for vod in self.database.list_vods()])
+
     def test_streamer_glossary_is_available_on_vod(self):
         streamer = self.database.add_streamer("glossary-user", "단어사전")
         self.database.update_streamer_glossary(

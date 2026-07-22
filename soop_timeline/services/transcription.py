@@ -8,6 +8,7 @@ import ctypes
 import importlib.util
 import time
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
@@ -22,7 +23,7 @@ ProgressCallback = Callable[[int, str], None]
 CancelCallback = Callable[[], bool]
 PreviewCallback = Callable[[str, str], None]
 CheckpointCallback = Callable[["Transcript"], None]
-LiveUpdateCallback = Callable[["Transcript"], None]
+LiveUpdateCallback = Callable[["LiveTranscriptUpdate"], None]
 
 
 _NVIDIA_DLL_DIRECTORY_HANDLES: list[object] = []
@@ -200,6 +201,22 @@ class Transcript:
             segments=segments,
             words=words,
         )
+
+
+@dataclass(slots=True, frozen=True)
+class LiveTranscriptUpdate:
+    """Only the text newly accepted from one live audio chunk.
+
+    Keeping live updates incremental avoids copying the complete multi-hour
+    transcript after every 15-second chunk. The final ``Transcript`` is still
+    returned once when reception ends.
+    """
+
+    model: str
+    language: str
+    duration_seconds: float
+    segments: tuple[TranscriptSegment, ...] = ()
+    words: tuple[TranscriptWord, ...] = ()
 
 
 def _extract_words(raw_segment: object) -> list[TranscriptWord]:
@@ -626,7 +643,10 @@ class FasterWhisperTranscriber:
         )
         from .vod_stream import AudioChunk
 
-        backend = self._prepare_backend(progress, lambda: False)
+        # Loading a large Whisper model can itself take noticeable time.  Pass
+        # the real stop callback so closing the app during startup does not
+        # have to wait for the whole model preparation path to finish.
+        backend = self._prepare_backend(progress, stop_requested)
         batch_size = 8 if backend.runtime.device == "cuda" else 2
         progress(
             0,
@@ -674,7 +694,7 @@ class FasterWhisperTranscriber:
                         return _STREAM_END
 
         language = "ko"
-        accepted: list[tuple[float, float, str]] = []
+        accepted: list[TranscriptSegment] = []
         accepted_words: list[TranscriptWord] = []
         lower_boundary = source.runtime_seconds
         latest_end = source.runtime_seconds
@@ -697,6 +717,8 @@ class FasterWhisperTranscriber:
                     lambda: False,
                 )
                 language = detected_language or language
+                new_segments: list[TranscriptSegment] = []
+                new_words: list[TranscriptWord] = []
                 for start, end, text, rel_words in relative_segments:
                     absolute_start = max(
                         item.start_seconds,
@@ -709,7 +731,23 @@ class FasterWhisperTranscriber:
                     midpoint = (absolute_start + absolute_end) / 2.0
                     if midpoint + 1e-6 < lower_boundary:
                         continue
-                    accepted.append((absolute_start, absolute_end, text))
+                    clean_text = text.strip()
+                    if not clean_text:
+                        continue
+                    candidate = TranscriptSegment(
+                        segment_id=f"s{len(accepted):06d}",
+                        start=absolute_start,
+                        end=absolute_end,
+                        text=clean_text,
+                    )
+                    if _is_duplicate_live_segment(
+                        candidate,
+                        accepted,
+                        DEFAULT_LIVE_OVERLAP_SECONDS,
+                    ):
+                        continue
+                    accepted.append(candidate)
+                    new_segments.append(candidate)
                     for word in rel_words:
                         word_start = max(
                             item.start_seconds,
@@ -719,38 +757,29 @@ class FasterWhisperTranscriber:
                             word_start,
                             min(item.end_seconds, item.start_seconds + word.end),
                         )
-                        accepted_words.append(
-                            TranscriptWord(word_start, word_end, word.text)
-                        )
+                        accepted_word = TranscriptWord(word_start, word_end, word.text)
+                        accepted_words.append(accepted_word)
+                        new_words.append(accepted_word)
 
                 latest_end = max(latest_end, item.end_seconds)
                 lower_boundary = max(
                     lower_boundary,
                     item.end_seconds - DEFAULT_LIVE_OVERLAP_SECONDS / 2.0,
                 )
-                snapshot = Transcript(
+                incremental = LiveTranscriptUpdate(
                     model=self.model_name,
                     language=language,
                     duration_seconds=latest_end,
-                    segments=[
-                        TranscriptSegment(
-                            segment_id=f"s{index:06d}",
-                            start=start,
-                            end=end,
-                            text=text,
-                        )
-                        for index, (start, end, text) in enumerate(accepted)
-                        if text.strip()
-                    ],
-                    words=tuple(accepted_words),
+                    segments=tuple(new_segments),
+                    words=tuple(new_words),
                 )
-                if preview is not None and snapshot.segments:
+                if preview is not None and new_segments:
                     preview(
-                        "live_transcript",
-                        transcript_preview_document(snapshot.segments),
+                        "live_transcript_append",
+                        transcript_preview_document(new_segments),
                     )
                 if update is not None:
-                    update(snapshot)
+                    update(incremental)
 
                 captured = max(0.0, latest_end - source.runtime_seconds)
                 wall_elapsed = max(0.001, time.monotonic() - started_at)
@@ -760,22 +789,13 @@ class FasterWhisperTranscriber:
                     0,
                     "라이브 실시간 음성 인식 중… "
                     f"방송 {format_timestamp(latest_end)} · "
-                    f"자막 {len(snapshot.segments):,}개{lag_text}",
+                    f"자막 {len(accepted):,}개{lag_text}",
                 )
         finally:
             stop_event.set()
             producer.join(timeout=9.0)
 
-        segments = [
-            TranscriptSegment(
-                segment_id=f"s{index:06d}",
-                start=start,
-                end=end,
-                text=text,
-            )
-            for index, (start, end, text) in enumerate(accepted)
-            if text.strip()
-        ]
+        segments = list(accepted)
         transcript = Transcript(
             model=self.model_name,
             language=language,
@@ -783,10 +803,6 @@ class FasterWhisperTranscriber:
             segments=segments,
             words=tuple(accepted_words),
         )
-        if preview is not None and segments:
-            preview("live_transcript", transcript_preview_document(segments))
-        if update is not None:
-            update(transcript)
         progress(
             0,
             f"라이브 수신 종료 · 자막 {len(segments):,}개 · 최종 타임라인 정리 중…",
@@ -923,6 +939,42 @@ def load_vod_transcript_cache(
         return transcript
     except (OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def _normalized_spoken_text(value: str) -> str:
+    return "".join(character.lower() for character in value if character.isalnum())
+
+
+def _is_duplicate_live_segment(
+    candidate: TranscriptSegment,
+    accepted: list[TranscriptSegment],
+    overlap_seconds: float,
+) -> bool:
+    """Reject the same utterance recognized again in a live overlap window."""
+    normalized = _normalized_spoken_text(candidate.text)
+    if not normalized:
+        return False
+    time_tolerance = max(1.0, float(overlap_seconds)) + 1.5
+    for previous in reversed(accepted[-12:]):
+        if candidate.start - previous.end > time_tolerance:
+            break
+        if abs(candidate.start - previous.start) > time_tolerance:
+            continue
+        prior = _normalized_spoken_text(previous.text)
+        if not prior:
+            continue
+        if normalized == prior:
+            return True
+        if min(len(normalized), len(prior)) >= 6:
+            similarity = SequenceMatcher(
+                None,
+                normalized,
+                prior,
+                autojunk=False,
+            ).ratio()
+            if similarity >= 0.88:
+                return True
+    return False
 
 
 def format_timestamp(seconds: float) -> str:

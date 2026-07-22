@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
@@ -32,6 +33,12 @@ class LiveAnalysisWorker(QObject):
         self.analyzer = analyzer
         self.vod = vod
         self.source = source
+        self._skip_finalization = threading.Event()
+
+    def request_stop(self, *, finalize: bool) -> None:
+        """Choose whether interruption should run new Gemini final requests."""
+        if not finalize:
+            self._skip_finalization.set()
 
     @Slot()
     def run(self) -> None:
@@ -54,6 +61,7 @@ class LiveAnalysisWorker(QObject):
                 progress=progress,
                 stop_requested=thread.isInterruptionRequested,
                 preview=preview,
+                finalize_requested=lambda: not self._skip_finalization.is_set(),
             )
         except AnalysisCancelled:
             self.cancelled.emit(self.vod.vod_id)

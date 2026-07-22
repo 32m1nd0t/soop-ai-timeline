@@ -6,7 +6,10 @@ from soop_timeline.services.gemini_line_rewrite import (
     AITimelineLineRewriter,
     build_transcript_excerpt,
 )
-from soop_timeline.services.timeline_timestamp import timeline_line_at_position
+from soop_timeline.services.timeline_timestamp import (
+    replace_timeline_line_at_position,
+    timeline_line_at_position,
+)
 from soop_timeline.services.transcription import (
     Transcript,
     TranscriptSegment,
@@ -62,6 +65,7 @@ class TimelineLineAtPositionTests(unittest.TestCase):
         self.assertEqual(hit.line, "0:20:00 어제 꿈 이야기")
         self.assertEqual(hit.seconds, 1_200)
         self.assertEqual(hit.next_seconds, 1_500)
+        self.assertEqual(document[hit.start : hit.end], hit.line)
 
     def test_last_entry_has_no_next(self):
         document = "0:20:00 마지막 주제\n"
@@ -72,6 +76,21 @@ class TimelineLineAtPositionTests(unittest.TestCase):
     def test_non_timeline_line_returns_none(self):
         document = "오늘의 콘텐츠: 테스트\n0:20:00 주제\n"
         self.assertIsNone(timeline_line_at_position(document, 3))
+
+    def test_replaces_selected_duplicate_line_only(self):
+        duplicate = "0:20:00 같은 내용"
+        document = f"{duplicate}\n0:21:00 중간\n{duplicate}\n"
+        hit = timeline_line_at_position(document, document.rfind("같은 내용"))
+        self.assertIsNotNone(hit)
+        updated, changed = replace_timeline_line_at_position(
+            document,
+            hit.start,
+            hit.line,
+            "0:20:05 선택한 두 번째 줄",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(updated.count(duplicate), 1)
+        self.assertTrue(updated.endswith("0:20:05 선택한 두 번째 줄\n"))
 
 
 class LineRewriteTests(unittest.TestCase):
@@ -100,6 +119,27 @@ class LineRewriteTests(unittest.TestCase):
                 "0:20:00 어제 꾼 이상한 꿈 이야기",
                 1_500,
                 make_transcript(),
+            )
+
+    def test_quote_mode_rejects_sentence_stitched_across_a_long_pause(self):
+        transcript = Transcript(
+            model="test",
+            language="ko",
+            duration_seconds=100.0,
+            segments=[
+                TranscriptSegment("s0", 10.0, 12.0, "오늘은 사과"),
+                TranscriptSegment("s1", 70.0, 72.0, "게임을 합니다"),
+            ],
+        )
+        rewriter = AITimelineLineRewriter(
+            FakeProvider("오늘은 사과 게임을 합니다")
+        )
+        with self.assertRaises(RuntimeError):
+            rewriter.rewrite(
+                "quote",
+                "0:00:10 사과 게임 이야기",
+                90,
+                transcript,
             )
 
     def test_summary_mode_keeps_timestamp_and_normalizes(self):

@@ -9,6 +9,7 @@ from soop_timeline.services.timeline_timestamp import (
     timestamp_at_position,
 )
 from soop_timeline.ui.review_player import (
+    build_close_script,
     build_player_action_script,
     build_player_url,
     build_seek_script,
@@ -75,6 +76,15 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("video.muted = false", script)
         self.assertIn("VOD 보기", script)
 
+    def test_seek_script_uses_soop_global_progress_for_multipart_vod(self):
+        script = build_seek_script(18_116, 24_357)
+        self.assertIn("const expectedTotal = 24357", script)
+        self.assertIn("__dispatchSoopSeek(target, globalTotal)", script)
+        self.assertIn("#player .progress", script)
+        self.assertIn("strategy: 'soop-progress'", script)
+        self.assertIn("correctedLocal = localCurrent + correction", script)
+        self.assertIn("globalTotal > availableEnd + 15", script)
+
     def test_review_player_uses_official_embed_page(self):
         url = build_player_url("200312857").toString()
         self.assertTrue(url.startswith("https://vod.sooplive.com/player/200312857/embed?"))
@@ -83,8 +93,26 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("showChat=false", url)
 
     def test_player_action_scripts_support_position_and_relative_seek(self):
-        self.assertIn("currentTime", build_player_action_script("position"))
-        self.assertIn("+ -10", build_player_action_script("relative", -10))
+        position_script = build_player_action_script(
+            "position",
+            expected_duration=24_357,
+        )
+        relative_script = build_player_action_script(
+            "relative",
+            -10,
+            expected_duration=24_357,
+        )
+        self.assertIn("reportedCurrent", position_script)
+        self.assertIn("const expectedTotal = 24357", position_script)
+        self.assertIn("+ -10", relative_script)
+        self.assertIn("localTarget = localCurrent + -10", relative_script)
+        self.assertIn("__dispatchSoopSeek(target, globalTotal)", relative_script)
+
+    def test_close_script_stops_and_mutes_every_video(self):
+        script = build_close_script()
+        self.assertIn("querySelectorAll('video')", script)
+        self.assertIn("video.pause()", script)
+        self.assertIn("video.muted = true", script)
 
 
 if __name__ == "__main__":

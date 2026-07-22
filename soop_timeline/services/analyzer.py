@@ -5,7 +5,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Callable
+import queue
+import threading
+from typing import Callable, Iterable
 
 from ..models import Vod
 from ..paths import analysis_data_dir
@@ -22,9 +24,13 @@ from .gemini_timeline import (
 )
 from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
 from .transcription import (
+    AnalysisCancelled,
     CancelCallback,
     FasterWhisperTranscriber,
+    LiveTranscriptUpdate,
     Transcript,
+    TranscriptSegment,
+    TranscriptWord,
     format_timestamp,
     PreviewCallback,
     ProgressCallback,
@@ -42,6 +48,7 @@ LIVE_SUMMARY_OVERLAP_SECONDS = 30
 LIVE_TOPIC_CONFIRMATION_SECONDS = 30
 TIMELINE_CHECKPOINT_FILENAME = "timeline.partial.json"
 LIVE_TRANSCRIPT_FILENAME = "live-transcript.json"
+LIVE_TRANSCRIPT_JOURNAL_FILENAME = "live-transcript.jsonl"
 
 
 @dataclass(slots=True, frozen=True)
@@ -476,6 +483,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         progress: ProgressCallback,
         stop_requested: CancelCallback,
         preview: PreviewCallback | None = None,
+        finalize_requested: CancelCallback | None = None,
     ) -> str:
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
@@ -491,6 +499,11 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         self._preflight(generator, progress, stop_requested)
         prompt = build_whisper_prompt(vod, live=True)
         live_mode = live_ai_mode(self.config.live_ai_mode)
+        should_finalize = finalize_requested or (lambda: True)
+
+        def fast_stop_requested() -> bool:
+            return stop_requested() and not should_finalize()
+
         progress(
             0,
             f"라이브 Gemini 모드: {live_mode.label} · "
@@ -500,7 +513,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         titles: list[str] = []
         last_summary_end = source.runtime_seconds
         next_summary_at = source.runtime_seconds + live_mode.first_summary_seconds
-        last_snapshot: Transcript | None = None
+        transcript_journal = _LiveTranscriptJournal(vod, source)
 
         def emit_timeline() -> None:
             if preview is None or not candidates:
@@ -515,7 +528,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
         def summarize_snapshot(snapshot: Transcript, *, force: bool = False) -> None:
             nonlocal candidates, last_summary_end, next_summary_at
-            if not snapshot.segments:
+            if fast_stop_requested() or not snapshot.segments:
                 return
             latest_end = snapshot.segments[-1].end
             if not force and latest_end < next_summary_at:
@@ -549,9 +562,13 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 partial = generator.summarize_live_window(
                     vod,
                     window,
-                    lambda: False,
+                    fast_stop_requested,
                     previous_entries=deduplicate_entries(candidates)[-8:],
                 )
+            except AnalysisCancelled:
+                if fast_stop_requested():
+                    return
+                raise
             except Exception as error:
                 next_summary_at = latest_end + min(
                     live_mode.first_summary_seconds,
@@ -569,23 +586,116 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             next_summary_at = latest_end + live_mode.interval_seconds
             emit_timeline()
 
-        def on_update(snapshot: Transcript) -> None:
-            nonlocal last_snapshot
-            last_snapshot = snapshot
-            _save_live_transcript_snapshot(vod, source, snapshot)
-            summarize_snapshot(snapshot)
+        # Whisper stays in its own consumer thread. Gemini can therefore wait,
+        # retry, or time out without stopping the live HLS decoder and losing
+        # audio after the small three-chunk capture buffer fills.
+        updates: queue.Queue[object] = queue.Queue()
+        transcription_done = object()
+        transcription_result: list[Transcript] = []
+        transcription_failure: list[BaseException] = []
+        internal_stop = threading.Event()
 
-        transcript = transcriber.transcribe_live(
-            source,
-            initial_prompt=prompt,
-            progress=progress,
-            stop_requested=stop_requested,
-            preview=preview,
-            update=on_update,
+        def effective_stop_requested() -> bool:
+            return internal_stop.is_set() or stop_requested()
+
+        def on_update(update: LiveTranscriptUpdate | Transcript) -> None:
+            if isinstance(update, LiveTranscriptUpdate):
+                transcript_journal.append_update(update)
+            else:
+                transcript_journal.append(update)
+            updates.put(update)
+
+        def run_transcription() -> None:
+            try:
+                result = transcriber.transcribe_live(
+                    source,
+                    initial_prompt=prompt,
+                    progress=progress,
+                    stop_requested=effective_stop_requested,
+                    preview=preview,
+                    update=on_update,
+                )
+                transcription_result.append(result)
+            except BaseException as error:
+                transcription_failure.append(error)
+            finally:
+                updates.put(transcription_done)
+
+        transcription_thread = threading.Thread(
+            target=run_transcription,
+            name=f"soop-live-whisper-{source.broadcast_no}",
+            daemon=True,
         )
-        last_snapshot = transcript
+        transcription_thread.start()
+
+        live_segments: list[TranscriptSegment] = []
+        live_language = "ko"
+        live_duration = source.runtime_seconds
+        reached_end = False
+
+        def apply_update(update: object) -> None:
+            nonlocal live_language, live_duration
+            if isinstance(update, LiveTranscriptUpdate):
+                live_segments.extend(update.segments)
+                live_language = update.language or live_language
+                live_duration = max(live_duration, update.duration_seconds)
+            elif isinstance(update, Transcript):
+                # Compatibility for third-party/fake transcribers that still
+                # provide cumulative snapshots.
+                live_segments[:] = update.segments
+                live_language = update.language or live_language
+                live_duration = max(live_duration, update.duration_seconds)
+
+        try:
+            while not reached_end:
+                message = updates.get()
+                if message is transcription_done:
+                    reached_end = True
+                else:
+                    apply_update(message)
+
+                # Coalesce updates accumulated while a Gemini request was in
+                # flight, so only the newest due snapshot is summarized.
+                while not reached_end:
+                    try:
+                        message = updates.get_nowait()
+                    except queue.Empty:
+                        break
+                    if message is transcription_done:
+                        reached_end = True
+                    else:
+                        apply_update(message)
+
+                if (
+                    not reached_end
+                    and not fast_stop_requested()
+                    and live_segments
+                    and live_segments[-1].end >= next_summary_at
+                ):
+                    summarize_snapshot(
+                        Transcript(
+                            model=self.config.whisper_model,
+                            language=live_language,
+                            duration_seconds=live_duration,
+                            segments=list(live_segments),
+                        )
+                    )
+        finally:
+            internal_stop.set()
+            transcription_thread.join(timeout=12.0)
+
+        if transcription_failure:
+            raise transcription_failure[0]
+        if not transcription_result:
+            raise RuntimeError("라이브 음성 인식 작업이 결과 없이 종료되었습니다.")
+        transcript = transcription_result[0]
         if not transcript.segments:
             raise RuntimeError("라이브 방송에서 인식 가능한 음성을 찾지 못했습니다.")
+        transcript_journal.finalize(transcript)
+        if not should_finalize():
+            raise AnalysisCancelled(
+                "프로그램 종료를 위해 새 Gemini 최종 요청 없이 라이브 자막만 저장했습니다."
+            )
 
         latest_end = transcript.segments[-1].end
         if not candidates or latest_end > last_summary_end + 10:
@@ -600,7 +710,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 vod,
                 transcript,
                 progress,
-                lambda: False,
+                fast_stop_requested,
                 None,
                 granularity=self.config.topic_granularity,
             )
@@ -614,8 +724,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             vod,
             titles,
             candidates,
-            last_snapshot.segments,
-            lambda: False,
+            transcript.segments,
+            fast_stop_requested,
         )
         if preview is not None:
             preview("live_timeline", final.to_document())
@@ -650,6 +760,147 @@ def _save_live_transcript_snapshot(
         encoding="utf-8",
     )
     temporary.replace(destination)
+
+
+def _live_source_payload(vod: Vod, source: object) -> dict[str, object]:
+    return {
+        "kind": "soop_live",
+        "url": vod.url,
+        "runtime_start_seconds": float(
+            getattr(source, "runtime_seconds", 0.0) or 0.0
+        ),
+    }
+
+
+class _LiveTranscriptJournal:
+    """Append only newly recognized live text, then compact once at completion."""
+
+    def __init__(self, vod: Vod, source: object):
+        self.vod = vod
+        self.source = source
+        root = analysis_data_dir(vod.vod_id)
+        self.path = root / LIVE_TRANSCRIPT_JOURNAL_FILENAME
+        self.source_payload = _live_source_payload(vod, source)
+        self.segment_count = 0
+        self.word_count = 0
+        self.duration_seconds = 0.0
+        recovered = _load_live_transcript_journal(self.path, vod, None)
+        if recovered is not None:
+            self.segment_count = len(recovered.segments)
+            self.word_count = len(recovered.words)
+            self.duration_seconds = recovered.duration_seconds
+        else:
+            self._reset()
+
+    def _reset(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        header = {
+            "type": "header",
+            "version": 1,
+            "source": self.source_payload,
+        }
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(header, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+        self.segment_count = 0
+        self.word_count = 0
+        self.duration_seconds = 0.0
+
+    def append(self, transcript: Transcript) -> None:
+        if (
+            len(transcript.segments) < self.segment_count
+            or len(transcript.words) < self.word_count
+        ):
+            self._reset()
+        new_segments = transcript.segments[self.segment_count :]
+        new_words = transcript.words[self.word_count :]
+        duration = float(transcript.duration_seconds)
+        if (
+            not new_segments
+            and not new_words
+            and duration <= self.duration_seconds
+        ):
+            return
+        self._append_record(
+            transcript.model,
+            transcript.language,
+            duration,
+            new_segments,
+            new_words,
+        )
+        self.segment_count = len(transcript.segments)
+        self.word_count = len(transcript.words)
+        self.duration_seconds = max(self.duration_seconds, duration)
+
+    def append_update(self, update: LiveTranscriptUpdate) -> None:
+        """Persist one live delta without reconstructing the full transcript."""
+        if (
+            self.segment_count
+            and update.segments
+            and update.segments[0].segment_id == "s000000"
+        ):
+            # A new capture was started against a stale journal path.
+            self._reset()
+        duration = float(update.duration_seconds)
+        if (
+            not update.segments
+            and not update.words
+            and duration <= self.duration_seconds
+        ):
+            return
+        self._append_record(
+            update.model,
+            update.language,
+            duration,
+            update.segments,
+            update.words,
+        )
+        self.segment_count += len(update.segments)
+        self.word_count += len(update.words)
+        self.duration_seconds = max(self.duration_seconds, duration)
+
+    def _append_record(
+        self,
+        model: str,
+        language: str,
+        duration: float,
+        segments: Iterable[TranscriptSegment],
+        words: Iterable[TranscriptWord],
+    ) -> None:
+        record = {
+            "type": "append",
+            "model": model,
+            "language": language,
+            "duration_seconds": duration,
+            "segments": [
+                {
+                    "segment_id": segment.segment_id,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text,
+                }
+                for segment in segments
+            ],
+            "words": [
+                {"start": word.start, "end": word.end, "text": word.text}
+                for word in words
+            ],
+        }
+        with self.path.open("a", encoding="utf-8", newline="\n") as journal:
+            journal.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+            journal.flush()
+
+    def finalize(self, transcript: Transcript) -> None:
+        _save_live_transcript_snapshot(self.vod, self.source, transcript)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def build_whisper_prompt(vod: Vod, *, live: bool) -> str:
@@ -734,26 +985,114 @@ def has_pending_timeline_finalization(vod_id: str) -> bool:
         return False
 
 
+def remove_timeline_generation_checkpoint(vod_id: str) -> bool:
+    """Remove AI topic-generation state without deleting the Whisper transcript."""
+    path = analysis_data_dir(vod_id) / TIMELINE_CHECKPOINT_FILENAME
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def load_live_transcript_cache(
     path: str | Path,
     vod: Vod,
     expected_model: str | None,
 ) -> Transcript | None:
     cache_path = Path(path)
-    if not cache_path.is_file():
+    if cache_path.is_file():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            source = payload.get("source", {})
+            if (
+                isinstance(source, dict)
+                and source.get("kind") == "soop_live"
+                and str(source.get("url", "")) == vod.url
+            ):
+                transcript = Transcript.from_dict(payload["transcript"])
+                if (
+                    (not expected_model or transcript.model == expected_model)
+                    and transcript.segments
+                ):
+                    return transcript
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+    journal_path = cache_path.with_name(LIVE_TRANSCRIPT_JOURNAL_FILENAME)
+    return _load_live_transcript_journal(journal_path, vod, expected_model)
+
+
+def _load_live_transcript_journal(
+    path: str | Path,
+    vod: Vod,
+    expected_model: str | None,
+) -> Transcript | None:
+    journal_path = Path(path)
+    if not journal_path.is_file():
         return None
     try:
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        source = payload.get("source", {})
-        if not isinstance(source, dict) or source.get("kind") != "soop_live":
-            return None
-        if str(source.get("url", "")) != vod.url:
-            return None
-        transcript = Transcript.from_dict(payload["transcript"])
-        if (expected_model and transcript.model != expected_model) or not transcript.segments:
-            return None
-        return transcript
-    except (OSError, ValueError, TypeError, KeyError):
+        lines = journal_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines()
+    except (OSError, UnicodeError):
+        return None
+    if not lines:
+        return None
+    try:
+        header = json.loads(lines[0])
+    except (ValueError, TypeError):
+        return None
+    source = header.get("source", {}) if isinstance(header, dict) else {}
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != "soop_live"
+        or str(source.get("url", "")) != vod.url
+    ):
+        return None
+
+    model = ""
+    language = "ko"
+    duration = 0.0
+    segments: list[dict[str, object]] = []
+    words: list[dict[str, object]] = []
+    for line in lines[1:]:
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            # A process can stop in the middle of its final append. Earlier
+            # complete records remain valid and are still useful for recovery.
+            continue
+        if not isinstance(record, dict) or record.get("type") != "append":
+            continue
+        model = str(record.get("model", model))
+        language = str(record.get("language", language) or language)
+        try:
+            record_duration = float(record.get("duration_seconds", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            record_duration = 0.0
+        duration = max(duration, record_duration)
+        raw_segments = record.get("segments", [])
+        raw_words = record.get("words", [])
+        if isinstance(raw_segments, list):
+            segments.extend(item for item in raw_segments if isinstance(item, dict))
+        if isinstance(raw_words, list):
+            words.extend(item for item in raw_words if isinstance(item, dict))
+    if not segments or (expected_model and model != expected_model):
+        return None
+    try:
+        return Transcript.from_dict(
+            {
+                "model": model,
+                "language": language,
+                "duration_seconds": duration,
+                "segments": segments,
+                "words": words,
+            }
+        )
+    except (ValueError, TypeError, KeyError):
         return None
 
 

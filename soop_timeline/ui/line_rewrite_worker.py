@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 
 class TimelineLineRewriteWorker(QObject):
     usage_changed = Signal(str, str)
-    succeeded = Signal(str, str, str)  # vod_id, original_line, new_line
+    succeeded = Signal(str, str, str, int)  # vod_id, original_line, new_line, start
     failed = Signal(str, str)
+    cancelled = Signal(str)
     finished = Signal()
 
     def __init__(
@@ -24,6 +25,7 @@ class TimelineLineRewriteWorker(QObject):
         mode: str,
         line: str,
         next_seconds: int,
+        line_start: int,
         transcript: Transcript,
     ):
         super().__init__()
@@ -32,6 +34,7 @@ class TimelineLineRewriteWorker(QObject):
         self.mode = mode
         self.line = line
         self.next_seconds = next_seconds
+        self.line_start = line_start
         self.transcript = transcript
 
     @Slot()
@@ -46,7 +49,7 @@ class TimelineLineRewriteWorker(QObject):
                 cancelled=thread.isInterruptionRequested,
             )
         except AnalysisCancelled:
-            self.failed.emit(self.vod_id, "줄 변환을 취소했습니다.")
+            self.cancelled.emit(self.vod_id)
         except Exception as error:
             logger.exception("Timeline line rewrite failed for %s", self.vod_id)
             self.failed.emit(self.vod_id, str(error))
@@ -55,6 +58,6 @@ class TimelineLineRewriteWorker(QObject):
             usage = str(summary()) if callable(summary) else ""
             if usage:
                 self.usage_changed.emit(self.vod_id, usage)
-            self.succeeded.emit(self.vod_id, self.line, result)
+            self.succeeded.emit(self.vod_id, self.line, result, self.line_start)
         finally:
             self.finished.emit()

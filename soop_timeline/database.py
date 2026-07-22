@@ -167,6 +167,27 @@ class Database:
         self.connection.execute("DELETE FROM vods WHERE vod_id = ?", (vod_id,))
         self.connection.commit()
 
+    def reset_vod_work(self, vod_id: str) -> None:
+        """Clear generated work while keeping the VOD visible in the main list."""
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM timeline_documents WHERE vod_id = ?",
+                (vod_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM timeline_revisions WHERE vod_id = ?",
+                (vod_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM analysis_queue WHERE vod_id = ?",
+                (vod_id,),
+            )
+            self.connection.execute(
+                "UPDATE vods SET state = ?, updated_at = ? WHERE vod_id = ?",
+                (VodState.NEW.value, now, vod_id),
+            )
+
     def list_vod_ids_for_streamer(self, streamer_id: int) -> list[str]:
         rows = self.connection.execute(
             "SELECT vod_id FROM vods WHERE streamer_id = ?",

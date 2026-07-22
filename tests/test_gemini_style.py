@@ -55,6 +55,36 @@ class GeminiStyleTests(unittest.TestCase):
                 }
             )
 
+    def test_rebuild_cannot_change_existing_direct_quote(self):
+        parsed = parse_timeline_document(
+            '오늘의 콘텐츠: 토크\n\n00:00:10 "원래 실제 발언" 길게 설명합니다.\n'
+        )
+        result = parsed.rebuild(
+            {
+                "content_title": "토크",
+                "entries": [
+                    {
+                        "line_id": "line_0000",
+                        "summary": '"AI가 바꾼 발언" 짧은 메모',
+                    }
+                ],
+            }
+        )
+        self.assertIn('00:00:10 "원래 실제 발언" 짧은 메모', result)
+
+    def test_rebuild_keeps_original_line_if_ai_removes_quote(self):
+        original = '00:00:10 "원래 실제 발언" 길게 설명합니다.'
+        parsed = parse_timeline_document(f"오늘의 콘텐츠: 토크\n\n{original}\n")
+        result = parsed.rebuild(
+            {
+                "content_title": "토크",
+                "entries": [
+                    {"line_id": "line_0000", "summary": "인용을 없앤 메모"}
+                ],
+            }
+        )
+        self.assertIn(original, result)
+
     def test_prompt_requires_dry_neutral_style_without_structure_changes(self):
         prompt = build_style_prompt(parse_timeline_document(SOURCE_DOCUMENT))
         self.assertIn("간결하고 자연스러운", prompt)
