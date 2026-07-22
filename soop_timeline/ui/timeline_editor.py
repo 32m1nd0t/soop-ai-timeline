@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
@@ -58,7 +60,36 @@ class TimelineTextEdit(QPlainTextEdit):
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         super().focusInEvent(event)
+        self._restore_native_keyboard_focus()
         self.focused.emit()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        super().mousePressEvent(event)
+        self._restore_native_keyboard_focus()
+        # WebView2 is a native WinForms child and can finish processing its
+        # focus change after Qt handles this click. Reclaim it once more on the
+        # next event-loop turn so normal typing reaches the Qt text editor.
+        QTimer.singleShot(0, self._restore_native_keyboard_focus)
+        QTimer.singleShot(75, self._restore_native_keyboard_focus_if_current)
+
+    def _restore_native_keyboard_focus_if_current(self) -> None:
+        if QApplication.focusWidget() is self:
+            self._restore_native_keyboard_focus()
+
+    def _restore_native_keyboard_focus(self) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if sys.platform != "win32":
+            return
+        try:
+            # Regular Qt child widgets share their top-level window's HWND.
+            # WebView2 owns a separate native HWND, so Qt focus alone is not
+            # enough after the embedded player has held keyboard focus.
+            ctypes.windll.user32.SetFocus(int(self.window().winId()))
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            # Keep editing functional on nonstandard Windows environments even
+            # if the native focus correction is unavailable.
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         cursor = self.cursorForPosition(event.position().toPoint())

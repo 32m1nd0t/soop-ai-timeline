@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from soop_timeline.services.timeline_timestamp import (
     adjust_timestamp_on_current_line,
@@ -9,10 +10,12 @@ from soop_timeline.services.timeline_timestamp import (
     timestamp_at_position,
 )
 from soop_timeline.ui.review_player import (
+    SoopReviewPlayer,
     build_close_script,
     build_player_action_script,
     build_player_url,
     build_seek_script,
+    build_seek_verification_script,
 )
 
 
@@ -84,6 +87,91 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("strategy: 'soop-progress'", script)
         self.assertIn("correctedLocal = localCurrent + correction", script)
         self.assertIn("globalTotal > availableEnd + 15", script)
+
+    def test_seek_script_prefers_precise_direct_seek_inside_first_part(self):
+        script = build_seek_script(12_282, 24_357)
+        direct_seek = script.index("strategy: 'active-part-current-time'")
+        global_seek = script.index(
+            "const dispatched = __dispatchSoopSeek(target, globalTotal)"
+        )
+        self.assertLess(direct_seek, global_seek)
+        self.assertIn("firstPartIsActive && target < availableEnd - 1", script)
+        self.assertIn("issued: true", script)
+
+    def test_seek_verification_only_reads_clock(self):
+        script = build_seek_verification_script(12_282)
+        self.assertIn("const clocks = __readSoopClocks()", script)
+        self.assertIn("strategy: 'clock-verification'", script)
+        self.assertNotIn(
+            "const dispatched = __dispatchSoopSeek(target, globalTotal)",
+            script,
+        )
+        self.assertNotIn("video.currentTime = target", script)
+
+    def test_pending_seek_switches_retries_to_read_only_verification(self):
+        class StubWebView:
+            is_ready = True
+
+            def __init__(self):
+                self.script = ""
+
+            def evaluate_js(self, script, callback):
+                self.script = script
+
+        web_view = StubWebView()
+        player = SimpleNamespace(
+            _dom_loaded=True,
+            _pending_seconds=12_282,
+            _seek_in_flight=False,
+            _seek_attempts=0,
+            _seek_generation=1,
+            _seek_command_sent=True,
+            _duration_seconds=24_357,
+            web_view=web_view,
+        )
+        SoopReviewPlayer._attempt_seek(player)
+        self.assertTrue(player._seek_in_flight)
+        self.assertIn("strategy: 'clock-verification'", web_view.script)
+        self.assertNotIn("video.currentTime = target", web_view.script)
+
+    def test_issued_seek_is_never_sent_again_while_landing(self):
+        class Recorder:
+            def __init__(self):
+                self.values = []
+
+            def setText(self, value):
+                self.values.append(value)
+
+            def emit(self, value):
+                self.values.append(value)
+
+        label = Recorder()
+        status = Recorder()
+        player = SimpleNamespace(
+            _seek_in_flight=True,
+            _seek_generation=2,
+            _pending_seconds=12_282,
+            _seek_command_sent=False,
+            _seek_attempts=7,
+            time_label=label,
+            status_changed=status,
+        )
+        SoopReviewPlayer._handle_seek_result(
+            player,
+            2,
+            12_282,
+            {
+                "success": True,
+                "result": {
+                    "ok": False,
+                    "reason": "target-not-ready",
+                    "issued": True,
+                },
+            },
+        )
+        self.assertTrue(player._seek_command_sent)
+        self.assertEqual(player._seek_attempts, 0)
+        self.assertTrue(any("한 번" in value for value in status.values))
 
     def test_review_player_uses_official_embed_page(self):
         url = build_player_url("200312857").toString()

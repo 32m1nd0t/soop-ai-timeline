@@ -172,6 +172,62 @@ if (expectedTotal > 0) {{
 const globalTotal = Number.isFinite(clocksBefore.total) && clocksBefore.total > 0
     ? clocksBefore.total
     : expectedTotal;
+
+const duration = Number(video.duration);
+let seekableEnd = 0;
+try {{
+    if (video.seekable && video.seekable.length) {{
+        seekableEnd = Number(video.seekable.end(video.seekable.length - 1));
+    }}
+}} catch (_) {{}}
+
+if ((!Number.isFinite(duration) || duration <= 0) && seekableEnd <= 0) {{
+    return {{ ok: false, reason: 'metadata-not-ready' }};
+}}
+
+const availableEnd = Number.isFinite(duration) && duration > 0
+    ? duration
+    : seekableEnd;
+
+// When the first media part is already active, seek it directly. Using the
+// full six-hour progress bar here is too coarse (roughly 20 seconds per pixel)
+// and repeated verification attempts can make a short section loop forever.
+const firstPartIsActive = !Number.isFinite(clocksBefore.current)
+    || clocksBefore.current < availableEnd + 5;
+if (firstPartIsActive && target < availableEnd - 1) {{
+    try {{
+        video.currentTime = target;
+        video.muted = false;
+        try {{ await video.play(); }} catch (_) {{}}
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        const landed = Number(video.currentTime);
+        if (Number.isFinite(landed) && Math.abs(landed - target) <= 5) {{
+            return {{
+                ok: true,
+                strategy: 'active-part-current-time',
+                currentTime: landed,
+                duration: globalTotal || availableEnd,
+                paused: Boolean(video.paused),
+                muted: Boolean(video.muted)
+            }};
+        }}
+        return {{
+            ok: false,
+            reason: 'target-not-ready',
+            issued: true,
+            landed,
+            duration: availableEnd,
+            strategy: 'active-part-current-time'
+        }};
+    }} catch (error) {{
+        return {{
+            ok: false,
+            reason: 'seek-failed',
+            message: String(error)
+        }};
+    }}
+}}
+
 if (globalTotal > 0) {{
     const dispatched = __dispatchSoopSeek(target, globalTotal);
     if (dispatched.ok) {{
@@ -219,28 +275,13 @@ if (globalTotal > 0) {{
         return {{
             ok: false,
             reason: 'target-not-ready',
+            issued: true,
             landed: landedGlobal,
             duration: globalTotal,
             strategy: 'soop-progress'
         }};
     }}
 }}
-
-const duration = Number(video.duration);
-let seekableEnd = 0;
-try {{
-    if (video.seekable && video.seekable.length) {{
-        seekableEnd = Number(video.seekable.end(video.seekable.length - 1));
-    }}
-}} catch (_) {{}}
-
-if ((!Number.isFinite(duration) || duration <= 0) && seekableEnd <= 0) {{
-    return {{ ok: false, reason: 'metadata-not-ready' }};
-}}
-
-const availableEnd = Number.isFinite(duration) && duration > 0
-    ? duration
-    : seekableEnd;
 
 // A multipart replay exposes only the active part through <video>. Never use a
 // global timestamp as that part's local currentTime; wait for SOOP's own
@@ -264,8 +305,10 @@ try {{
         return {{
             ok: false,
             reason: 'target-not-ready',
+            issued: true,
             landed: landed,
-            duration: availableEnd
+            duration: availableEnd,
+            strategy: 'video-current-time'
         }};
     }}
     return {{
@@ -283,6 +326,32 @@ try {{
         message: String(error)
     }};
 }}
+""").strip()
+
+
+def build_seek_verification_script(seconds: int) -> str:
+    """Read the SOOP global clock without issuing another seek command."""
+    target = max(0, int(seconds))
+    return (_SOOP_GLOBAL_TIME_FN + f"""
+const target = {target};
+const clocks = __readSoopClocks();
+if (!Number.isFinite(clocks.current)) {{
+    return {{ ok: false, reason: 'seek-still-pending' }};
+}}
+if (Math.abs(clocks.current - target) <= 5) {{
+    return {{
+        ok: true,
+        strategy: 'clock-verification',
+        currentTime: clocks.current,
+        duration: clocks.total
+    }};
+}}
+return {{
+    ok: false,
+    reason: 'seek-still-pending',
+    currentTime: clocks.current,
+    duration: clocks.total
+}};
 """).strip()
 
 
@@ -424,7 +493,7 @@ class SoopReviewPlayer(QFrame):
         self._activate_attempts = 0
         self._activate_generation = 0
         self._suppress_activate = False
-        self._not_ready_hits = 0
+        self._seek_command_sent = False
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -526,7 +595,7 @@ class SoopReviewPlayer(QFrame):
         self._pending_seconds = value
         self._seek_generation += 1
         self._seek_attempts = 0
-        self._not_ready_hits = 0
+        self._seek_command_sent = False
         label = format_timestamp_seconds(value)
         self.time_label.setText(f"이동 중 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동합니다…")
@@ -540,6 +609,8 @@ class SoopReviewPlayer(QFrame):
         self.open_player()
         self._dom_loaded = False
         self._suppress_activate = False
+        self._seek_command_sent = False
+        self._seek_attempts = 0
         self.time_label.setText("새로고침 중…")
         self.web_view.reload()
 
@@ -590,7 +661,7 @@ class SoopReviewPlayer(QFrame):
         self._seek_generation += 1
         self._seek_attempts = 0
         self._seek_in_flight = False
-        self._not_ready_hits = 0
+        self._seek_command_sent = False
         self._suppress_activate = False
         if self.web_view.is_ready:
             self.web_view.evaluate_js(build_close_script())
@@ -631,18 +702,30 @@ class SoopReviewPlayer(QFrame):
             label = format_timestamp_seconds(self._pending_seconds)
             self._pending_seconds = None
             self.time_label.setText(f"이동 대기 · {label}")
-            self.status_changed.emit(
-                "플레이어가 아직 준비되지 않았습니다. 광고가 끝났는지 확인한 뒤 "
-                "타임스탬프를 다시 더블클릭하세요."
-            )
+            if self._seek_command_sent:
+                self.status_changed.emit(
+                    "이동 명령은 한 번만 보냈지만 플레이어의 도착 시각을 확인하지 "
+                    "못했습니다. 재생 화면을 확인해 주세요."
+                )
+            else:
+                self.status_changed.emit(
+                    "플레이어가 아직 준비되지 않았습니다. 광고가 끝났는지 확인한 뒤 "
+                    "타임스탬프를 다시 더블클릭하세요."
+                )
+            self._seek_command_sent = False
             return
 
         self._seek_attempts += 1
         self._seek_in_flight = True
         generation = self._seek_generation
         seconds = self._pending_seconds
+        script = (
+            build_seek_verification_script(seconds)
+            if self._seek_command_sent
+            else build_seek_script(seconds, self._duration_seconds)
+        )
         self.web_view.evaluate_js(
-            build_seek_script(seconds, self._duration_seconds),
+            script,
             lambda result: self._handle_seek_result(generation, seconds, result),
         )
 
@@ -660,20 +743,29 @@ class SoopReviewPlayer(QFrame):
         payload = result.get("result")
         if not isinstance(payload, dict) or not bool(payload.get("ok")):
             reason = payload.get("reason") if isinstance(payload, dict) else None
-            if reason == "target-not-ready":
-                self._not_ready_hits += 1
-                if self._not_ready_hits == 4:
+            issued = bool(payload.get("issued")) if isinstance(payload, dict) else False
+            if reason == "target-not-ready" and issued:
+                # The actual seek was already issued. From now on the timer
+                # only reads SOOP's global clock and never sends the same seek
+                # again, preventing a one-to-two-second playback loop.
+                self._seek_command_sent = True
+                self._seek_attempts = 0
+                label = format_timestamp_seconds(seconds)
+                self.time_label.setText(f"이동 후 로딩 중 · {label}")
+                self.status_changed.emit(
+                    "이동 명령을 한 번 보냈습니다. 재생 위치를 확인하고 있습니다…"
+                )
+            elif reason == "seek-still-pending":
+                if self._seek_attempts == 8:
                     label = format_timestamp_seconds(seconds)
-                    self.time_label.setText(f"파트 전환 중 · {label}")
-                    self.status_changed.emit(
-                        "긴 방송의 다음 영상 파트를 불러오고 있습니다…"
-                    )
+                    self.time_label.setText(f"재생 위치 확인 중 · {label}")
             elif reason == "player-not-ready" and self._seek_attempts == 4:
                 self.time_label.setText("광고·본편 전환 대기 중…")
             return
 
         self._pending_seconds = None
         self._retry_timer.stop()
+        self._seek_command_sent = False
         label = format_timestamp_seconds(seconds)
         self.time_label.setText(f"재생 위치 · {label}")
         self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동했습니다.")
