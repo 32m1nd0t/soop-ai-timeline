@@ -188,6 +188,7 @@ class TimelineDocumentEditor(QWidget):
     transcript_requested = Signal(str)
     cache_delete_requested = Signal(str)
     work_reset_requested = Signal(str)
+    publish_requested = Signal(str)
 
     def __init__(
         self,
@@ -339,8 +340,13 @@ class TimelineDocumentEditor(QWidget):
         self.ready_button.setObjectName("primaryButton")
         self.ready_button.clicked.connect(self.mark_review_complete)
         self.publish_button = QPushButton("SOOP에 작성")
-        self.publish_button.setEnabled(False)
-        self.publish_button.setToolTip("공식 댓글 API 권한을 받은 뒤 활성화됩니다.")
+        self.publish_button.setToolTip(
+            "SOOP에 로그인해 검수한 타임라인을 댓글·대댓글로 등록하는 창을 엽니다. "
+            "비밀번호는 저장하지 않고 등록 전 확인을 거칩니다."
+        )
+        self.publish_button.clicked.connect(
+            lambda: self.publish_requested.emit(self.vod.vod_id)
+        )
         summary_row.addWidget(self.total_label)
         summary_row.addStretch(1)
         summary_row.addWidget(self.analyze_button)
@@ -794,6 +800,7 @@ class TimelineDocumentEditor(QWidget):
         self.analysis_progress.setVisible(running)
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.publish_button.setEnabled(not running)
         self.style_button.setEnabled(not running and self._style_available)
         self.regroup_button.setEnabled(
             not running and self._analyzer_available and self._cached_transcript_available
@@ -831,6 +838,7 @@ class TimelineDocumentEditor(QWidget):
             self.analysis_progress.setValue(100)
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.publish_button.setEnabled(not running)
         self.style_button.setEnabled(not running and self._style_available)
         self.preview_card.setVisible(running or self.preview_card.isVisible())
         self.regroup_button.setEnabled(
@@ -876,6 +884,7 @@ class TimelineDocumentEditor(QWidget):
         )
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.publish_button.setEnabled(not running)
         self.transcript_button.setEnabled(not running and self._cached_transcript_available)
         self.cache_delete_button.setEnabled(not running and self._cache_present)
         self.work_reset_button.setEnabled(not running)
@@ -1379,6 +1388,7 @@ class TimelineDocumentEditor(QWidget):
         self.style_button.setEnabled(not running and self._style_available)
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
+        self.publish_button.setEnabled(not running)
         self.transcript_button.setEnabled(not running and self._cached_transcript_available)
         self.cache_delete_button.setEnabled(not running and self._cache_present)
         self.work_reset_button.setEnabled(not running)

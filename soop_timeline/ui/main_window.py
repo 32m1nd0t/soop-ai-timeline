@@ -79,6 +79,7 @@ from ..services.update_checker import (
     parse_update_manifest,
 )
 from .analysis_worker import AnalysisWorker
+from .comment_publisher_window import SoopCommentPublisher
 from .line_rewrite_worker import TimelineLineRewriteWorker
 from .live_worker import LiveAnalysisWorker
 from .manual_link_worker import ManualLinkWorker
@@ -108,6 +109,8 @@ class MainWindow(QMainWindow):
         self._regroup_jobs: dict[str, tuple[QThread, TimelineRegroupWorker]] = {}
         self._manual_link_job: tuple[QThread, ManualLinkWorker] | None = None
         self._transcript_windows: dict[str, TranscriptViewerDialog] = {}
+        self._comment_publishers: dict[str, SoopCommentPublisher] = {}
+        self._comment_publish_acknowledged = False
         self._analysis_queue: list[str] = self.database.recover_analysis_queue()
         self._close_after_analysis = False
         self._loading_more_vods = False
@@ -257,7 +260,8 @@ class MainWindow(QMainWindow):
         root.addLayout(header)
 
         notice = QLabel(
-            "현재는 검수 후 블록별 복사 방식입니다. 공식 API 권한을 받으면 로그인과 댓글·대댓글 등록 버튼을 연결합니다."
+            "검수 후 블록별로 복사하거나, 편집 탭의 'SOOP에 작성'으로 로그인해 "
+            "댓글·대댓글을 등록할 수 있습니다. 자동 등록은 공식 API가 아닌 본인 로그인 세션을 사용합니다."
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
@@ -1066,12 +1070,54 @@ class MainWindow(QMainWindow):
         editor.transcript_requested.connect(self.show_cached_transcript)
         editor.cache_delete_requested.connect(self.delete_vod_cache)
         editor.work_reset_requested.connect(self.reset_vod_work)
+        editor.publish_requested.connect(self.open_comment_publisher)
         self._editor_tabs[vod_id] = editor
         self._refresh_editor_cache_state(vod_id)
         title = vod.title if len(vod.title) <= 22 else f"{vod.title[:21]}…"
         index = self.tabs.addTab(editor, title)
         self.tabs.setTabToolTip(index, vod.title)
         self.tabs.setCurrentIndex(index)
+
+    def open_comment_publisher(self, vod_id: str) -> None:
+        vod = self.database.get_vod(vod_id)
+        editor = self._editor_tabs.get(vod_id)
+        if vod is None or editor is None:
+            return
+        blocks = [block for block in editor.blocks() if block.strip()]
+        if not blocks:
+            QMessageBox.information(
+                self,
+                "등록할 내용 없음",
+                "먼저 타임라인을 분석·검수한 뒤 등록할 수 있습니다.",
+            )
+            return
+        if not self._comment_publish_acknowledged:
+            proceed = QMessageBox.warning(
+                self,
+                "SOOP 로그인 등록 안내",
+                "이 기능은 SOOP 공식 댓글 API가 아니라, 브라우저에 로그인한 회원님의 "
+                "세션으로 댓글을 직접 등록합니다.\n\n"
+                "· 비밀번호는 SOOP 로그인 페이지에서만 입력하며 앱은 저장하지 않습니다.\n"
+                "· 자동 등록은 SOOP 이용약관에 저촉될 수 있으니 본인 책임으로 사용하세요.\n"
+                "· 등록된 댓글은 SOOP에서 직접 삭제해야 합니다.\n\n"
+                "계속하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
+                return
+            self._comment_publish_acknowledged = True
+
+        prior = self._comment_publishers.pop(vod_id, None)
+        if prior is not None:
+            prior.close()
+        window = SoopCommentPublisher(vod, blocks)
+        window.status_changed.connect(self.status_label.setText)
+        window.closed.connect(
+            lambda vid=vod_id: self._comment_publishers.pop(vid, None)
+        )
+        self._comment_publishers[vod_id] = window
+        window.open_window()
 
     def _load_or_create_timeline_text(self, vod: Vod) -> str:
         document = self.database.get_timeline(vod.vod_id)
@@ -2361,6 +2407,9 @@ class MainWindow(QMainWindow):
             self._save_timeline(widget.vod.vod_id, widget.text())
             self._editor_tabs.pop(widget.vod.vod_id, None)
             widget.close_review_player()
+            publisher = self._comment_publishers.pop(widget.vod.vod_id, None)
+            if publisher is not None:
+                publisher.close()
         self.tabs.removeTab(index)
         widget.deleteLater()
 
@@ -2414,6 +2463,9 @@ class MainWindow(QMainWindow):
         for window in list(self._transcript_windows.values()):
             window.close()
         self._transcript_windows.clear()
+        for publisher in list(self._comment_publishers.values()):
+            publisher.close()
+        self._comment_publishers.clear()
 
     def _active_jobs(self) -> bool:
         return bool(
