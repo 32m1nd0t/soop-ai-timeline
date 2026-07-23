@@ -57,6 +57,10 @@ class Vod:
     updated_at: str
     source_kind: str = "vod"
     streamer_glossary: str = ""
+    live_broadcast_no: str = ""
+    linked_vod_id: str = ""
+    memo: str = ""
+    hidden: bool = False
 
 
 @dataclass(slots=True)

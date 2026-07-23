@@ -14,7 +14,7 @@ class PreferencesTests(unittest.TestCase):
     def test_live_mode_defaults_to_saving_and_estimates_calls(self):
         self.assertEqual(normalize_live_ai_mode("unknown"), "saving")
         self.assertEqual(live_ai_mode("saving").interval_seconds, 15 * 60)
-        self.assertEqual(estimated_live_calls(6 * 3_600, "saving"), 25)
+        self.assertEqual(estimated_live_calls(6 * 3_600, "saving"), 26)
         self.assertGreater(
             estimated_live_calls(6 * 3_600, "frequent"),
             estimated_live_calls(6 * 3_600, "saving"),

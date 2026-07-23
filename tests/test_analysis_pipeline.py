@@ -18,10 +18,13 @@ from soop_timeline.services.analyzer import (
     save_timeline_generation_state,
 )
 from soop_timeline.services.gemini_timeline import (
+    FINAL_TIMELINE_SCHEMA,
+    OVERALL_SUMMARY_SCHEMA,
     GeneratedTimeline,
     TimelineEntry,
     TimelineGenerationState,
     build_overall_summary,
+    build_overall_summary_prompt,
     build_chunk_prompt,
     build_final_prompt,
     deduplicate_entries,
@@ -397,6 +400,14 @@ class AnalysisPipelineTests(unittest.TestCase):
             [TimelineEntry("s000000", 0, "방송을 시작합니다.")],
             sample_transcript().segments,
         )
+        overall_prompt = build_overall_summary_prompt(
+            sample_vod(),
+            [
+                TimelineEntry("s000000", 0, "방송 시작"),
+                TimelineEntry("s000001", 2_600, "꿈 이야기"),
+                TimelineEntry("s000002", 2_800, "게임 시작"),
+            ],
+        )
 
         for prompt in (chunk_prompt, final_prompt):
             self.assertIn("타임라인 소제목", prompt)
@@ -405,10 +416,15 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertIn("현재 방송", prompt)
             self.assertIn("summary는 비웁니다", prompt)
         self.assertIn("문체 규칙에 맞게 간결하고 자연스럽게", final_prompt)
-        self.assertIn("전체 방송 한 줄 요약", final_prompt)
-        self.assertIn("시작·중간·후반", final_prompt)
-        self.assertIn("영상 제목이나 구간별 콘텐츠 제목 하나를 그대로 복사하지", final_prompt)
-        self.assertIn("영상 제목을 복사하지 말고", chunk_prompt)
+        self.assertIn("타임라인 entries만 정리", final_prompt)
+        self.assertIn("별도 단계에서 딱 한 번만", final_prompt)
+        self.assertNotIn("전체 방송 한 줄 요약", final_prompt)
+        self.assertNotIn("시작·중간·후반의 대표 흐름", final_prompt)
+        self.assertIn("전체 방송 요약이 아니라", chunk_prompt)
+        self.assertIn("영상 제목을 복사하지 않습니다", chunk_prompt)
+        self.assertIn("유일한 작업", overall_prompt)
+        self.assertIn("시작·중간·후반의 대표 흐름", overall_prompt)
+        self.assertIn("content_title 하나만", overall_prompt)
 
     def test_topic_prompts_keep_previous_context_and_merge_subtopics(self):
         previous = [TimelineEntry("old", 100, "와우 시절과 현재 선호 비교")]
@@ -469,13 +485,13 @@ class AnalysisPipelineTests(unittest.TestCase):
                 ],
             },
             {
-                "content_title": "테스트 콘텐츠",
                 "entries": [
                     {"segment_id": "s000000", "summary": "방송을 시작함"},
                     {"segment_id": "s000001", "summary": "꿈 이야기를 함"},
                     {"segment_id": "s000002", "summary": "게임을 시작함"},
                 ],
             },
+            {"content_title": "테스트 콘텐츠"},
         ]
         previews: list[tuple[str, str]] = []
         generator = GeminiTimelineGenerator("test-key")
@@ -494,7 +510,7 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertLess(len(previews[0][1]), len(previews[-1][1]))
         self.assertEqual(result.content_title, "테스트 콘텐츠")
 
-    def test_generator_replaces_copied_title_without_extra_gemini_call(self):
+    def test_generator_replaces_copied_overall_title_without_retrying(self):
         from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
 
         payloads = [
@@ -512,13 +528,13 @@ class AnalysisPipelineTests(unittest.TestCase):
                 ],
             },
             {
-                "content_title": sample_vod().title,
                 "entries": [
                     {"segment_id": "s000000", "summary": "방송을 시작함"},
                     {"segment_id": "s000001", "summary": "꿈 이야기"},
                     {"segment_id": "s000002", "summary": "게임 시작"},
                 ],
             },
+            {"content_title": sample_vod().title},
         ]
         generator = GeminiTimelineGenerator("test-key")
 
@@ -530,9 +546,63 @@ class AnalysisPipelineTests(unittest.TestCase):
                 cancelled=lambda: False,
             )
 
-        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_count, 4)
         self.assertEqual(result.content_title, "꿈 이야기 · 게임 시작")
         self.assertNotEqual(result.content_title, sample_vod().title)
+
+    def test_final_timeline_and_overall_title_use_separate_requests(self):
+        from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
+
+        payloads = [
+            {
+                "content_title": "방송 시작",
+                "entries": [
+                    {"segment_id": "s000000", "summary": "방송 시작"},
+                ],
+            },
+            {
+                "content_title": "꿈과 게임",
+                "entries": [
+                    {"segment_id": "s000001", "summary": "꿈 이야기"},
+                    {"segment_id": "s000002", "summary": "게임 시작"},
+                ],
+            },
+            {
+                "entries": [
+                    {"segment_id": "s000000", "summary": "방송 시작"},
+                    {"segment_id": "s000001", "summary": "꿈 이야기"},
+                    {"segment_id": "s000002", "summary": "게임 시작"},
+                ],
+            },
+            {"content_title": "꿈 이야기와 게임 시작"},
+        ]
+        calls: list[tuple[str, dict[str, object], str]] = []
+
+        def request(prompt, _cancelled, *, schema=None, purpose="timeline"):
+            calls.append((prompt, schema, purpose))
+            return payloads[len(calls) - 1]
+
+        generator = GeminiTimelineGenerator("test-key")
+        with patch.object(generator, "_request_json", side_effect=request):
+            result = generator.generate(
+                sample_vod(),
+                sample_transcript(),
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertIs(calls[-2][1], FINAL_TIMELINE_SCHEMA)
+        self.assertEqual(calls[-2][2], "timeline_finalize")
+        self.assertEqual(set(FINAL_TIMELINE_SCHEMA["properties"]), {"entries"})
+        self.assertIs(calls[-1][1], OVERALL_SUMMARY_SCHEMA)
+        self.assertEqual(calls[-1][2], "overall_summary")
+        self.assertEqual(
+            set(OVERALL_SUMMARY_SCHEMA["properties"]),
+            {"content_title"},
+        )
+        self.assertEqual(result.content_title, "꿈 이야기와 게임 시작")
+        self.assertEqual(len(result.entries), 3)
 
     def test_gemini_final_failure_keeps_checkpoint_and_resumes_final_only(self):
         from soop_timeline.services.gemini_timeline import GeminiTimelineGenerator
@@ -588,7 +658,6 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(len(draft.entries), 2)
 
         final_payload = {
-            "content_title": "최종 콘텐츠",
             "entries": [
                 {
                     "segment_id": "s000000",
@@ -605,7 +674,11 @@ class AnalysisPipelineTests(unittest.TestCase):
             ],
         }
         resumed = GeminiTimelineGenerator("test-key")
-        with patch.object(resumed, "_request_json", return_value=final_payload) as request:
+        with patch.object(
+            resumed,
+            "_request_json",
+            side_effect=[final_payload, {"content_title": "최종 콘텐츠"}],
+        ) as request:
             result = resumed.generate(
                 sample_vod(),
                 sample_transcript(),
@@ -614,7 +687,7 @@ class AnalysisPipelineTests(unittest.TestCase):
                 checkpoint_key="checkpoint-key",
                 resume_state=checkpoints[-1],
             )
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_count, 2)
         self.assertEqual(result.content_title, "최종 콘텐츠")
 
     def test_analyzer_reuses_cached_transcript(self):

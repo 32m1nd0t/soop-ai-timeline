@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, QUrl, QUrlQuery, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QTimer, Qt, QUrl, QUrlQuery, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -559,7 +559,11 @@ class SoopReviewPlayer(QFrame):
         self.vod = vod
         self._duration_seconds = parse_duration_text(vod.duration_text) or 0
         self.setObjectName("playerCard")
-        self.setMinimumWidth(380)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setWindowTitle(f"SOOP 검수 플레이어 · {vod.title}")
+        self.resize(760, 640)
+        self.setMinimumSize(520, 420)
 
         self._loaded = False
         self._dom_loaded = False
@@ -631,7 +635,9 @@ class SoopReviewPlayer(QFrame):
         layout.addWidget(self.help_label)
 
     def open_player(self) -> None:
-        self.setVisible(True)
+        self.show()
+        self.raise_()
+        self.activateWindow()
         if not self._loaded:
             self._loaded = True
             self.status_changed.emit("SOOP 검수 플레이어를 불러옵니다…")
@@ -639,6 +645,19 @@ class SoopReviewPlayer(QFrame):
             self.web_view.load_url(build_player_url(self.vod.vod_id).toString())
         elif self._dom_loaded and self._pending_seconds is None:
             self._activate_playback()
+
+    def set_vod(self, vod: Vod) -> None:
+        if vod.vod_id == self.vod.vod_id:
+            return
+        was_visible = self.isVisible()
+        self._stop_playback()
+        self.vod = vod
+        self._duration_seconds = parse_duration_text(vod.duration_text) or 0
+        self.setWindowTitle(f"SOOP 검수 플레이어 · {vod.title}")
+        self._loaded = False
+        self._dom_loaded = False
+        if was_visible:
+            self.open_player()
 
     def _activate_playback(self) -> None:
         """Nudge the replay to load and play so the player is not left black."""
@@ -733,6 +752,13 @@ class SoopReviewPlayer(QFrame):
         )
 
     def close_player(self) -> None:
+        was_visible = self.isVisible()
+        self._stop_playback()
+        self.hide()
+        if was_visible:
+            self.closed.emit()
+
+    def _stop_playback(self) -> None:
         # Invalidate delayed auto-activation callbacks before hiding the widget;
         # otherwise one can call play() again after this method has paused it.
         self._activate_generation += 1
@@ -746,7 +772,10 @@ class SoopReviewPlayer(QFrame):
         self._suppress_activate = False
         if self.web_view.is_ready:
             self.web_view.evaluate_js(build_close_script())
-        self.setVisible(False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._stop_playback()
+        event.accept()
         self.closed.emit()
 
     def _on_webview_initialized(self, success: bool, error_message: str) -> None:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -44,6 +45,10 @@ class Database:
                 published_text TEXT NOT NULL DEFAULT '',
                 thumbnail_url TEXT NOT NULL DEFAULT '',
                 source_kind TEXT NOT NULL DEFAULT 'vod',
+                live_broadcast_no TEXT NOT NULL DEFAULT '',
+                linked_vod_id TEXT NOT NULL DEFAULT '',
+                memo TEXT NOT NULL DEFAULT '',
+                hidden INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL DEFAULT 'new',
                 discovered_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -94,6 +99,22 @@ class Database:
         if "source_kind" not in vod_columns:
             self.connection.execute(
                 "ALTER TABLE vods ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'vod'"
+            )
+        if "live_broadcast_no" not in vod_columns:
+            self.connection.execute(
+                "ALTER TABLE vods ADD COLUMN live_broadcast_no TEXT NOT NULL DEFAULT ''"
+            )
+        if "linked_vod_id" not in vod_columns:
+            self.connection.execute(
+                "ALTER TABLE vods ADD COLUMN linked_vod_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "memo" not in vod_columns:
+            self.connection.execute(
+                "ALTER TABLE vods ADD COLUMN memo TEXT NOT NULL DEFAULT ''"
+            )
+        if "hidden" not in vod_columns:
+            self.connection.execute(
+                "ALTER TABLE vods ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
             )
         streamer_columns = {
             str(row["name"])
@@ -167,6 +188,20 @@ class Database:
         self.connection.execute("DELETE FROM vods WHERE vod_id = ?", (vod_id,))
         self.connection.commit()
 
+    def set_vod_hidden(self, vod_id: str, hidden: bool) -> None:
+        self.connection.execute(
+            "UPDATE vods SET hidden = ?, updated_at = ? WHERE vod_id = ?",
+            (1 if hidden else 0, utc_now(), vod_id),
+        )
+        self.connection.commit()
+
+    def update_vod_memo(self, vod_id: str, memo: str) -> None:
+        self.connection.execute(
+            "UPDATE vods SET memo = ?, updated_at = ? WHERE vod_id = ?",
+            (str(memo), utc_now(), vod_id),
+        )
+        self.connection.commit()
+
     def reset_vod_work(self, vod_id: str) -> None:
         """Clear generated work while keeping the VOD visible in the main list."""
         now = utc_now()
@@ -204,6 +239,13 @@ class Database:
         sql += " ORDER BY display_name COLLATE NOCASE, channel_id COLLATE NOCASE"
         rows = self.connection.execute(sql, params).fetchall()
         return [self._streamer_from_row(row) for row in rows]
+
+    def get_streamer(self, streamer_id: int) -> Streamer | None:
+        row = self.connection.execute(
+            "SELECT * FROM streamers WHERE id = ?",
+            (streamer_id,),
+        ).fetchone()
+        return self._streamer_from_row(row) if row is not None else None
 
     def update_streamer_name(self, streamer_id: int, display_name: str) -> None:
         if not display_name.strip():
@@ -297,6 +339,7 @@ class Database:
         thumbnail_url: str = "",
         source_kind: str = "manual_vod",
         state: str = VodState.NEW.value,
+        live_broadcast_no: str = "",
     ) -> Vod:
         streamer = self.ensure_external_streamer(channel_id, streamer_name)
         now = utc_now()
@@ -304,9 +347,9 @@ class Database:
             """
             INSERT INTO vods(
                 vod_id, streamer_id, title, url, duration_text,
-                published_text, thumbnail_url, source_kind, state,
+                published_text, thumbnail_url, source_kind, live_broadcast_no, state,
                 discovered_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(vod_id) DO UPDATE SET
                 streamer_id = excluded.streamer_id,
                 title = excluded.title,
@@ -317,6 +360,11 @@ class Database:
                 source_kind = CASE
                     WHEN vods.source_kind = 'vod' THEN vods.source_kind
                     ELSE excluded.source_kind
+                END,
+                live_broadcast_no = CASE
+                    WHEN excluded.live_broadcast_no = ''
+                    THEN vods.live_broadcast_no
+                    ELSE excluded.live_broadcast_no
                 END,
                 updated_at = excluded.updated_at
             """,
@@ -329,6 +377,7 @@ class Database:
                 published_text,
                 thumbnail_url,
                 source_kind,
+                live_broadcast_no,
                 state,
                 now,
                 now,
@@ -344,15 +393,45 @@ class Database:
         self,
         states: Iterable[str] | None = None,
         limit: int = 500,
+        *,
+        streamer_id: int | None = None,
+        sort: str = "newest",
+        hidden: bool = False,
     ) -> list[Vod]:
-        params: list[object] = []
-        where = ""
+        params: list[object] = [1 if hidden else 0]
+        clauses: list[str] = ["v.hidden = ?"]
         if states is not None:
             state_list = list(states)
             if state_list:
                 placeholders = ",".join("?" for _ in state_list)
-                where = f"WHERE v.state IN ({placeholders})"
+                clauses.append(f"v.state IN ({placeholders})")
                 params.extend(state_list)
+        if streamer_id is not None:
+            clauses.append("v.streamer_id = ?")
+            params.append(streamer_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_by = {
+            "newest": (
+                "CASE WHEN v.source_kind = 'live' THEN 0 ELSE 1 END, "
+                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN CAST(v.vod_id AS INTEGER) END DESC, "
+                "v.discovered_at DESC"
+            ),
+            "oldest": (
+                "CASE WHEN v.source_kind = 'live' THEN 1 ELSE 0 END, "
+                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN CAST(v.vod_id AS INTEGER) END ASC, "
+                "v.discovered_at ASC"
+            ),
+            "recent_work": "v.updated_at DESC, v.discovered_at DESC",
+            "status": (
+                "CASE v.state "
+                "WHEN 'analyzing' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 "
+                "WHEN 'review' THEN 3 WHEN 'new' THEN 4 WHEN 'ready' THEN 5 "
+                "WHEN 'copied' THEN 6 WHEN 'published' THEN 7 ELSE 8 END, "
+                "v.updated_at DESC"
+            ),
+        }.get(sort, "")
+        if not order_by:
+            raise ValueError(f"지원하지 않는 VOD 정렬 방식입니다: {sort}")
         params.append(limit)
         rows = self.connection.execute(
             f"""
@@ -364,15 +443,107 @@ class Database:
             FROM vods v
             JOIN streamers s ON s.id = v.streamer_id
             {where}
-            ORDER BY
-                CASE WHEN v.source_kind = 'live' THEN 0 ELSE 1 END,
-                v.updated_at DESC,
-                CAST(v.vod_id AS INTEGER) DESC
+            ORDER BY {order_by}
             LIMIT ?
             """,
             params,
         ).fetchall()
         return [self._vod_from_row(row) for row in rows]
+
+    def auto_link_live_sessions(
+        self,
+        streamer_id: int,
+        vod_ids: Iterable[str],
+        *,
+        new_vod_ids: Iterable[str] = (),
+    ) -> list[tuple[str, str]]:
+        """Attach recent live work sessions to their completed replay VODs."""
+        requested = [str(vod_id) for vod_id in vod_ids if str(vod_id).isdigit()]
+        if not requested:
+            return []
+        placeholders = ",".join("?" for _ in requested)
+        replays = self.connection.execute(
+            f"""
+            SELECT vod_id, title
+            FROM vods
+            WHERE streamer_id = ?
+              AND source_kind != 'live'
+              AND vod_id IN ({placeholders})
+            ORDER BY CAST(vod_id AS INTEGER) DESC
+            """,
+            (streamer_id, *requested),
+        ).fetchall()
+        if not replays:
+            return []
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat(
+            timespec="seconds"
+        )
+        candidates = self.connection.execute(
+            """
+            SELECT vod_id, title, discovered_at
+            FROM vods
+            WHERE streamer_id = ?
+              AND source_kind = 'live'
+              AND linked_vod_id = ''
+              AND state != ?
+              AND discovered_at >= ?
+            ORDER BY discovered_at DESC
+            """,
+            (streamer_id, VodState.ANALYZING.value, cutoff),
+        ).fetchall()
+        if not candidates:
+            return []
+
+        fresh_ids = {str(vod_id) for vod_id in new_vod_ids}
+        available = list(candidates)
+        linked: list[tuple[str, str]] = []
+        used_replays = {
+            str(row["linked_vod_id"])
+            for row in self.connection.execute(
+                "SELECT linked_vod_id FROM vods WHERE linked_vod_id != ''"
+            ).fetchall()
+        }
+        for replay in replays:
+            replay_id = str(replay["vod_id"])
+            if replay_id in used_replays:
+                continue
+            replay_title = _normalized_broadcast_title(str(replay["title"]))
+            matches = [
+                candidate
+                for candidate in available
+                if replay_title
+                and _normalized_broadcast_title(str(candidate["title"])) == replay_title
+            ]
+            if not matches and len(fresh_ids) == 1 and replay_id in fresh_ids and len(available) == 1:
+                matches = [available[0]]
+            if not matches:
+                continue
+            live = matches[0]
+            live_id = str(live["vod_id"])
+            self.connection.execute(
+                "UPDATE vods SET linked_vod_id = ?, updated_at = ? WHERE vod_id = ?",
+                (replay_id, utc_now(), live_id),
+            )
+            linked.append((live_id, replay_id))
+            used_replays.add(replay_id)
+            available.remove(live)
+        self.connection.commit()
+        return linked
+
+    def list_recent_unlinked_live_sessions(self, *, days: int = 2) -> list[str]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat(
+            timespec="seconds"
+        )
+        rows = self.connection.execute(
+            """
+            SELECT vod_id FROM vods
+            WHERE source_kind = 'live' AND linked_vod_id = '' AND discovered_at >= ?
+            ORDER BY discovered_at DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [str(row["vod_id"]) for row in rows]
 
     def get_vod(self, vod_id: str) -> Vod | None:
         row = self.connection.execute(
@@ -614,4 +785,14 @@ class Database:
             updated_at=row["updated_at"],
             source_kind=row["source_kind"],
             streamer_glossary=str(row["streamer_glossary"] or ""),
+            live_broadcast_no=str(row["live_broadcast_no"] or ""),
+            linked_vod_id=str(row["linked_vod_id"] or ""),
+            memo=str(row["memo"] or ""),
+            hidden=bool(row["hidden"]),
         )
+
+
+def _normalized_broadcast_title(value: str) -> str:
+    text = re.sub(r"^\s*\[?\s*live\s*\]?\s*", "", value, flags=re.IGNORECASE)
+    text = re.sub(r"(?:다시보기|풀영상|full\s*vod)", "", text, flags=re.IGNORECASE)
+    return "".join(character.casefold() for character in text if character.isalnum())

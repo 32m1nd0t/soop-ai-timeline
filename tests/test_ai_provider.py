@@ -36,9 +36,9 @@ class AIProviderTests(unittest.TestCase):
         self.assertEqual(set(AI_PROVIDER_SPECS), {"gemini"})
         self.assertEqual(normalize_ai_provider("legacy-provider"), "gemini")
         self.assertEqual(normalize_ai_provider("unknown"), "gemini")
-        self.assertEqual(estimate_timeline_calls(0), 2)
-        self.assertEqual(estimate_timeline_calls(45 * 60), 2)
-        self.assertGreater(estimate_timeline_calls(8 * 3600), 2)
+        self.assertEqual(estimate_timeline_calls(0), 3)
+        self.assertEqual(estimate_timeline_calls(45 * 60), 3)
+        self.assertGreater(estimate_timeline_calls(8 * 3600), 3)
 
     def test_schema_strips_additional_properties_for_nested_objects(self):
         # The Gemini API rejects ``additionalProperties`` with 400

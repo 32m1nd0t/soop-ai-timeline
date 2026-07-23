@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from soop_timeline.services.gemini_style import (
+    STYLE_SCHEMA,
     GeminiTimelineStyler,
     build_style_prompt,
     parse_timeline_document,
@@ -36,7 +37,7 @@ class GeminiStyleTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            "오늘의 콘텐츠: 협동 게임\n"
+            "오늘의 콘텐츠: 게임 합방\n"
             "\n"
             "00:01:02 게임 시작과 설정 조정\n"
             "검수 메모는 그대로 유지\n"
@@ -91,12 +92,14 @@ class GeminiStyleTests(unittest.TestCase):
         self.assertIn("항목을 추가·삭제·병합·분할", prompt)
         self.assertIn("line_0000 | 00:01:02", prompt)
         self.assertIn("MBTI 검사 재진행", prompt)
-        self.assertIn("처음·중간·후반의 주요 흐름", prompt)
+        self.assertIn("현재 콘텐츠 제목은 수정하거나 다시 요약하지 않습니다", prompt)
+        self.assertIn("entries만 반환", prompt)
+        self.assertNotIn("처음·중간·후반의 주요 흐름", prompt)
+        self.assertEqual(set(STYLE_SCHEMA["properties"]), {"entries"})
 
     def test_styler_rewrites_document_without_a_network_call(self):
         styler = GeminiTimelineStyler("test-key")
         payload = {
-            "content_title": "협동 게임",
             "entries": [
                 {"line_id": "line_0000", "summary": "게임 시작과 설정 조정"},
                 {"line_id": "line_0001", "summary": "장애물 구간 공략"},

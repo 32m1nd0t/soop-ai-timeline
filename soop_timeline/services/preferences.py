@@ -58,12 +58,12 @@ def estimated_live_calls(duration_seconds: float, mode: str) -> int:
     spec = live_ai_mode(mode)
     duration = max(0.0, float(duration_seconds or 0.0))
     if duration <= 0:
-        return spec.estimated_calls_per_hour + 1
+        return spec.estimated_calls_per_hour + 2
     summaries = max(
         1,
         1 + int(max(0.0, duration - spec.first_summary_seconds) // spec.interval_seconds),
     )
-    return summaries + 1
+    return summaries + 2
 
 
 def normalized_discovery_interval(value: str | int) -> int:

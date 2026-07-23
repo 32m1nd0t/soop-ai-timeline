@@ -90,6 +90,8 @@ from .version_history_dialog import TimelineVersionHistoryDialog
 
 
 class MainWindow(QMainWindow):
+    _REPLAY_LINK_RETRY_MS = (30_000, 90_000, 180_000, 300_000, 600_000, 1_200_000)
+
     def __init__(self, database: Database, parent: QWidget | None = None):
         super().__init__(parent)
         self.database = database
@@ -104,8 +106,14 @@ class MainWindow(QMainWindow):
         self._line_rewrite_jobs: dict[str, tuple[QThread, TimelineLineRewriteWorker]] = {}
         self._regroup_jobs: dict[str, tuple[QThread, TimelineRegroupWorker]] = {}
         self._manual_link_job: tuple[QThread, ManualLinkWorker] | None = None
+        self._transcript_windows: dict[str, TranscriptViewerDialog] = {}
         self._analysis_queue: list[str] = self.database.recover_analysis_queue()
         self._close_after_analysis = False
+        self._loading_more_vods = False
+        self._linked_replay_count = 0
+        self._replay_link_attempts: dict[str, int] = {}
+        self._replay_link_scheduled: set[str] = set()
+        self._replay_link_inflight: set[str] = set()
         self._update_reply: QNetworkReply | None = None
         self._update_check_silent = True
         self._stale_live_sessions = self.database.recover_stale_live_sessions()
@@ -174,6 +182,8 @@ class MainWindow(QMainWindow):
                     "복구 대상으로 표시했습니다. 저장 자막 다시 정리를 사용할 수 있습니다."
                 ),
             )
+        for live_vod_id in self.database.list_recent_unlinked_live_sessions():
+            self._schedule_replay_link_check(live_vod_id, initial=True)
 
     def _show_first_run_privacy_notice(self) -> None:
         message = QMessageBox(self)
@@ -352,6 +362,9 @@ class MainWindow(QMainWindow):
 
         self.streamer_list = QListWidget()
         self.streamer_list.setAlternatingRowColors(True)
+        self.streamer_list.currentItemChanged.connect(
+            self._select_streamer_tab_from_list
+        )
         layout.addWidget(self.streamer_list, 1)
 
         self.channel_input = QLineEdit()
@@ -396,19 +409,49 @@ class MainWindow(QMainWindow):
         self.filter_combo.addItem("작업 대상", "work")
         self.filter_combo.addItem("신규만", "new")
         self.filter_combo.addItem("전체", "all")
+        self.filter_combo.addItem("숨긴 영상", "hidden")
         self.filter_combo.currentIndexChanged.connect(self.load_vods)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("최신 영상순", "newest")
+        self.sort_combo.addItem("오래된 영상순", "oldest")
+        self.sort_combo.addItem("최근 작업순", "recent_work")
+        self.sort_combo.addItem("상태순", "status")
+        self.sort_combo.currentIndexChanged.connect(self.load_vods)
+        self.load_more_button = QPushButton("과거 영상 30개 더 불러오기")
+        self.load_more_button.clicked.connect(self.load_more_vods)
         clear_button = QPushButton("선택 해제")
         clear_button.clicked.connect(self.clear_checks)
         controls.addWidget(title)
         controls.addWidget(self.vod_count_label)
         controls.addStretch(1)
+        controls.addWidget(self.sort_combo)
         controls.addWidget(self.filter_combo)
+        controls.addWidget(self.load_more_button)
         controls.addWidget(clear_button)
         layout.addLayout(controls)
 
-        self.vod_table = QTableWidget(0, 7)
+        self.streamer_tabs = QTabBar()
+        self.streamer_tabs.setExpanding(False)
+        self.streamer_tabs.setUsesScrollButtons(True)
+        self.streamer_tabs.currentChanged.connect(self._on_streamer_tab_changed)
+        layout.addWidget(self.streamer_tabs)
+
+        self.vod_table = QTableWidget(0, 8)
         self.vod_table.setHorizontalHeaderLabels(
-            ["선택", "상태", "스트리머", "영상 제목", "길이", "업로드", "영상/세션 번호"]
+            [
+                "선택",
+                "상태",
+                "스트리머",
+                "영상 제목",
+                "메모",
+                "길이",
+                "업로드",
+                "영상/세션 번호",
+            ]
+        )
+        self.vod_table.setToolTip(
+            "더블클릭하면 타임라인 작업 탭을 엽니다. "
+            "오른쪽 클릭하면 SOOP 열기와 목록 숨기기를 사용할 수 있습니다."
         )
         self.vod_table.setAlternatingRowColors(True)
         self.vod_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -423,13 +466,17 @@ class MainWindow(QMainWindow):
         header = self.vod_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         self.vod_table.setColumnWidth(0, 54)
+        self.vod_table.setColumnWidth(4, 220)
         layout.addWidget(self.vod_table, 1)
         return panel
 
     def load_streamers(self) -> None:
+        selected_streamer_id = self._current_streamer_id()
         self.streamer_list.clear()
-        for streamer in self.database.list_streamers(enabled_only=True):
+        streamers = self.database.list_streamers()
+        for streamer in (item for item in streamers if item.enabled):
             text = f"{streamer.display_name}\n@{streamer.channel_id}"
             if streamer.last_error:
                 text += "  ·  확인 오류"
@@ -443,8 +490,33 @@ class MainWindow(QMainWindow):
             item.setToolTip("\n\n".join(tooltip_parts))
             self.streamer_list.addItem(item)
 
+        self.streamer_tabs.blockSignals(True)
+        while self.streamer_tabs.count():
+            self.streamer_tabs.removeTab(0)
+        for streamer in streamers:
+            index = self.streamer_tabs.addTab(streamer.display_name)
+            self.streamer_tabs.setTabData(index, streamer.id)
+            self.streamer_tabs.setTabToolTip(index, f"@{streamer.channel_id}")
+        if self.streamer_tabs.count() == 0:
+            index = self.streamer_tabs.addTab("등록된 스트리머 없음")
+            self.streamer_tabs.setTabData(index, None)
+            self.streamer_tabs.setTabEnabled(index, False)
+        else:
+            target = next(
+                (
+                    index
+                    for index in range(self.streamer_tabs.count())
+                    if self.streamer_tabs.tabData(index) == selected_streamer_id
+                ),
+                0,
+            )
+            self.streamer_tabs.setCurrentIndex(target)
+        self.streamer_tabs.blockSignals(False)
+        self._update_load_more_button()
+
     def load_vods(self) -> None:
         mode = self.filter_combo.currentData() if hasattr(self, "filter_combo") else "work"
+        hidden = mode == "hidden"
         if mode == "new":
             states = [VodState.NEW.value]
         elif mode == "work":
@@ -460,7 +532,14 @@ class MainWindow(QMainWindow):
         else:
             states = None
 
-        vods = self.database.list_vods(states=states)
+        streamer_id = self._current_streamer_id()
+        sort = self.sort_combo.currentData() if hasattr(self, "sort_combo") else "newest"
+        vods = self.database.list_vods(
+            states=states,
+            streamer_id=streamer_id,
+            sort=str(sort),
+            hidden=hidden,
+        )
         self.vod_table.setRowCount(0)
         for vod in vods:
             row = self.vod_table.rowCount()
@@ -477,10 +556,13 @@ class MainWindow(QMainWindow):
             check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.vod_table.setItem(row, 0, check_item)
 
+            memo = " ".join(vod.memo.split())
+            memo_preview = memo if len(memo) <= 80 else f"{memo[:79]}…"
             values = [
                 STATE_LABELS.get(vod.state, vod.state),
                 vod.streamer_name,
                 vod.title,
+                memo_preview,
                 vod.duration_text,
                 vod.published_text,
                 vod.vod_id,
@@ -488,11 +570,92 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, vod.vod_id)
-                if column in (1, 4, 5, 6):
+                if column == 4 and memo:
+                    item.setToolTip(vod.memo)
+                if column in (1, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.vod_table.setItem(row, column, item)
 
         self.vod_count_label.setText(f"{len(vods):,}개")
+        self._update_load_more_button()
+
+    def _current_streamer_id(self) -> int | None:
+        if not hasattr(self, "streamer_tabs") or self.streamer_tabs.count() == 0:
+            return None
+        value = self.streamer_tabs.tabData(self.streamer_tabs.currentIndex())
+        return int(value) if value is not None else None
+
+    def _select_streamer_tab(self, streamer_id: int) -> None:
+        for index in range(self.streamer_tabs.count()):
+            if self.streamer_tabs.tabData(index) == streamer_id:
+                self.streamer_tabs.setCurrentIndex(index)
+                return
+
+    def _select_streamer_tab_from_list(
+        self,
+        current: QListWidgetItem | None,
+        previous: QListWidgetItem | None,
+    ) -> None:
+        del previous
+        if current is None:
+            return
+        self._select_streamer_tab(int(current.data(Qt.ItemDataRole.UserRole)))
+
+    def _on_streamer_tab_changed(self, index: int) -> None:
+        del index
+        streamer_id = self._current_streamer_id()
+        if streamer_id is not None:
+            self.streamer_list.blockSignals(True)
+            for row in range(self.streamer_list.count()):
+                item = self.streamer_list.item(row)
+                if int(item.data(Qt.ItemDataRole.UserRole)) == streamer_id:
+                    self.streamer_list.setCurrentRow(row)
+                    break
+            self.streamer_list.blockSignals(False)
+        self.load_vods()
+
+    def _update_load_more_button(self) -> None:
+        if not hasattr(self, "load_more_button"):
+            return
+        streamer_id = self._current_streamer_id()
+        streamer = self.database.get_streamer(streamer_id) if streamer_id is not None else None
+        hidden_mode = (
+            hasattr(self, "filter_combo")
+            and self.filter_combo.currentData() == "hidden"
+        )
+        enabled = bool(
+            streamer
+            and streamer.enabled
+            and not self.discovery.busy
+            and not hidden_mode
+        )
+        self.load_more_button.setEnabled(enabled)
+        self.load_more_button.setToolTip(
+            "현재 스트리머의 목록을 아래로 탐색해 과거 영상 30개를 추가합니다."
+            if enabled
+            else (
+                "숨긴 영상 보기에서는 과거 영상을 불러올 수 없습니다."
+                if hidden_mode
+                else "자동 확인 목록에 등록된 스트리머 탭에서 사용할 수 있습니다."
+            )
+        )
+
+    def load_more_vods(self) -> None:
+        if self.discovery.busy:
+            self.status_label.setText("현재 영상 확인이 끝난 뒤 과거 영상을 불러오세요.")
+            return
+        streamer_id = self._current_streamer_id()
+        streamer = self.database.get_streamer(streamer_id) if streamer_id is not None else None
+        if streamer is None or not streamer.enabled:
+            self.status_label.setText(
+                "자동 확인 스트리머 탭을 선택해야 과거 영상을 불러올 수 있습니다."
+            )
+            return
+        self._loading_more_vods = True
+        self._actual_new_count = 0
+        self._linked_replay_count = 0
+        known_ids = set(self.database.list_vod_ids_for_streamer(streamer.id))
+        self.discovery.load_more(streamer, known_ids)
 
     def add_streamer(self) -> None:
         try:
@@ -501,10 +664,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "입력 확인", str(error))
             return
 
-        self.database.add_streamer(channel_id, self.name_input.text())
+        streamer = self.database.add_streamer(channel_id, self.name_input.text())
         self.channel_input.clear()
         self.name_input.clear()
         self.load_streamers()
+        self._select_streamer_tab(streamer.id)
         self.status_label.setText(f"@{channel_id}을(를) 추가했습니다.")
         QTimer.singleShot(100, self.refresh_discovery)
 
@@ -577,7 +741,7 @@ class MainWindow(QMainWindow):
             self,
             f"{streamer.display_name} 단어 사전",
             "인명·게임명·고유명사를 한 줄에 하나씩 입력하세요.\n"
-            "예: 마이곰이\n월드 오브 워크래프트\n약칭 = 정식 표기",
+            "예: 홍길동\n월드 오브 워크래프트\n약칭 = 정식 표기",
             streamer.glossary,
         )
         if not accepted:
@@ -654,6 +818,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _manual_link_resolved(self, result: object) -> None:
         if isinstance(result, ResolvedVodLink):
+            was_new = self.database.get_vod(result.vod_id) is None
             vod = self.database.upsert_external_vod(
                 vod_id=result.vod_id,
                 channel_id=result.channel_id,
@@ -665,7 +830,16 @@ class MainWindow(QMainWindow):
                 thumbnail_url=result.thumbnail_url,
                 source_kind="manual_vod",
             )
+            links = self.database.auto_link_live_sessions(
+                vod.streamer_id,
+                [vod.vod_id],
+                new_vod_ids=[vod.vod_id] if was_new else [],
+            )
+            for live_vod_id, replay_vod_id in links:
+                self._apply_linked_replay(live_vod_id, replay_vod_id)
             self.manual_link_input.clear()
+            self.load_streamers()
+            self._select_streamer_tab(vod.streamer_id)
             self.load_vods()
             self.open_timeline(vod.vod_id)
             self.status_label.setText(
@@ -689,8 +863,11 @@ class MainWindow(QMainWindow):
                 published_text=now.strftime("%Y-%m-%d %H:%M"),
                 source_kind="live",
                 state=VodState.ANALYZING.value,
+                live_broadcast_no=result.broadcast_no,
             )
             self.manual_link_input.clear()
+            self.load_streamers()
+            self._select_streamer_tab(vod.streamer_id)
             self.load_vods()
             self.open_timeline(vod.vod_id)
             self.start_live_analysis(vod.vod_id, result)
@@ -721,7 +898,9 @@ class MainWindow(QMainWindow):
         if not streamers:
             self.status_label.setText("먼저 자동 확인할 스트리머를 추가하세요.")
             return
+        self._loading_more_vods = False
         self._actual_new_count = 0
+        self._linked_replay_count = 0
         self.discovery.refresh(streamers)
 
     def _initial_refresh(self) -> None:
@@ -732,13 +911,36 @@ class MainWindow(QMainWindow):
 
     def _on_discovery_started(self, count: int) -> None:
         self.refresh_button.setEnabled(False)
-        self.status_label.setText(f"스트리머 {count}명의 신규 영상을 확인합니다…")
+        self._update_load_more_button()
+        self.status_label.setText(
+            "선택한 스트리머의 과거 영상을 불러옵니다…"
+            if self._loading_more_vods
+            else f"스트리머 {count}명의 신규 영상을 확인합니다…"
+        )
 
     def _on_discovery_result(self, streamer_id: int, streamer_name: str, items: object) -> None:
         if streamer_name:
             self.database.update_streamer_name(streamer_id, streamer_name)
         if isinstance(items, list):
+            item_ids = [
+                str(item.get("vod_id", "") or "")
+                for item in items
+                if isinstance(item, dict)
+            ]
+            new_ids = [
+                vod_id
+                for vod_id in item_ids
+                if vod_id and self.database.get_vod(vod_id) is None
+            ]
             self._actual_new_count += self.database.upsert_discovered_vods(streamer_id, items)
+            links = self.database.auto_link_live_sessions(
+                streamer_id,
+                item_ids,
+                new_vod_ids=new_ids,
+            )
+            self._linked_replay_count += len(links)
+            for live_vod_id, replay_vod_id in links:
+                self._apply_linked_replay(live_vod_id, replay_vod_id)
         self.database.record_discovery_success(streamer_id)
 
     def _on_discovery_error(self, streamer_id: int, message: str) -> None:
@@ -751,12 +953,31 @@ class MainWindow(QMainWindow):
         self.load_vods()
         checked_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.last_checked_label.setText(f"마지막 확인: {checked_at}")
-        if error_count:
+        if self._loading_more_vods:
+            if error_count:
+                self.status_label.setText("과거 영상을 불러오지 못했습니다.")
+            elif self._actual_new_count:
+                self.status_label.setText(
+                    f"과거 영상 {self._actual_new_count}개를 추가했습니다."
+                )
+            else:
+                self.status_label.setText("더 불러올 과거 영상이 없습니다.")
+        elif error_count:
             self.status_label.setText(
                 f"신규 {self._actual_new_count}개 · 확인 오류 {error_count}명"
             )
         else:
-            self.status_label.setText(f"신규 영상 {self._actual_new_count}개를 추가했습니다.")
+            linked = (
+                f" · 종료된 라이브 {self._linked_replay_count}개 다시보기 연결"
+                if self._linked_replay_count
+                else ""
+            )
+            self.status_label.setText(
+                f"신규 영상 {self._actual_new_count}개를 추가했습니다{linked}."
+            )
+        self._loading_more_vods = False
+        self._update_load_more_button()
+        self._finish_replay_link_checks()
         if self._actual_new_count > 0 and setting_enabled(
             self.database.get_setting(NEW_VOD_NOTIFICATION_SETTING, "1")
         ):
@@ -807,11 +1028,7 @@ class MainWindow(QMainWindow):
         vod = self.database.get_vod(vod_id)
         if vod is None:
             return
-        document = self.database.get_timeline(vod_id)
-        text = document.text if document else self.analyzer.initial_document(vod)
-        if document is None:
-            self.database.save_timeline(vod_id, text, VodState.REVIEW.value)
-        self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        text = self._load_or_create_timeline_text(vod)
 
         editor = TimelineDocumentEditor(
             vod,
@@ -821,7 +1038,12 @@ class MainWindow(QMainWindow):
             self.styler.available,
             self.styler.unavailable_reason,
         )
+        if vod.linked_vod_id:
+            replay = self.database.get_vod(vod.linked_vod_id)
+            if replay is not None:
+                editor.attach_replay(replay)
         editor.document_changed.connect(self._save_timeline)
+        editor.memo_changed.connect(self._save_vod_memo)
         editor.review_completed.connect(self._mark_review_complete)
         editor.analysis_requested.connect(self.start_analysis)
         editor.analysis_cancel_requested.connect(self.cancel_analysis)
@@ -840,6 +1062,15 @@ class MainWindow(QMainWindow):
         index = self.tabs.addTab(editor, title)
         self.tabs.setTabToolTip(index, vod.title)
         self.tabs.setCurrentIndex(index)
+
+    def _load_or_create_timeline_text(self, vod: Vod) -> str:
+        document = self.database.get_timeline(vod.vod_id)
+        if document is not None:
+            return document.text
+        text = self.analyzer.initial_document(vod)
+        self.database.save_timeline(vod.vod_id, text, VodState.REVIEW.value)
+        self.database.set_vod_state(vod.vod_id, VodState.REVIEW.value)
+        return text
 
     def _refresh_editor_cache_state(self, vod_id: str) -> None:
         editor = self._editor_tabs.get(vod_id)
@@ -871,7 +1102,89 @@ class MainWindow(QMainWindow):
             )
             self._refresh_editor_cache_state(vod_id)
             return
-        TranscriptViewerDialog(vod, transcript, self).exec()
+        existing = self._transcript_windows.get(vod_id)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        window = TranscriptViewerDialog(vod, transcript)
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.finished.connect(
+            lambda _result, target=vod_id: self._transcript_windows.pop(target, None)
+        )
+        self._transcript_windows[vod_id] = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _apply_linked_replay(self, live_vod_id: str, replay_vod_id: str) -> None:
+        replay = self.database.get_vod(replay_vod_id)
+        if replay is None:
+            return
+        editor = self._editor_tabs.get(live_vod_id)
+        if editor is not None:
+            editor.attach_replay(replay)
+        self._replay_link_attempts.pop(live_vod_id, None)
+        self._replay_link_inflight.discard(live_vod_id)
+
+    def _schedule_replay_link_check(
+        self,
+        live_vod_id: str,
+        *,
+        initial: bool = False,
+    ) -> None:
+        vod = self.database.get_vod(live_vod_id)
+        if vod is None or vod.source_kind != "live" or vod.linked_vod_id:
+            if vod is not None and vod.linked_vod_id:
+                self._apply_linked_replay(live_vod_id, vod.linked_vod_id)
+            return
+        if live_vod_id in self._replay_link_scheduled:
+            return
+        attempt = self._replay_link_attempts.get(live_vod_id, 0)
+        if attempt >= len(self._REPLAY_LINK_RETRY_MS):
+            return
+        delay = 5_000 if initial else self._REPLAY_LINK_RETRY_MS[attempt]
+        self._replay_link_scheduled.add(live_vod_id)
+        QTimer.singleShot(
+            delay,
+            lambda target=live_vod_id: self._check_replay_link(target),
+        )
+
+    def _check_replay_link(self, live_vod_id: str) -> None:
+        self._replay_link_scheduled.discard(live_vod_id)
+        vod = self.database.get_vod(live_vod_id)
+        if vod is None or vod.source_kind != "live":
+            return
+        if vod.linked_vod_id:
+            self._apply_linked_replay(live_vod_id, vod.linked_vod_id)
+            return
+        if self.discovery.busy:
+            self._schedule_replay_link_check(live_vod_id)
+            return
+        streamer = self.database.get_streamer(vod.streamer_id)
+        if streamer is None:
+            return
+        self._replay_link_attempts[live_vod_id] = (
+            self._replay_link_attempts.get(live_vod_id, 0) + 1
+        )
+        self._replay_link_inflight.add(live_vod_id)
+        self._loading_more_vods = False
+        self._actual_new_count = 0
+        self._linked_replay_count = 0
+        self.discovery.refresh([streamer], include_disabled=True)
+
+    def _finish_replay_link_checks(self) -> None:
+        pending = list(self._replay_link_inflight)
+        self._replay_link_inflight.clear()
+        for live_vod_id in pending:
+            vod = self.database.get_vod(live_vod_id)
+            if vod is None:
+                continue
+            if vod.linked_vod_id:
+                self._apply_linked_replay(live_vod_id, vod.linked_vod_id)
+            else:
+                self._schedule_replay_link_check(live_vod_id)
 
     @Slot(str)
     def delete_vod_cache(self, vod_id: str) -> None:
@@ -950,13 +1263,37 @@ class MainWindow(QMainWindow):
         vod = self.database.get_vod(vod_id)
         existing = self.database.get_timeline(vod_id)
         changed = existing is None or existing.text != text
-        preserve_states = {VodState.READY.value, VodState.COPIED.value}
+        preserve_states = {
+            VodState.READY.value,
+            VodState.COPIED.value,
+            VodState.PUBLISHED.value,
+            VodState.SKIPPED.value,
+        }
         if vod is not None and not changed and vod.state in preserve_states:
             self.database.save_timeline(vod_id, text, vod.state)
             return
         self.database.save_timeline(vod_id, text, VodState.REVIEW.value)
         if vod and vod.state != VodState.REVIEW.value:
             self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+
+    @Slot(str, str)
+    def _save_vod_memo(self, vod_id: str, memo: str) -> None:
+        self.database.update_vod_memo(vod_id, memo)
+        preview = " ".join(memo.split())
+        if len(preview) > 80:
+            preview = f"{preview[:79]}…"
+        for row in range(self.vod_table.rowCount()):
+            id_item = self.vod_table.item(row, 0)
+            if (
+                id_item is None
+                or str(id_item.data(Qt.ItemDataRole.UserRole)) != vod_id
+            ):
+                continue
+            memo_item = self.vod_table.item(row, 4)
+            if memo_item is not None:
+                memo_item.setText(preview)
+                memo_item.setToolTip(memo)
+            break
 
     @Slot(str, str, str)
     def _snapshot_timeline(self, vod_id: str, reason: str, text: str) -> None:
@@ -1428,6 +1765,7 @@ class MainWindow(QMainWindow):
         )
         self._refresh_editor_cache_state(vod_id)
         self.load_vods()
+        self._schedule_replay_link_check(vod_id)
 
     @Slot(str, str)
     def _live_failed(self, vod_id: str, message: str) -> None:
@@ -1444,6 +1782,7 @@ class MainWindow(QMainWindow):
         self._refresh_editor_cache_state(vod_id)
         self.status_label.setText("라이브 실시간 분석에 실패했습니다.")
         self.load_vods()
+        self._schedule_replay_link_check(vod_id)
         QMessageBox.critical(self, "라이브 분석 실패", message)
 
     @Slot(str)
@@ -1906,12 +2245,55 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(
             lambda _=False, vid=vod_id: self.open_timeline(vid)
         )
+        source_action = menu.addAction("SOOP에서 열기")
+        source_action.triggered.connect(
+            lambda _=False, url=vod.url: QDesktopServices.openUrl(QUrl(url))
+        )
         if self._vod_active_job(vod_id):
             cancel_action = menu.addAction("AI 작업 취소")
             cancel_action.triggered.connect(
                 lambda _=False, vid=vod_id: self._cancel_or_dequeue(vid)
             )
+        menu.addSeparator()
+        visibility_action = menu.addAction(
+            "목록에 다시 표시" if vod.hidden else "다시보기 목록에서 숨기기"
+        )
+        visibility_action.setEnabled(not self._vod_active_job(vod_id))
+        visibility_action.triggered.connect(
+            lambda _=False, vid=vod_id, hidden=not vod.hidden: self._set_vod_hidden(
+                vid,
+                hidden,
+            )
+        )
         menu.exec(self.vod_table.viewport().mapToGlobal(pos))
+
+    def _set_vod_hidden(self, vod_id: str, hidden: bool) -> None:
+        if self._vod_active_job(vod_id):
+            QMessageBox.information(
+                self,
+                "작업 진행 중",
+                "진행 중인 AI 작업을 마친 뒤 목록에서 숨길 수 있습니다.",
+            )
+            return
+        if hidden:
+            answer = QMessageBox.question(
+                self,
+                "다시보기 목록에서 숨기기",
+                "이 영상을 목록에서 숨길까요?\n\n"
+                "타임라인, 메모, 저장 자막은 삭제되지 않으며 "
+                "‘숨긴 영상’ 필터에서 언제든 다시 표시할 수 있습니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.database.set_vod_hidden(vod_id, hidden)
+        self.load_vods()
+        self.status_label.setText(
+            "다시보기 목록에서 숨겼습니다."
+            if hidden
+            else "숨긴 영상을 목록에 다시 표시했습니다."
+        )
 
     def _cancel_or_dequeue(self, vod_id: str) -> None:
         if vod_id in self._analysis_jobs or vod_id in self._live_jobs:
@@ -1941,9 +2323,7 @@ class MainWindow(QMainWindow):
         item = self.vod_table.item(row, 0)
         if item is None:
             return
-        vod = self.database.get_vod(str(item.data(Qt.ItemDataRole.UserRole)))
-        if vod:
-            QDesktopServices.openUrl(QUrl(vod.url))
+        self.open_timeline(str(item.data(Qt.ItemDataRole.UserRole)))
 
     def _close_tab(self, index: int) -> None:
         if index == 0:
@@ -1964,13 +2344,21 @@ class MainWindow(QMainWindow):
                     "AI 작업을 취소하거나 완료한 뒤 탭을 닫으세요.",
                 )
                 return
+            widget.flush_memo_save()
             self._save_timeline(widget.vod.vod_id, widget.text())
             self._editor_tabs.pop(widget.vod.vod_id, None)
+            widget.close_review_player()
         self.tabs.removeTab(index)
         widget.deleteLater()
 
+    def _flush_editor_memos(self) -> None:
+        for editor in self._editor_tabs.values():
+            editor.flush_memo_save()
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._flush_editor_memos()
         if not self._active_jobs():
+            self._close_auxiliary_windows()
             event.accept()
             return
         answer = QMessageBox.question(
@@ -2003,8 +2391,16 @@ class MainWindow(QMainWindow):
         if self._active_jobs():
             self.status_label.setText("AI 작업 취소 후 프로그램을 종료합니다…")
             event.ignore()
-        else:
-            event.accept()
+            return
+        self._close_auxiliary_windows()
+        event.accept()
+
+    def _close_auxiliary_windows(self) -> None:
+        for editor in list(self._editor_tabs.values()):
+            editor.close_review_player()
+        for window in list(self._transcript_windows.values()):
+            window.close()
+        self._transcript_windows.clear()
 
     def _active_jobs(self) -> bool:
         return bool(

@@ -508,7 +508,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         progress(
             0,
             f"라이브 Gemini 모드: {live_mode.label} · "
-            f"예상 시간당 약 {live_mode.estimated_calls_per_hour}회 + 종료 시 최종 1회",
+            f"예상 시간당 약 {live_mode.estimated_calls_per_hour}회 + "
+            "종료 시 타임라인 정리·전체 제목 각 1회",
         )
         candidates: list[TimelineEntry] = []
         titles: list[str] = []

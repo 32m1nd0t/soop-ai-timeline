@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QDesktopServices,
+    QCloseEvent,
     QFocusEvent,
     QKeySequence,
     QMouseEvent,
@@ -173,6 +174,7 @@ class TimelineBlockWidget(QFrame):
 
 class TimelineDocumentEditor(QWidget):
     document_changed = Signal(str, str)
+    memo_changed = Signal(str, str)
     review_completed = Signal(str)
     analysis_requested = Signal(str)
     analysis_cancel_requested = Signal(str)
@@ -203,12 +205,14 @@ class TimelineDocumentEditor(QWidget):
         self._analyzer_available = analyzer_available
         self._style_available = style_available
         self._is_live = vod.source_kind == "live"
+        self._review_vod: Vod | None = None if self._is_live else vod
         self._search_matches: list[tuple[int, int]] = []
         self._search_index = -1
         self._find_replace_undo_text: str | None = None
         self._last_ai_usage = ""
         self._live_preview_chars = 0
         self._last_committed_text = text
+        self._last_saved_memo = vod.memo
         self._manual_snapshot_taken = False
         self._cached_transcript_available = False
         self._cache_present = False
@@ -221,6 +225,11 @@ class TimelineDocumentEditor(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(500)
         self._save_timer.timeout.connect(self._emit_document_changed)
+
+        self._memo_save_timer = QTimer(self)
+        self._memo_save_timer.setSingleShot(True)
+        self._memo_save_timer.setInterval(500)
+        self._memo_save_timer.timeout.connect(self._emit_memo_changed)
 
         self._rebalance_timer = QTimer(self)
         self._rebalance_timer.setSingleShot(True)
@@ -245,18 +254,16 @@ class TimelineDocumentEditor(QWidget):
         title = QLabel(vod.title)
         title.setObjectName("sectionTitle")
         title.setWordWrap(True)
-        open_button = QPushButton(
+        self.open_source_button = QPushButton(
             "SOOP 라이브 열기" if self._is_live else "SOOP에서 열기"
         )
-        open_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(self.vod.url))
-        )
+        self.open_source_button.clicked.connect(self._open_source_page)
         self.player_button = QPushButton("검수 플레이어 열기")
         self.player_button.clicked.connect(self.toggle_review_player)
         self.player_button.setVisible(not self._is_live)
         title_row.addWidget(title, 1)
         title_row.addWidget(self.player_button)
-        title_row.addWidget(open_button)
+        title_row.addWidget(self.open_source_button)
 
         meta = QLabel(
             f"{vod.streamer_name}  ·  {vod.published_text or '업로드 시각 미확인'}"
@@ -265,6 +272,24 @@ class TimelineDocumentEditor(QWidget):
         meta.setObjectName("muted")
         card_layout.addLayout(title_row)
         card_layout.addWidget(meta)
+
+        memo_header = QHBoxLayout()
+        memo_label = QLabel("메모")
+        memo_label.setObjectName("muted")
+        memo_help = QLabel("이 영상에만 저장되며 타임라인 댓글에는 포함되지 않습니다.")
+        memo_help.setObjectName("muted")
+        memo_header.addWidget(memo_label)
+        memo_header.addStretch(1)
+        memo_header.addWidget(memo_help)
+        self.memo_editor = QPlainTextEdit(vod.memo)
+        self.memo_editor.setPlaceholderText(
+            "검수할 부분, 확인할 내용 등 자유롭게 메모하세요."
+        )
+        self.memo_editor.setMaximumHeight(82)
+        self.memo_editor.setTabChangesFocus(True)
+        self.memo_editor.textChanged.connect(self._queue_memo_save)
+        card_layout.addLayout(memo_header)
+        card_layout.addWidget(self.memo_editor)
         root.addWidget(card)
 
         self.notice = QLabel()
@@ -529,19 +554,12 @@ class TimelineDocumentEditor(QWidget):
         self.review_player.status_changed.connect(self._set_player_status)
         self.review_player.current_time_ready.connect(self._insert_timestamp)
 
-        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.setChildrenCollapsible(False)
-        self.content_splitter.addWidget(self.scroll)
-        self.content_splitter.addWidget(self.review_player)
-        self.content_splitter.setStretchFactor(0, 1)
-        self.content_splitter.setStretchFactor(1, 0)
-
         # 실시간 미리보기가 위에 세로로 쌓이면서 아래 댓글 블록이 잘리던 문제를 피하려고
         # 미리보기(좌)와 댓글 블록(우)을 가로로 나란히 배치한다. 미리보기가 숨겨지면
         # 좌측 칸이 접혀 댓글 블록이 전체 폭을 차지하므로 평소 편집 화면은 그대로다.
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.body_splitter.addWidget(self.preview_card)
-        self.body_splitter.addWidget(self.content_splitter)
+        self.body_splitter.addWidget(self.scroll)
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
         root.addWidget(self.body_splitter, 1)
@@ -860,9 +878,7 @@ class TimelineDocumentEditor(QWidget):
         self.cache_delete_button.setEnabled(not running and self._cache_present)
         self.work_reset_button.setEnabled(not running)
         if running:
-            self.status_label.setText(
-                "Gemini가 타임스탬프를 유지하며 문체만 건조하게 교정합니다…"
-            )
+            self.status_label.setText("AI 문체를 교정합니다…")
 
     def apply_analysis_result(self, text: str) -> None:
         self.set_text(text)
@@ -911,6 +927,23 @@ class TimelineDocumentEditor(QWidget):
 
     def text(self) -> str:
         return "".join(block.text() for block in self._blocks)
+
+    def memo_text(self) -> str:
+        return self.memo_editor.toPlainText()
+
+    def flush_memo_save(self) -> None:
+        self._memo_save_timer.stop()
+        self._emit_memo_changed()
+
+    def _queue_memo_save(self) -> None:
+        self._memo_save_timer.start()
+
+    def _emit_memo_changed(self) -> None:
+        memo = self.memo_text()
+        if memo == self._last_saved_memo:
+            return
+        self.memo_changed.emit(self.vod.vod_id, memo)
+        self._last_saved_memo = memo
 
     def blocks(self) -> list[str]:
         return [block.text() for block in self._blocks]
@@ -1263,7 +1296,7 @@ class TimelineDocumentEditor(QWidget):
             self.status_label.setText("타임라인 검사를 통과했습니다.")
 
     def insert_current_timestamp(self) -> None:
-        if self._is_live:
+        if not self._review_vod_available():
             self.status_label.setText("라이브는 현재 위치 삽입을 지원하지 않습니다.")
             return
         self._show_review_player()
@@ -1318,11 +1351,11 @@ class TimelineDocumentEditor(QWidget):
             consumed += len(block.text())
 
     def review_player_toggle_playback(self) -> None:
-        if not self._is_live and self.review_player.isVisible():
+        if self._review_vod_available() and self.review_player.isVisible():
             self.review_player.toggle_playback()
 
     def review_player_seek_relative(self, seconds: int) -> None:
-        if not self._is_live and self.review_player.isVisible():
+        if self._review_vod_available() and self.review_player.isVisible():
             self.review_player.seek_relative(seconds)
 
     def set_regroup_running(self, running: bool) -> None:
@@ -1357,8 +1390,10 @@ class TimelineDocumentEditor(QWidget):
         self.status_label.setText(f"주제 다시 묶기 완료 · 내용을 검수하세요{suffix}.")
 
     def toggle_review_player(self) -> None:
-        if self._is_live:
-            QDesktopServices.openUrl(QUrl(self.vod.url))
+        if not self._review_vod_available():
+            self.status_label.setText(
+                "방송 종료 후 다시보기가 연결되면 검수 플레이어를 사용할 수 있습니다."
+            )
             return
         if self.review_player.isVisible():
             self.review_player.close_player()
@@ -1367,7 +1402,7 @@ class TimelineDocumentEditor(QWidget):
         self.review_player.open_player()
 
     def seek_to_timestamp(self, seconds: int) -> None:
-        if self._is_live:
+        if not self._review_vod_available():
             del seconds
             self.status_label.setText(
                 "라이브 세션의 타임스탬프는 방송 경과시간 기준이며 내부 검수 이동은 지원하지 않습니다."
@@ -1377,19 +1412,38 @@ class TimelineDocumentEditor(QWidget):
         self.review_player.seek_to(seconds)
 
     def _show_review_player(self) -> None:
-        was_hidden = not self.review_player.isVisible()
-        self.review_player.setVisible(True)
         self.player_button.setText("검수 플레이어 닫기")
-        if was_hidden:
-            total_width = max(900, self.content_splitter.width())
-            player_width = min(520, max(400, total_width * 2 // 5))
-            self.content_splitter.setSizes(
-                [max(420, total_width - player_width), player_width]
-            )
+
+    def _review_vod_available(self) -> bool:
+        return self._review_vod is not None
+
+    def attach_replay(self, replay: Vod) -> None:
+        self._review_vod = replay
+        self.review_player.set_vod(replay)
+        self.player_button.setVisible(True)
+        self.insert_time_button.setVisible(True)
+        self.open_source_button.setText("SOOP 다시보기 열기")
+        self.notice.setText(
+            "종료된 라이브의 다시보기를 자동으로 연결했습니다. "
+            "라이브 중 만든 타임라인은 그대로 유지되며 검수 플레이어로 전체 방송을 확인할 수 있습니다."
+        )
+        self.status_label.setText("종료된 라이브에 다시보기를 자동 연결했습니다.")
+
+    def _open_source_page(self) -> None:
+        target = self._review_vod or self.vod
+        QDesktopServices.openUrl(QUrl(target.url))
+
+    def close_review_player(self) -> None:
+        self.review_player.close_player()
 
     def _on_review_player_closed(self) -> None:
         self.player_button.setText("검수 플레이어 열기")
         self.status_label.setText("SOOP 검수 플레이어를 닫았습니다.")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.flush_memo_save()
+        self.close_review_player()
+        event.accept()
 
     def _on_seek_completed(self, seconds: int) -> None:
         del seconds

@@ -1,6 +1,9 @@
 import unittest
 
-from soop_timeline.services.discovery import classify_discovery_result
+from soop_timeline.services.discovery import (
+    additional_vod_items,
+    classify_discovery_result,
+)
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -36,6 +39,21 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "error")
         self.assertIn("차단", decision.message)
+
+    def test_more_loading_skips_known_vods_and_keeps_page_order(self):
+        items = [
+            {"vod_id": "5"},
+            {"vod_id": "4"},
+            {"vod_id": "3"},
+            {"vod_id": "2"},
+        ]
+        self.assertEqual(
+            [
+                item["vod_id"]
+                for item in additional_vod_items(items, {"5", "4"}, limit=2)
+            ],
+            ["3", "2"],
+        )
 
 
 if __name__ == "__main__":

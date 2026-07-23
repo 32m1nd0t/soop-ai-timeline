@@ -321,14 +321,15 @@ def strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
 
 
 def estimate_timeline_calls(duration_seconds: float) -> int:
-    # 45-minute windows overlap by two minutes, followed by one final pass.
+    # 45-minute windows overlap by two minutes, followed by one final timeline
+    # pass and one separate whole-broadcast title summary.
     duration = max(0.0, float(duration_seconds or 0.0))
     if duration <= 0:
-        return 2
+        return 3
     window = 45 * 60
     advance = window - 2 * 60
     windows = 1 if duration <= window else 1 + int((duration - window + advance - 1) // advance)
-    return windows + 1
+    return windows + 2
 
 
 def _parse_json_text(text: str, provider_name: str) -> dict[str, object]:

@@ -7,7 +7,7 @@ from soop_timeline.ui.main_window import MainWindow
 
 class _TimelineDatabase:
     def __init__(self, *, state: str, text: str):
-        self.vod = SimpleNamespace(state=state)
+        self.vod = SimpleNamespace(vod_id="vod-1", state=state)
         self.timeline = SimpleNamespace(text=text)
         self.saved: list[tuple[str, str, str]] = []
         self.state_changes: list[tuple[str, str]] = []
@@ -28,6 +28,19 @@ class _TimelineDatabase:
 
 
 class MainWindowStateLogicTests(unittest.TestCase):
+    def test_opening_existing_completed_timeline_does_not_change_state(self):
+        database = _TimelineDatabase(state=VodState.READY.value, text="완료된 내용")
+        window = SimpleNamespace(
+            database=database,
+            analyzer=SimpleNamespace(initial_document=lambda vod: "새 문서"),
+        )
+
+        text = MainWindow._load_or_create_timeline_text(window, database.vod)
+
+        self.assertEqual(text, "완료된 내용")
+        self.assertEqual(database.saved, [])
+        self.assertEqual(database.state_changes, [])
+
     def test_unchanged_ready_timeline_stays_ready_when_editor_closes(self):
         database = _TimelineDatabase(state=VodState.READY.value, text="same")
         window = SimpleNamespace(_live_jobs={}, database=database)
@@ -54,6 +67,27 @@ class MainWindowStateLogicTests(unittest.TestCase):
             database.state_changes,
             [("vod-1", VodState.REVIEW.value)],
         )
+
+    def test_double_click_opens_timeline_tab(self):
+        class Item:
+            @staticmethod
+            def data(role):
+                del role
+                return "vod-77"
+
+        opened: list[str] = []
+        window = SimpleNamespace(
+            vod_table=SimpleNamespace(
+                item=lambda row, column: Item()
+                if (row, column) == (3, 0)
+                else None
+            ),
+            open_timeline=opened.append,
+        )
+
+        MainWindow.open_vod_from_row(window, 3, 4)
+
+        self.assertEqual(opened, ["vod-77"])
 
     def test_recovered_queue_item_is_not_removed_before_start_attempt(self):
         calls: list[tuple[str, bool, list[str]]] = []

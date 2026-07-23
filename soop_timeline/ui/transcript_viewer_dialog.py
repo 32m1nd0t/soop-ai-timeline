@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -36,6 +37,8 @@ class TranscriptViewerDialog(QDialog):
         self.transcript = transcript
         self._text = transcript_to_text(transcript)
         self.setWindowTitle("저장된 Whisper 자막")
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setModal(False)
         self.resize(900, 680)
 
         root = QVBoxLayout(self)

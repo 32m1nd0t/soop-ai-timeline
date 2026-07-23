@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,51 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.upsert_discovered_vods(streamer.id, [item]), 0)
         self.assertEqual(len(self.database.list_vods()), 1)
 
+    def test_existing_database_is_migrated_for_memos_and_hidden_vods(self):
+        legacy_path = Path(self.temp_dir.name) / "legacy.db"
+        connection = sqlite3.connect(legacy_path)
+        connection.executescript(
+            """
+            CREATE TABLE streamers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                added_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                last_error TEXT
+            );
+            CREATE TABLE vods (
+                vod_id TEXT PRIMARY KEY,
+                streamer_id INTEGER NOT NULL REFERENCES streamers(id),
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                duration_text TEXT NOT NULL DEFAULT '',
+                published_text TEXT NOT NULL DEFAULT '',
+                thumbnail_url TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'vod',
+                state TEXT NOT NULL DEFAULT 'new',
+                discovered_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.close()
+
+        migrated = Database(legacy_path)
+        try:
+            columns = {
+                str(row["name"])
+                for row in migrated.connection.execute(
+                    "PRAGMA table_info(vods)"
+                ).fetchall()
+            }
+        finally:
+            migrated.close()
+
+        self.assertIn("memo", columns)
+        self.assertIn("hidden", columns)
+
     def test_timeline_is_saved_and_state_is_preserved(self):
         streamer = self.database.add_streamer("sample02")
         self.database.upsert_discovered_vods(
@@ -50,6 +96,52 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNotNone(document)
         self.assertEqual(document.text, text)
         self.assertEqual(vod.state, VodState.READY.value)
+
+    def test_vod_memo_persists_without_reopening_completed_work(self):
+        streamer = self.database.add_streamer("memo-user", "메모")
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "memo-1",
+                    "title": "메모할 영상",
+                    "url": "https://vod.sooplive.com/player/memo-1",
+                }
+            ],
+        )
+        self.database.set_vod_state("memo-1", VodState.READY.value)
+
+        self.database.update_vod_memo("memo-1", "후반부 게임 구간 다시 확인")
+
+        vod = self.database.get_vod("memo-1")
+        self.assertEqual(vod.memo, "후반부 게임 구간 다시 확인")
+        self.assertEqual(vod.state, VodState.READY.value)
+
+    def test_hidden_vod_stays_hidden_after_discovery_and_can_be_restored(self):
+        streamer = self.database.add_streamer("hidden-user", "숨김")
+        item = {
+            "vod_id": "hidden-1",
+            "title": "숨길 영상",
+            "url": "https://vod.sooplive.com/player/hidden-1",
+        }
+        self.database.upsert_discovered_vods(streamer.id, [item])
+        self.database.update_vod_memo("hidden-1", "삭제하지 않을 메모")
+        self.database.set_vod_hidden("hidden-1", True)
+
+        self.assertEqual(self.database.list_vods(), [])
+        hidden = self.database.list_vods(hidden=True)
+        self.assertEqual([vod.vod_id for vod in hidden], ["hidden-1"])
+        self.assertEqual(hidden[0].memo, "삭제하지 않을 메모")
+
+        self.database.upsert_discovered_vods(streamer.id, [item])
+        self.assertEqual(self.database.list_vods(), [])
+        self.assertTrue(self.database.get_vod("hidden-1").hidden)
+
+        self.database.set_vod_hidden("hidden-1", False)
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods()],
+            ["hidden-1"],
+        )
 
     def test_settings_round_trip(self):
         self.assertEqual(self.database.get_setting("missing", "default"), "default")
@@ -153,6 +245,80 @@ class DatabaseTests(unittest.TestCase):
         )
         self.assertEqual(self.database.recover_stale_live_sessions(), [vod.vod_id])
         self.assertEqual(self.database.get_vod(vod.vod_id).state, VodState.FAILED.value)
+
+    def test_list_vods_filters_by_streamer_and_supports_sort_orders(self):
+        first = self.database.add_streamer("first-user", "첫 번째")
+        second = self.database.add_streamer("second-user", "두 번째")
+        self.database.upsert_discovered_vods(
+            first.id,
+            [
+                {
+                    "vod_id": "100",
+                    "title": "예전 영상",
+                    "url": "https://vod.sooplive.com/player/100",
+                },
+                {
+                    "vod_id": "300",
+                    "title": "최근 영상",
+                    "url": "https://vod.sooplive.com/player/300",
+                },
+            ],
+        )
+        self.database.upsert_discovered_vods(
+            second.id,
+            [
+                {
+                    "vod_id": "200",
+                    "title": "다른 스트리머",
+                    "url": "https://vod.sooplive.com/player/200",
+                }
+            ],
+        )
+
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(streamer_id=first.id)],
+            ["300", "100"],
+        )
+        self.assertEqual(
+            [
+                vod.vod_id
+                for vod in self.database.list_vods(
+                    streamer_id=first.id,
+                    sort="oldest",
+                )
+            ],
+            ["100", "300"],
+        )
+
+    def test_finished_replay_is_linked_to_matching_live_session(self):
+        streamer = self.database.add_streamer("live-link-user", "라이브 연결")
+        live = self.database.upsert_external_vod(
+            vod_id="live-900-20260723000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 여름 특집 방송",
+            url="https://play.sooplive.com/live-link-user/900",
+            source_kind="live",
+            live_broadcast_no="900",
+        )
+        item = {
+            "vod_id": "777001",
+            "title": "여름 특집 방송 다시보기",
+            "url": "https://vod.sooplive.com/player/777001",
+        }
+        self.database.upsert_discovered_vods(streamer.id, [item])
+
+        links = self.database.auto_link_live_sessions(
+            streamer.id,
+            ["777001"],
+            new_vod_ids=["777001"],
+        )
+
+        self.assertEqual(links, [(live.vod_id, "777001")])
+        self.assertEqual(
+            self.database.get_vod(live.vod_id).linked_vod_id,
+            "777001",
+        )
 
 
 if __name__ == "__main__":

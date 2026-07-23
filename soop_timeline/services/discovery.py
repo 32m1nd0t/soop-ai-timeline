@@ -58,7 +58,7 @@ JSON.stringify((() => {
       thumbnail: image ? (image.currentSrc || image.src || '') : ''
     });
 
-    if (items.length >= 30) break;
+    if (items.length >= 1000) break;
   }
 
   const title = document.title || '';
@@ -78,6 +78,23 @@ JSON.stringify((() => {
     has_vod_container: !!document.querySelector('[class*="VodList_"]')
   };
 })())
+"""
+
+LOAD_MORE_SCRIPT = r"""
+(() => {
+  const candidates = Array.from(document.querySelectorAll('button, a'));
+  const more = candidates.find(element =>
+    /^(?:더\s*보기|더보기|이전\s*영상|이전영상)$/.test(
+      (element.innerText || element.textContent || '').trim()
+    )
+  );
+  if (more) {
+    try { more.click(); } catch (_) {}
+  }
+  const root = document.scrollingElement || document.documentElement;
+  window.scrollTo({ top: root.scrollHeight, behavior: 'instant' });
+  return { clicked: Boolean(more), height: root.scrollHeight };
+})()
 """
 
 
@@ -113,6 +130,27 @@ def classify_discovery_result(
     )
 
 
+def additional_vod_items(
+    items: list[object],
+    known_vod_ids: set[str],
+    *,
+    limit: int = 30,
+) -> list[dict[str, object]]:
+    additional: list[dict[str, object]] = []
+    seen = set(known_vod_ids)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        vod_id = str(item.get("vod_id", "") or "").strip()
+        if not vod_id or vod_id in seen:
+            continue
+        seen.add(vod_id)
+        additional.append(item)
+        if len(additional) >= limit:
+            break
+    return additional
+
+
 class SoopVodDiscovery(QObject):
     started = Signal(int)
     progress = Signal(str)
@@ -135,6 +173,12 @@ class SoopVodDiscovery(QObject):
         self._new_count = 0
         self._error_count = 0
         self._busy = False
+        self._load_more_mode = False
+        self._known_vod_ids: set[str] = set()
+        self._additional_items: list[dict[str, object]] = []
+        self._additional_ids: set[str] = set()
+        self._last_anchor_count = -1
+        self._stagnant_rounds = 0
 
         self._profile = QWebEngineProfile(self)
         self._profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
@@ -148,10 +192,19 @@ class SoopVodDiscovery(QObject):
     def busy(self) -> bool:
         return self._busy
 
-    def refresh(self, streamers: list[Streamer]) -> None:
+    def refresh(
+        self,
+        streamers: list[Streamer],
+        *,
+        include_disabled: bool = False,
+    ) -> None:
         if self._busy:
             return
-        enabled = [streamer for streamer in streamers if streamer.enabled]
+        enabled = (
+            list(streamers)
+            if include_disabled
+            else [streamer for streamer in streamers if streamer.enabled]
+        )
         if not enabled:
             self.finished.emit(0, 0)
             return
@@ -159,9 +212,35 @@ class SoopVodDiscovery(QObject):
         self._queue = deque(enabled)
         self._new_count = 0
         self._error_count = 0
+        self._load_more_mode = False
+        self._known_vod_ids.clear()
+        self._reset_load_more_progress()
         self._busy = True
         self.started.emit(len(enabled))
         self._load_next()
+
+    def load_more(
+        self,
+        streamer: Streamer,
+        known_vod_ids: set[str],
+    ) -> None:
+        if self._busy:
+            return
+        self._queue = deque([streamer])
+        self._new_count = 0
+        self._error_count = 0
+        self._load_more_mode = True
+        self._known_vod_ids = {str(vod_id) for vod_id in known_vod_ids}
+        self._reset_load_more_progress()
+        self._busy = True
+        self.started.emit(1)
+        self._load_next()
+
+    def _reset_load_more_progress(self) -> None:
+        self._additional_items = []
+        self._additional_ids = set()
+        self._last_anchor_count = -1
+        self._stagnant_rounds = 0
 
     def _load_next(self) -> None:
         if not self._queue:
@@ -171,7 +250,10 @@ class SoopVodDiscovery(QObject):
             return
 
         self._current = self._queue.popleft()
-        self.progress.emit(f"{self._current.display_name} 신규 영상 확인 중…")
+        if self._load_more_mode:
+            self.progress.emit(f"{self._current.display_name} 과거 영상 불러오는 중…")
+        else:
+            self.progress.emit(f"{self._current.display_name} 신규 영상 확인 중…")
         channel = quote(self._current.channel_id, safe="")
         url = QUrl(f"https://www.sooplive.com/station/{channel}/vod/review")
         self._page.load(url)
@@ -204,6 +286,10 @@ class SoopVodDiscovery(QObject):
             self._fail_current("VOD 목록 응답 형식이 변경되었습니다.")
             return
 
+        if self._load_more_mode:
+            self._on_load_more_extracted(current, result)
+            return
+
         self._elapsed_ms += self._settle_ms
         decision = classify_discovery_result(
             result,
@@ -223,6 +309,8 @@ class SoopVodDiscovery(QObject):
             return
 
         items = result.get("items", [])
+        if isinstance(items, list):
+            items = items[:30]
 
         # Qt may return nested wrappers on some versions; JSON round-tripping
         # produces plain Python data for the database boundary.
@@ -231,6 +319,65 @@ class SoopVodDiscovery(QObject):
         self.result_ready.emit(current.id, streamer_name, clean_items)
         self._new_count += len(clean_items)
         self._current = None
+        QTimer.singleShot(200, self._load_next)
+
+    def _on_load_more_extracted(
+        self,
+        current: Streamer,
+        result: dict[str, object],
+    ) -> None:
+        if bool(result.get("blocked")):
+            self._fail_current(
+                "SOOP 페이지가 과거 영상 요청을 차단했습니다. 잠시 뒤 다시 시도하세요."
+            )
+            return
+        items = result.get("items")
+        if not isinstance(items, list):
+            self._fail_current("VOD 목록을 해석하지 못했습니다.")
+            return
+
+        clean_items = json.loads(json.dumps(items, ensure_ascii=False))
+        unseen = additional_vod_items(
+            clean_items,
+            self._known_vod_ids | self._additional_ids,
+            limit=30 - len(self._additional_items),
+        )
+        self._additional_items.extend(unseen)
+        self._additional_ids.update(str(item["vod_id"]) for item in unseen)
+        if len(self._additional_items) >= 30:
+            self._finish_load_more_current(current)
+            return
+
+        anchor_count = int(result.get("vod_anchor_count", len(items)) or len(items))
+        if unseen or anchor_count > self._last_anchor_count:
+            self._elapsed_ms = 0
+            self._stagnant_rounds = 0
+        else:
+            self._elapsed_ms += self._settle_ms
+            self._stagnant_rounds += 1
+        self._last_anchor_count = max(self._last_anchor_count, anchor_count)
+
+        if self._elapsed_ms >= self._max_wait_ms or self._stagnant_rounds >= 5:
+            self._finish_load_more_current(current)
+            return
+
+        self.progress.emit(
+            f"{current.display_name} 과거 영상 탐색 중… "
+            f"{len(self._additional_items):,}/30개"
+        )
+        self._page.runJavaScript(LOAD_MORE_SCRIPT)
+        QTimer.singleShot(self._settle_ms, self._extract_current)
+
+    def _finish_load_more_current(self, current: Streamer) -> None:
+        streamer_name = current.display_name
+        self.result_ready.emit(
+            current.id,
+            streamer_name,
+            self._additional_items[:30],
+        )
+        self._new_count += len(self._additional_items[:30])
+        self._current = None
+        self._reset_load_more_progress()
         QTimer.singleShot(200, self._load_next)
 
     def _fail_current(self, message: str) -> None:
