@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soop-timeline"
-version = "0.4.7"
+version = "0.4.8"
 description = "SOOP VOD timeline review desktop app"
 readme = "README.md"
 requires-python = ">=3.10"
