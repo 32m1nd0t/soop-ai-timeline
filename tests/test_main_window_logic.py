@@ -2,13 +2,14 @@ import unittest
 from types import SimpleNamespace
 
 from soop_timeline.models import VodState
+from soop_timeline.services.timeline_document import ensure_ai_timeline_notice
 from soop_timeline.ui.main_window import MainWindow
 
 
 class _TimelineDatabase:
     def __init__(self, *, state: str, text: str):
         self.vod = SimpleNamespace(vod_id="vod-1", state=state)
-        self.timeline = SimpleNamespace(text=text)
+        self.timeline = SimpleNamespace(text=text, status=state)
         self.saved: list[tuple[str, str, str]] = []
         self.state_changes: list[tuple[str, str]] = []
 
@@ -29,6 +30,20 @@ class _TimelineDatabase:
 
 class MainWindowStateLogicTests(unittest.TestCase):
     def test_opening_existing_completed_timeline_does_not_change_state(self):
+        existing = ensure_ai_timeline_notice("완료된 내용")
+        database = _TimelineDatabase(state=VodState.READY.value, text=existing)
+        window = SimpleNamespace(
+            database=database,
+            analyzer=SimpleNamespace(initial_document=lambda vod: "새 문서"),
+        )
+
+        text = MainWindow._load_or_create_timeline_text(window, database.vod)
+
+        self.assertEqual(text, existing)
+        self.assertEqual(database.saved, [])
+        self.assertEqual(database.state_changes, [])
+
+    def test_opening_older_timeline_adds_notice_without_reopening_review(self):
         database = _TimelineDatabase(state=VodState.READY.value, text="완료된 내용")
         window = SimpleNamespace(
             database=database,
@@ -37,8 +52,12 @@ class MainWindowStateLogicTests(unittest.TestCase):
 
         text = MainWindow._load_or_create_timeline_text(window, database.vod)
 
-        self.assertEqual(text, "완료된 내용")
-        self.assertEqual(database.saved, [])
+        expected = ensure_ai_timeline_notice("완료된 내용")
+        self.assertEqual(text, expected)
+        self.assertEqual(
+            database.saved,
+            [("vod-1", expected, VodState.READY.value)],
+        )
         self.assertEqual(database.state_changes, [])
 
     def test_unchanged_ready_timeline_stays_ready_when_editor_closes(self):

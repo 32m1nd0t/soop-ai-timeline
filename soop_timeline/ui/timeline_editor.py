@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from ..models import Vod
 from ..services.text_editing import find_literal_matches, replace_literal_all
 from ..services.timeline_blocks import COMMENT_LIMIT, block_label, split_timeline
+from ..services.timeline_document import ensure_ai_timeline_notice
 from ..services.timeline_timestamp import (
     adjust_timestamp_on_current_line,
     format_timestamp_seconds,
@@ -574,6 +575,7 @@ class TimelineDocumentEditor(QWidget):
         )
         self.set_style_availability(style_available, style_unavailable_reason)
         self.set_text(text)
+        self._last_committed_text = self.text()
 
     def _build_find_replace_bar(self) -> QFrame:
         bar = QFrame()
@@ -949,13 +951,13 @@ class TimelineDocumentEditor(QWidget):
         return [block.text() for block in self._blocks]
 
     def set_text(self, text: str) -> None:
-        self._replace_blocks(split_timeline(text))
+        self._replace_blocks(split_timeline(ensure_ai_timeline_notice(text)))
 
     def reset_work_document(self, text: str) -> None:
         self._save_timer.stop()
         self._rebalance_timer.stop()
         self.set_text(text)
-        self._last_committed_text = text
+        self._last_committed_text = self.text()
         self._manual_snapshot_taken = False
         self._find_replace_undo_text = None
         self.undo_replace_button.setEnabled(False)

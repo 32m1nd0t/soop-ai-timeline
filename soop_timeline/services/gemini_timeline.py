@@ -14,6 +14,7 @@ from .ai_provider import (
 )
 from .eta import EtaEstimator, format_eta
 from .gemini_style import DRY_TIMELINE_STYLE_GUIDE
+from .timeline_document import AI_TIMELINE_NOTICE_LINES
 from .transcription import (
     AnalysisCancelled,
     CancelCallback,
@@ -720,7 +721,12 @@ class GeneratedTimeline:
     entries: list[TimelineEntry]
 
     def to_document(self) -> str:
-        lines = [f"오늘의 콘텐츠: {self.content_title.strip()}", ""]
+        lines = [
+            *AI_TIMELINE_NOTICE_LINES,
+            "",
+            f"오늘의 콘텐츠: {self.content_title.strip()}",
+            "",
+        ]
         lines.extend(
             f"{format_timestamp(entry.start)} {text}"
             for entry in self.entries

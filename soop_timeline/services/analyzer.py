@@ -24,6 +24,7 @@ from .gemini_timeline import (
     deduplicate_entries,
 )
 from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
+from .timeline_document import initial_timeline_document
 from .transcription import (
     AnalysisCancelled,
     CancelCallback,
@@ -109,7 +110,7 @@ class ReviewDraftAnalyzer(TimelineAnalyzer):
         return False
 
     def initial_document(self, vod: Vod) -> str:
-        return f"오늘의 콘텐츠: {vod.title}\n\n"
+        return initial_timeline_document(vod.title)
 
     @property
     def unavailable_reason(self) -> str:
@@ -238,7 +239,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         self.last_usage_summary = str(summary()) if callable(summary) else ""
 
     def initial_document(self, vod: Vod) -> str:
-        return f"오늘의 콘텐츠: {vod.title}\n\n"
+        return initial_timeline_document(vod.title)
 
     def _generate_with_checkpoint(
         self,

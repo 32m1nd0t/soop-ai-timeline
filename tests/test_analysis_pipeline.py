@@ -38,6 +38,7 @@ from soop_timeline.services.gemini_timeline import (
     split_transcript,
     validate_and_snap_quotes,
 )
+from soop_timeline.services.timeline_document import AI_TIMELINE_NOTICE
 from soop_timeline.services.transcription import (
     AnalysisCancelled,
     LiveTranscriptUpdate,
@@ -345,7 +346,9 @@ class AnalysisPipelineTests(unittest.TestCase):
         ).to_document()
         self.assertEqual(
             document,
-            "오늘의 콘텐츠: 테스트 콘텐츠\n\n01:02:05 시청자와 꿈 이야기\n",
+            f"{AI_TIMELINE_NOTICE}\n\n"
+            "오늘의 콘텐츠: 테스트 콘텐츠\n\n"
+            "01:02:05 시청자와 꿈 이야기\n",
         )
 
     def test_overall_summary_covers_representative_broadcast_topics(self):
@@ -841,7 +844,8 @@ class AnalysisPipelineTests(unittest.TestCase):
 
         self.assertIn("01:00:00 방송 시작", result)
         self.assertEqual(len(recovered.segments), 2)
-        self.assertEqual(result.splitlines()[0], "오늘의 콘텐츠: 최종 라이브")
+        self.assertTrue(result.startswith(f"{AI_TIMELINE_NOTICE}\n\n"))
+        self.assertEqual(result.splitlines()[3], "오늘의 콘텐츠: 최종 라이브")
         self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))
 
     def test_live_gemini_wait_does_not_block_new_whisper_updates(self):

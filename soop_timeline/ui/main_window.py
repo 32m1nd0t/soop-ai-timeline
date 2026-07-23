@@ -72,6 +72,7 @@ from ..services.preferences import (
 )
 from ..services.transcription import format_timestamp
 from ..services.timeline_validation import parse_duration_text
+from ..services.timeline_document import ensure_ai_timeline_notice
 from ..services.update_checker import (
     automatic_update_check_enabled,
     configured_manifest_url,
@@ -1075,8 +1076,11 @@ class MainWindow(QMainWindow):
     def _load_or_create_timeline_text(self, vod: Vod) -> str:
         document = self.database.get_timeline(vod.vod_id)
         if document is not None:
-            return document.text
-        text = self.analyzer.initial_document(vod)
+            text = ensure_ai_timeline_notice(document.text)
+            if text != document.text:
+                self.database.save_timeline(vod.vod_id, text, document.status)
+            return text
+        text = ensure_ai_timeline_notice(self.analyzer.initial_document(vod))
         self.database.save_timeline(vod.vod_id, text, VodState.REVIEW.value)
         self.database.set_vod_state(vod.vod_id, VodState.REVIEW.value)
         return text
