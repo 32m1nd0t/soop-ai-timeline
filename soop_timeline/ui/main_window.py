@@ -456,6 +456,10 @@ class MainWindow(QMainWindow):
         self.vod_table.setAlternatingRowColors(True)
         self.vod_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.vod_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.vod_table.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.vod_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.vod_table.setSortingEnabled(False)
         self.vod_table.verticalHeader().setVisible(False)
         self.vod_table.verticalHeader().setDefaultSectionSize(43)
@@ -464,11 +468,14 @@ class MainWindow(QMainWindow):
         self.vod_table.customContextMenuRequested.connect(self._show_vod_context_menu)
 
         header = self.vod_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.vod_table.setColumnWidth(0, 54)
-        self.vod_table.setColumnWidth(4, 220)
+        # ResizeToContents lets one unusually long value consume the viewport and
+        # can squeeze the title header down to only a few pixels. Keep predictable
+        # user-resizable widths instead; narrow windows use horizontal scrolling.
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setStretchLastSection(False)
+        for column, width in enumerate((48, 76, 96, 235, 130, 70, 145, 115)):
+            self.vod_table.setColumnWidth(column, width)
         layout.addWidget(self.vod_table, 1)
         return panel
 
@@ -572,6 +579,8 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, vod.vod_id)
                 if column == 4 and memo:
                     item.setToolTip(vod.memo)
+                elif column in (3, 6) and value:
+                    item.setToolTip(value)
                 if column in (1, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.vod_table.setItem(row, column, item)
