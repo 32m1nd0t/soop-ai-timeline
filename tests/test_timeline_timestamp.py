@@ -10,8 +10,11 @@ from soop_timeline.services.timeline_timestamp import (
     timestamp_at_position,
 )
 from soop_timeline.ui.review_player import (
+    ResilientQtWebView2Widget,
     SoopReviewPlayer,
     build_close_script,
+    build_exit_fullscreen_script,
+    build_fullscreen_escape_guard_script,
     build_player_action_script,
     build_player_url,
     build_seek_script,
@@ -293,6 +296,44 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("querySelectorAll('video')", script)
         self.assertIn("video.pause()", script)
         self.assertIn("video.muted = true", script)
+
+    def test_close_button_hides_reusable_player_instead_of_disposing_it(self):
+        calls = []
+
+        class CloseEvent:
+            def ignore(self):
+                calls.append("ignored")
+
+        player = SimpleNamespace(close_player=lambda: calls.append("hidden"))
+        SoopReviewPlayer.closeEvent(player, CloseEvent())
+        self.assertEqual(calls, ["ignored", "hidden"])
+
+    def test_disposed_native_webview_is_reported_as_unhealthy(self):
+        player = SimpleNamespace(
+            is_ready=True,
+            _webview=SimpleNamespace(IsDisposed=True),
+            _webview_hwnd=123,
+        )
+        self.assertFalse(
+            ResilientQtWebView2Widget.native_control_healthy(player)
+        )
+
+    def test_lazy_webview_is_healthy_before_native_control_exists(self):
+        player = SimpleNamespace(
+            is_ready=False,
+            _webview=None,
+            _webview_hwnd=None,
+        )
+        self.assertTrue(
+            ResilientQtWebView2Widget.native_control_healthy(player)
+        )
+
+    def test_fullscreen_helpers_restore_both_page_and_player_window(self):
+        exit_script = build_exit_fullscreen_script()
+        guard_script = build_fullscreen_escape_guard_script()
+        self.assertIn("document.exitFullscreen()", exit_script)
+        self.assertIn("event.key !== 'Escape'", guard_script)
+        self.assertIn("api.exitFullscreen()", guard_script)
 
 
 if __name__ == "__main__":

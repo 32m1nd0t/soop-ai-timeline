@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import QTimer, Qt, QUrl, QUrlQuery, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -11,11 +13,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from qtwebview2 import QtWebView2Widget
+import win32con
+import win32gui
 
 from ..models import Vod
 from ..paths import app_data_dir
 from ..services.timeline_timestamp import format_timestamp_seconds
 from ..services.timeline_validation import parse_duration_text
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_player_url(vod_id: str) -> QUrl:
@@ -462,6 +469,30 @@ for (const video of videos) {
     } catch (_) {}
 }
 return { ok: true, count: videos.length };
+    """.strip()
+
+
+def build_exit_fullscreen_script() -> str:
+    return """
+if (document.fullscreenElement && document.exitFullscreen) {
+    try { await document.exitFullscreen(); } catch (_) {}
+}
+return { ok: true };
+""".strip()
+
+
+def build_fullscreen_escape_guard_script() -> str:
+    return """
+if (!window.__soopTimelineFullscreenGuard) {
+    window.__soopTimelineFullscreenGuard = true;
+    window.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') { return; }
+        try {
+            window.qtwebview2.api.exitFullscreen();
+        } catch (_) {}
+    }, true);
+}
+return { ok: true };
 """.strip()
 
 
@@ -545,7 +576,134 @@ return {{
     currentTime: reportedCurrent,
     paused: Boolean(video.paused)
 }};
-""").strip()
+    """).strip()
+
+
+class ResilientQtWebView2Widget(QtWebView2Widget):
+    """Guards qtwebview2 0.4.1 against stale or already-disposed HWNDs."""
+
+    native_control_failed = Signal(str)
+
+    def __init__(self, *args, **kwargs):
+        self._native_failure_reported = False
+        super().__init__(*args, **kwargs)
+
+    def native_control_healthy(self) -> bool:
+        webview = getattr(self, "_webview", None)
+        if webview is not None:
+            try:
+                if bool(webview.IsDisposed):
+                    return False
+            except Exception:
+                return False
+        if not self.is_ready:
+            return True
+        if webview is None:
+            return False
+        hwnd = getattr(self, "_webview_hwnd", None)
+        if not hwnd:
+            return False
+        try:
+            return bool(win32gui.IsWindow(int(hwnd)))
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def repair_native_parent(self) -> bool:
+        if not self.is_ready:
+            return True
+        if not self.native_control_healthy():
+            self._report_native_failure("WebView2 창 핸들이 유효하지 않습니다.")
+            return False
+        try:
+            hwnd = int(self._webview_hwnd)
+            target = int(self.winId())
+            win32gui.SetParent(hwnd, target)
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            style = (
+                (style | win32con.WS_CHILD)
+                & ~win32con.WS_POPUP
+                & ~win32con.WS_BORDER
+            )
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            self._resize_webview()
+            return self.native_control_healthy()
+        except Exception as error:
+            self._report_native_failure(f"WebView2 창 연결 복구 실패: {error}")
+            return False
+
+    def _report_native_failure(self, message: str) -> None:
+        if self._native_failure_reported:
+            return
+        self._native_failure_reported = True
+        logger.warning(message)
+        self.native_control_failed.emit(message)
+
+    def _resize_webview(self) -> None:
+        if not self.is_ready:
+            return
+        if not self.native_control_healthy():
+            self._report_native_failure("WebView2 크기 변경 중 창 핸들이 끊어졌습니다.")
+            return
+        try:
+            super()._resize_webview()
+        except Exception as error:
+            self._report_native_failure(f"WebView2 크기 변경 실패: {error}")
+
+    def showEvent(self, event) -> None:
+        try:
+            super().showEvent(event)
+        except Exception as error:
+            self._report_native_failure(f"WebView2 표시 실패: {error}")
+
+    def hideEvent(self, event) -> None:
+        try:
+            super().hideEvent(event)
+        except Exception as error:
+            self._report_native_failure(f"WebView2 숨기기 실패: {error}")
+            QWidget.hideEvent(self, event)
+
+    def reload(self) -> None:
+        if self.is_ready and not self.native_control_healthy():
+            self._report_native_failure("폐기된 WebView2를 새로고침하려 했습니다.")
+            return
+        try:
+            super().reload()
+        except Exception as error:
+            self._report_native_failure(f"WebView2 새로고침 실패: {error}")
+
+    def load_url(self, url: str) -> None:
+        if self.is_ready and not self.native_control_healthy():
+            self._report_native_failure("폐기된 WebView2에 영상을 불러오려 했습니다.")
+            return
+        try:
+            super().load_url(url)
+        except Exception as error:
+            self._report_native_failure(f"WebView2 영상 불러오기 실패: {error}")
+
+    def evaluate_js(self, script: str, callback=None) -> None:
+        if self.is_ready and not self.native_control_healthy():
+            self._report_native_failure("폐기된 WebView2에 명령을 보내려 했습니다.")
+            return
+        try:
+            super().evaluate_js(script, callback)
+        except Exception as error:
+            self._report_native_failure(f"WebView2 명령 실행 실패: {error}")
+
+    def closeEvent(self, event) -> None:
+        webview = getattr(self, "_webview", None)
+        try:
+            if webview is not None and not bool(webview.IsDisposed):
+                webview.Dispose()
+        except Exception:
+            pass
+        executor = getattr(self, "_wsgi_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+        QWidget.closeEvent(self, event)
 
 
 class SoopReviewPlayer(QFrame):
@@ -576,6 +734,11 @@ class SoopReviewPlayer(QFrame):
         self._suppress_activate = False
         self._seek_command_sent = False
         self._fine_correction_sent = False
+        self._fullscreen_active = False
+        self._normal_geometry = None
+        self._was_maximized = False
+        self._webview_rebuild_pending = False
+        self._rebuilding_webview = False
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -594,12 +757,15 @@ class SoopReviewPlayer(QFrame):
         external_button.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(self.vod.url))
         )
+        self.fullscreen_button = QPushButton("전체화면")
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         close_button = QPushButton("닫기")
         close_button.clicked.connect(self.close_player)
         header.addWidget(title)
         header.addStretch(1)
         header.addWidget(reload_button)
         header.addWidget(external_button)
+        header.addWidget(self.fullscreen_button)
         header.addWidget(close_button)
         layout.addLayout(header)
 
@@ -607,37 +773,198 @@ class SoopReviewPlayer(QFrame):
         self.time_label.setObjectName("muted")
         layout.addWidget(self.time_label)
 
-        browser_data = app_data_dir() / "webview2"
-        browser_data.mkdir(parents=True, exist_ok=True)
-        self.web_view = QtWebView2Widget(
-            debug=False,
-            context_menus=False,
-            background_color="#000000",
-            handle_new_window=True,
-            lazyload=True,
-            user_data_folder=str(browser_data),
-            fullscreen_support=True,
-            parent=self,
-        )
-        self.web_view.setMinimumHeight(260)
-        self.web_view.bridge.initialization_done.connect(
-            self._on_webview_initialized
-        )
-        self.web_view.bridge.domContentLoaded.connect(self._on_dom_loaded)
+        self._browser_data = app_data_dir() / "webview2"
+        self._browser_data.mkdir(parents=True, exist_ok=True)
+        self._player_layout = layout
+        self.web_view = self._create_web_view()
         layout.addWidget(self.web_view, 1)
 
         self.help_label = QLabel(
             "타임라인의 시간을 더블클릭하면 이 플레이어가 같은 지점으로 이동합니다. "
+            "F11 또는 전체화면 버튼으로 전환하고 Esc로 돌아올 수 있습니다. "
             "광고가 표시되면 광고가 끝난 뒤 시간을 한 번 더 더블클릭하세요."
         )
         self.help_label.setObjectName("muted")
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
 
+        self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        self._fullscreen_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._fullscreen_shortcut.activated.connect(self.toggle_fullscreen)
+        self._escape_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self._escape_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._escape_shortcut.activated.connect(self.exit_fullscreen)
+
+    def _create_web_view(self) -> ResilientQtWebView2Widget:
+        web_view = ResilientQtWebView2Widget(
+            debug=False,
+            context_menus=False,
+            background_color="#000000",
+            handle_new_window=True,
+            lazyload=True,
+            js_apis={"exitFullscreen": self._request_fullscreen_exit_from_web},
+            user_data_folder=str(self._browser_data),
+            fullscreen_support=False,
+            parent=self,
+        )
+        web_view.setMinimumHeight(260)
+        web_view.bridge.initialization_done.connect(
+            lambda success, error, candidate=web_view: (
+                self._on_webview_initialized(success, error)
+                if candidate is self.web_view
+                else None
+            )
+        )
+        web_view.bridge.domContentLoaded.connect(
+            lambda candidate=web_view: (
+                self._on_dom_loaded() if candidate is self.web_view else None
+            )
+        )
+        web_view.bridge.fullscreen_changed.connect(
+            lambda is_fullscreen, candidate=web_view: (
+                self._on_web_fullscreen_changed(is_fullscreen)
+                if candidate is self.web_view
+                else None
+            )
+        )
+        web_view.native_control_failed.connect(
+            lambda message, candidate=web_view: self._on_native_control_failed(
+                candidate,
+                message,
+            )
+        )
+        return web_view
+
+    def _ensure_web_view(self) -> None:
+        if self._rebuilding_webview:
+            return
+        if (
+            self._webview_rebuild_pending
+            or not self.web_view.native_control_healthy()
+        ):
+            self._replace_web_view()
+
+    def _replace_web_view(self) -> None:
+        if self._rebuilding_webview:
+            return
+        self._rebuilding_webview = True
+        old_web_view = self.web_view
+        index = self._player_layout.indexOf(old_web_view)
+        if index < 0:
+            help_label = getattr(self, "help_label", None)
+            index = self._player_layout.indexOf(help_label)
+        if index < 0:
+            index = self._player_layout.count()
+        was_visible = self.isVisible()
+        try:
+            try:
+                old_web_view.evaluate_js(build_close_script())
+                old_web_view.hide()
+                old_web_view.close()
+            except Exception:
+                pass
+            self._player_layout.removeWidget(old_web_view)
+            new_web_view = self._create_web_view()
+            self.web_view = new_web_view
+            self._player_layout.insertWidget(index, new_web_view, 1)
+            old_web_view.deleteLater()
+            self._loaded = False
+            self._dom_loaded = False
+            self._seek_in_flight = False
+            self._webview_rebuild_pending = False
+            if was_visible:
+                new_web_view.show()
+                self._loaded = True
+                self.time_label.setText("Edge 플레이어 복구 중…")
+                self.status_changed.emit(
+                    "끊어진 검수 플레이어를 새 WebView2로 복구합니다…"
+                )
+                new_web_view.load_url(build_player_url(self.vod.vod_id).toString())
+        finally:
+            self._rebuilding_webview = False
+
+    def _on_native_control_failed(
+        self,
+        candidate: ResilientQtWebView2Widget,
+        message: str,
+    ) -> None:
+        if candidate is not self.web_view or self._rebuilding_webview:
+            return
+        self._webview_rebuild_pending = True
+        self._dom_loaded = False
+        self._loaded = False
+        logger.warning("Review player WebView2 will be rebuilt: %s", message)
+        self.status_changed.emit(
+            "검수 플레이어 연결이 끊어져 자동으로 다시 준비합니다…"
+        )
+        if self._fullscreen_active or self.isFullScreen():
+            self.exit_fullscreen(request_document_exit=False)
+        if self.isVisible():
+            QTimer.singleShot(0, self._replace_web_view)
+
+    def _schedule_webview_host_repair(self) -> None:
+        for delay in (0, 100, 350):
+            QTimer.singleShot(delay, self._repair_webview_host)
+
+    def _repair_webview_host(self) -> None:
+        if not self.isVisible() or self._rebuilding_webview:
+            return
+        if not self.web_view.repair_native_parent():
+            self._webview_rebuild_pending = True
+
+    def toggle_fullscreen(self) -> None:
+        if self._fullscreen_active or self.isFullScreen():
+            self.exit_fullscreen()
+        else:
+            self.enter_fullscreen()
+
+    def enter_fullscreen(self) -> None:
+        if self._fullscreen_active:
+            return
+        self._normal_geometry = self.saveGeometry()
+        self._was_maximized = self.isMaximized()
+        self._fullscreen_active = True
+        self.fullscreen_button.setText("전체화면 종료")
+        self.showFullScreen()
+        self._schedule_webview_host_repair()
+
+    def exit_fullscreen(self, *, request_document_exit: bool = True) -> None:
+        was_fullscreen = self._fullscreen_active or self.isFullScreen()
+        self._fullscreen_active = False
+        self.fullscreen_button.setText("전체화면")
+        if request_document_exit:
+            self.web_view.evaluate_js(build_exit_fullscreen_script())
+        if not was_fullscreen:
+            return
+        geometry = self._normal_geometry
+        was_maximized = self._was_maximized
+        self.showNormal()
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        if was_maximized:
+            self.showMaximized()
+        self._normal_geometry = None
+        self._was_maximized = False
+        self.raise_()
+        self.activateWindow()
+        self._schedule_webview_host_repair()
+
+    def _request_fullscreen_exit_from_web(self) -> bool:
+        QTimer.singleShot(0, self.exit_fullscreen)
+        return True
+
+    def _on_web_fullscreen_changed(self, is_fullscreen: bool) -> None:
+        if is_fullscreen:
+            self.enter_fullscreen()
+        else:
+            self.exit_fullscreen(request_document_exit=False)
+
     def open_player(self) -> None:
+        self._ensure_web_view()
         self.show()
         self.raise_()
         self.activateWindow()
+        self._schedule_webview_host_repair()
         if not self._loaded:
             self._loaded = True
             self.status_changed.emit("SOOP 검수 플레이어를 불러옵니다…")
@@ -650,6 +977,8 @@ class SoopReviewPlayer(QFrame):
         if vod.vod_id == self.vod.vod_id:
             return
         was_visible = self.isVisible()
+        if self._fullscreen_active or self.isFullScreen():
+            self.exit_fullscreen()
         self._stop_playback()
         self.vod = vod
         self._duration_seconds = parse_duration_text(vod.duration_text) or 0
@@ -753,6 +1082,8 @@ class SoopReviewPlayer(QFrame):
 
     def close_player(self) -> None:
         was_visible = self.isVisible()
+        if self._fullscreen_active or self.isFullScreen():
+            self.exit_fullscreen()
         self._stop_playback()
         self.hide()
         if was_visible:
@@ -774,9 +1105,12 @@ class SoopReviewPlayer(QFrame):
             self.web_view.evaluate_js(build_close_script())
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._stop_playback()
-        event.accept()
-        self.closed.emit()
+        # Closing a top-level widget also closes its native WebView2 child.
+        # qtwebview2 disposes that child permanently, while the editor keeps
+        # this player object for reuse. Hide the player instead so reopening it
+        # never talks to an already-disposed WebView2 control.
+        event.ignore()
+        self.close_player()
 
     def _on_webview_initialized(self, success: bool, error_message: str) -> None:
         if not success:
@@ -790,6 +1124,7 @@ class SoopReviewPlayer(QFrame):
 
     def _on_dom_loaded(self) -> None:
         self._dom_loaded = True
+        self.web_view.evaluate_js(build_fullscreen_escape_guard_script())
         if self._pending_seconds is None:
             self.time_label.setText("시간을 더블클릭하세요")
             self.status_changed.emit("SOOP 검수 플레이어를 열었습니다.")
