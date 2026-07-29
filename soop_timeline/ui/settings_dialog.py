@@ -27,12 +27,19 @@ from ..services.analyzer import DEFAULT_GEMINI_MODEL, DEFAULT_WHISPER_MODEL
 from ..services.cache_manager import cache_size_bytes, human_size, remove_all_caches
 from ..services.credentials import get_gemini_api_key, save_gemini_api_key
 from ..services.gemini_timeline import DEFAULT_TOPIC_GRANULARITY
+from ..services.timeline_document import (
+    DEFAULT_TIMELINE_NOTICE,
+    TIMELINE_NOTICE_SETTING,
+    set_timeline_notice,
+)
 from ..services.preferences import (
+    AUTO_ANALYZE_SETTING,
     CACHE_RETENTION_SETTING,
     DISCOVERY_INTERVAL_SETTING,
     LIVE_AI_MODES,
     LIVE_AI_MODE_SETTING,
     NEW_VOD_NOTIFICATION_SETTING,
+    normalized_auto_analyze_mode,
     normalized_cache_retention,
     normalized_discovery_interval,
 )
@@ -130,6 +137,29 @@ class AnalysisSettingsDialog(QDialog):
         self.topic_granularity_combo.setCurrentIndex(max(0, granularity_index))
         form.addRow("기본 타임라인 밀도", self.topic_granularity_combo)
 
+        self.timeline_notice_input = QPlainTextEdit(
+            database.get_setting(TIMELINE_NOTICE_SETTING, DEFAULT_TIMELINE_NOTICE)
+        )
+        self.timeline_notice_input.setPlaceholderText(
+            "타임라인 맨 위에 붙는 고정 문구 · 비우면 문구 없이 생성됩니다"
+        )
+        self.timeline_notice_input.setFixedHeight(76)
+        notice_reset = QPushButton("기본 문구로")
+        notice_reset.clicked.connect(
+            lambda: self.timeline_notice_input.setPlainText(DEFAULT_TIMELINE_NOTICE)
+        )
+        notice_reset_row = QHBoxLayout()
+        notice_reset_row.addStretch(1)
+        notice_reset_row.addWidget(notice_reset)
+        notice_box = QVBoxLayout()
+        notice_box.setContentsMargins(0, 0, 0, 0)
+        notice_box.setSpacing(4)
+        notice_box.addWidget(self.timeline_notice_input)
+        notice_box.addLayout(notice_reset_row)
+        notice_widget = QWidget()
+        notice_widget.setLayout(notice_box)
+        form.addRow("상단 고정 문구", notice_widget)
+
         self.live_ai_mode_combo = QComboBox()
         for mode in LIVE_AI_MODES.values():
             self.live_ai_mode_combo.addItem(
@@ -188,6 +218,9 @@ class AnalysisSettingsDialog(QDialog):
         self.discovery_interval_combo = QComboBox()
         for label, value in (
             ("자동 확인 끄기", 0),
+            ("3분마다 · 방송 종료 후 빠르게", 3),
+            ("5분마다", 5),
+            ("10분마다", 10),
             ("30분마다", 30),
             ("1시간마다", 60),
             ("3시간마다", 180),
@@ -201,6 +234,21 @@ class AnalysisSettingsDialog(QDialog):
         )
         self.discovery_interval_combo.setCurrentIndex(max(0, interval_index))
         discovery_form.addRow("확인 주기", self.discovery_interval_combo)
+
+        self.auto_analyze_combo = QComboBox()
+        for label, value in (
+            ("끄기 · 감지만 하고 대기", "off"),
+            ("자막만 추출 · fw로 백그라운드 전사(Gemini 미사용)", "transcribe"),
+            ("타임라인까지 · fw + Gemini 자동 생성", "full"),
+        ):
+            self.auto_analyze_combo.addItem(label, value)
+        auto_index = self.auto_analyze_combo.findData(
+            normalized_auto_analyze_mode(
+                database.get_setting(AUTO_ANALYZE_SETTING, "off")
+            )
+        )
+        self.auto_analyze_combo.setCurrentIndex(max(0, auto_index))
+        discovery_form.addRow("신규 영상 자동 처리", self.auto_analyze_combo)
         root.addLayout(discovery_form)
         self.new_vod_notification_check = QCheckBox(
             "새 영상이 발견되면 Windows 알림 표시"
@@ -450,6 +498,13 @@ class AnalysisSettingsDialog(QDialog):
         self.database.set_setting(
             UPDATE_MANIFEST_SETTING,
             self.update_manifest_input.text().strip(),
+        )
+        notice_text = self.timeline_notice_input.toPlainText().strip("\r\n")
+        self.database.set_setting(TIMELINE_NOTICE_SETTING, notice_text)
+        set_timeline_notice(notice_text)
+        self.database.set_setting(
+            AUTO_ANALYZE_SETTING,
+            str(self.auto_analyze_combo.currentData()),
         )
         self.accept()
 

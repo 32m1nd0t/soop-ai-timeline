@@ -26,11 +26,13 @@ class TimelineRegroupWorker(QObject):
         analyzer: LocalWhisperGeminiAnalyzer,
         vod: Vod,
         granularity: str,
+        result_vod_id: str | None = None,
     ):
         super().__init__()
         self.analyzer = analyzer
         self.vod = vod
         self.granularity = granularity
+        self.result_vod_id = result_vod_id or vod.vod_id
 
     @Slot()
     def run(self) -> None:
@@ -38,13 +40,13 @@ class TimelineRegroupWorker(QObject):
 
         def progress(percent: int, message: str) -> None:
             self.progress_changed.emit(
-                self.vod.vod_id,
+                self.result_vod_id,
                 max(0, min(100, percent)),
                 message,
             )
 
         def preview(stage: str, text: str) -> None:
-            self.preview_changed.emit(self.vod.vod_id, stage, text)
+            self.preview_changed.emit(self.result_vod_id, stage, text)
 
         try:
             document = self.analyzer.regroup_vod(
@@ -55,14 +57,14 @@ class TimelineRegroupWorker(QObject):
                 preview,
             )
         except AnalysisCancelled:
-            self.cancelled.emit(self.vod.vod_id)
+            self.cancelled.emit(self.result_vod_id)
         except Exception as error:
             logger.exception("Timeline regroup failed for %s", self.vod.vod_id)
-            self.failed.emit(self.vod.vod_id, str(error))
+            self.failed.emit(self.result_vod_id, str(error))
         else:
             usage = str(getattr(self.analyzer, "last_usage_summary", "") or "")
             if usage:
-                self.usage_changed.emit(self.vod.vod_id, usage)
-            self.succeeded.emit(self.vod.vod_id, document)
+                self.usage_changed.emit(self.result_vod_id, usage)
+            self.succeeded.emit(self.result_vod_id, document)
         finally:
             self.finished.emit()

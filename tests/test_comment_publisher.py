@@ -1,5 +1,7 @@
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from soop_timeline.services.comment_publisher import (
     PublicationPlan,
@@ -11,6 +13,7 @@ from soop_timeline.services.comment_publisher import (
     root_needle,
     vod_page_url,
 )
+from soop_timeline.ui.comment_publisher_window import SoopCommentPublisher
 
 
 class VodPageUrlTests(unittest.TestCase):
@@ -27,6 +30,10 @@ class VodPageUrlTests(unittest.TestCase):
     def test_rejects_empty(self):
         with self.assertRaises(ValueError):
             vod_page_url("   ")
+
+    def test_rejects_synthetic_live_session_id(self):
+        with self.assertRaises(ValueError):
+            vod_page_url("live-98765-20260721")
 
 
 class PublicationPlanTests(unittest.TestCase):
@@ -71,7 +78,10 @@ class ScriptBuilderTests(unittest.TestCase):
         self.assertEqual(script.count("{"), script.count("}"))
 
     def test_login_probe_is_well_formed(self):
-        self._assert_body_shape(build_login_probe_script())
+        script = build_login_probe_script()
+        self._assert_body_shape(script)
+        self.assertIn("commentClickTarget", script)
+        self.assertIn('li[click-target="btn_comment"] button', script)
 
     def test_dump_script_respects_limit(self):
         script = build_comment_dump_script(5000)
@@ -96,6 +106,61 @@ class ScriptBuilderTests(unittest.TestCase):
         self._assert_body_shape(script)
         self.assertIn(json.dumps(self.HOSTILE, ensure_ascii=False), script)
         self.assertIn(json.dumps("찾을 댓글", ensure_ascii=False), script)
+
+
+class PublisherWindowLogicTests(unittest.TestCase):
+    def test_background_mode_keeps_webview_normally_rendered_offscreen(self):
+        calls: list[object] = []
+        publisher = SimpleNamespace(
+            _auto_confirmed=False,
+            _background_rendering=False,
+            setAttribute=lambda *args: calls.append(("attribute", args)),
+            move=lambda *args: calls.append(("move", args)),
+            showNormal=lambda: calls.append("show-normal"),
+            lower=lambda: calls.append("lower"),
+            _mute_timer=SimpleNamespace(start=lambda: calls.append("mute")),
+            _loaded=True,
+        )
+
+        SoopCommentPublisher.open_in_background(publisher)
+
+        self.assertTrue(publisher._auto_confirmed)
+        self.assertTrue(publisher._background_rendering)
+        self.assertIn("show-normal", calls)
+        self.assertIn("lower", calls)
+        self.assertTrue(
+            any(
+                isinstance(call, tuple)
+                and call[0] == "move"
+                and call[1] == (-10_000, -10_000)
+                for call in calls
+            )
+        )
+
+    def test_comment_target_uses_trusted_webview_click_and_rechecks(self):
+        clicks: list[tuple[float, float]] = []
+        publisher = SimpleNamespace(
+            _comment_click_in_flight=False,
+            _comment_open_attempts=0,
+            web_view=SimpleNamespace(
+                dispatch_page_click=lambda x, y: clicks.append((x, y)) or True
+            ),
+            _after_comment_tab_click=lambda: None,
+        )
+
+        with patch(
+            "soop_timeline.ui.comment_publisher_window.QTimer.singleShot"
+        ) as single_shot:
+            opened = SoopCommentPublisher._try_open_comment_tab(
+                publisher,
+                {"commentClickTarget": {"x": 123.5, "y": 456.25}},
+            )
+
+        self.assertTrue(opened)
+        self.assertEqual(clicks, [(123.5, 456.25)])
+        self.assertTrue(publisher._comment_click_in_flight)
+        self.assertEqual(publisher._comment_open_attempts, 1)
+        single_shot.assert_called_once()
 
 
 if __name__ == "__main__":

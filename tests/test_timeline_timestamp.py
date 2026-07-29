@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -327,6 +328,38 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertTrue(
             ResilientQtWebView2Widget.native_control_healthy(player)
         )
+
+    def test_trusted_page_click_dispatches_pressed_and_released_events(self):
+        calls: list[tuple[str, dict]] = []
+
+        class Core:
+            def CallDevToolsProtocolMethodAsync(self, method, payload):
+                calls.append((method, json.loads(payload)))
+
+        class WebView:
+            is_ready = True
+            _webview = SimpleNamespace(CoreWebView2=Core())
+
+            @staticmethod
+            def native_control_healthy():
+                return True
+
+        dispatched = ResilientQtWebView2Widget.dispatch_page_click(
+            WebView(),
+            123.5,
+            456.25,
+        )
+
+        self.assertTrue(dispatched)
+        self.assertEqual(
+            [payload["type"] for _, payload in calls],
+            ["mousePressed", "mouseReleased"],
+        )
+        self.assertTrue(
+            all(method == "Input.dispatchMouseEvent" for method, _ in calls)
+        )
+        self.assertEqual(calls[0][1]["x"], 123.5)
+        self.assertEqual(calls[0][1]["y"], 456.25)
 
     def test_fullscreen_helpers_restore_both_page_and_player_window(self):
         exit_script = build_exit_fullscreen_script()

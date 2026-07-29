@@ -8,13 +8,18 @@ from unittest.mock import patch
 from soop_timeline.models import Vod
 from soop_timeline.services.analyzer import (
     AnalyzerConfig,
+    LIVE_RECONNECT_LOG_FILENAME,
     LIVE_TRANSCRIPT_FILENAME,
     LIVE_TRANSCRIPT_JOURNAL_FILENAME,
     LocalWhisperGeminiAnalyzer,
     _LiveTranscriptJournal,
+    _restore_live_timeline,
+    build_live_replay_transcript_reuse,
     build_whisper_prompt,
+    live_capture_position,
     load_cached_transcript,
     load_timeline_generation_state,
+    record_live_reconnect_gap,
     save_timeline_generation_state,
 )
 from soop_timeline.services.gemini_timeline import (
@@ -38,7 +43,7 @@ from soop_timeline.services.gemini_timeline import (
     split_transcript,
     validate_and_snap_quotes,
 )
-from soop_timeline.services.timeline_document import AI_TIMELINE_NOTICE
+from soop_timeline.services.timeline_document import DEFAULT_TIMELINE_NOTICE
 from soop_timeline.services.transcription import (
     AnalysisCancelled,
     LiveTranscriptUpdate,
@@ -81,12 +86,113 @@ def sample_transcript() -> Transcript:
 
 
 class AnalysisPipelineTests(unittest.TestCase):
+    def test_live_replay_reuse_excludes_recorded_reconnect_gaps(self):
+        replay = Vod(
+            vod_id="777",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="완성된 다시보기",
+            url="https://vod.sooplive.com/player/777",
+            duration_text="00:10:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="review",
+            discovered_at="",
+            updated_at="",
+            source_kind="manual_vod",
+            live_broadcast_no="broadcast-1",
+        )
+        live = Vod(
+            vod_id="live-broadcast-1",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="[LIVE] 테스트",
+            url="https://play.sooplive.com/sample/broadcast-1",
+            duration_text="시작 00:01:40",
+            published_text="오늘",
+            thumbnail_url="",
+            state="review",
+            discovered_at="",
+            updated_at="",
+            source_kind="live",
+            live_broadcast_no="broadcast-1",
+        )
+        transcript = Transcript(
+            model="large-v3-turbo",
+            language="ko",
+            duration_seconds=599,
+            segments=[
+                TranscriptSegment("s000000", 110, 120, "라이브 앞부분"),
+                TranscriptSegment("s000001", 580, 590, "라이브 끝부분"),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_root = root / live.vod_id
+            live_root.mkdir(parents=True)
+            (live_root / LIVE_TRANSCRIPT_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "source": {
+                            "kind": "soop_live",
+                            "url": live.url,
+                            "runtime_start_seconds": 100,
+                        },
+                        "transcript": transcript.to_dict(),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (live_root / LIVE_RECONNECT_LOG_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "type": "reconnect_gap",
+                        "broadcast_no": live.live_broadcast_no,
+                        "missing_start_seconds": 300,
+                        "missing_end_seconds": 320,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "soop_timeline.services.analyzer.analysis_data_dir",
+                side_effect=lambda vod_id=None: root / (vod_id or ""),
+            ):
+                reuse = build_live_replay_transcript_reuse(
+                    replay,
+                    [live],
+                    replay_duration=600,
+                )
+
+        self.assertIsNotNone(reuse)
+        self.assertEqual(
+            reuse.covered_ranges,
+            ((100.0, 300.0), (320.0, 600.0)),
+        )
+        self.assertEqual(reuse.session_count, 1)
+
     def test_timeline_checkpoint_round_trip_and_key_validation(self):
         state = TimelineGenerationState(
             "key-1",
             2,
             ["제목"],
-            [TimelineEntry("s1", 10, '"직접 인용" — 메모', "주제", "new", "직접 인용")],
+            [
+                TimelineEntry(
+                    "s1",
+                    10,
+                    '"직접 인용" — 메모',
+                    "주제",
+                    "new",
+                    "직접 인용",
+                    True,
+                )
+            ],
             stage="final_pending",
             last_error="quota",
         )
@@ -96,6 +202,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             restored = load_timeline_generation_state(path, "key-1")
             self.assertEqual(restored.to_dict(), state.to_dict())
             self.assertEqual(restored.entries[0].quote, "직접 인용")
+            self.assertTrue(restored.entries[0].section_break_before)
             self.assertIsNone(load_timeline_generation_state(path, "other-key"))
 
     def test_quote_first_entries_keep_quote_and_summary_separate(self):
@@ -119,6 +226,7 @@ class AnalysisPipelineTests(unittest.TestCase):
                     "topic_key": "게임",
                     "quote": "게임을 시작합니다",
                     "summary": "신작 점프맵 첫 도전",
+                    "section_break_before": True,
                 },
             ]
         }
@@ -132,6 +240,7 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual(
             format_entry_text(entries[1]), '"게임을 시작합니다" 신작 점프맵 첫 도전'
         )
+        self.assertTrue(entries[1].section_break_before)
 
     def test_fabricated_quote_is_downgraded_to_transcript_text(self):
         transcript = sample_transcript()
@@ -256,6 +365,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             format_entry_text(result[0]),
             '"자 오늘 방송은 여기까지 하겠습니다."',
         )
+        self.assertTrue(result[0].section_break_before)
 
     def test_negated_or_game_end_is_not_forced_to_a_broadcast_quote(self):
         segments = [
@@ -319,6 +429,7 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual([entry.segment_id for entry in result], ["topic", "ending"])
         self.assertEqual(result[-1].summary, "")
         self.assertEqual(result[-1].quote, "이제 방송 끌게요.")
+        self.assertTrue(result[-1].section_break_before)
 
     def test_transcript_is_split_with_overlap(self):
         windows = split_transcript(
@@ -346,9 +457,47 @@ class AnalysisPipelineTests(unittest.TestCase):
         ).to_document()
         self.assertEqual(
             document,
-            f"{AI_TIMELINE_NOTICE}\n\n"
+            f"{DEFAULT_TIMELINE_NOTICE}\n\n"
             "오늘의 콘텐츠: 테스트 콘텐츠\n\n"
             "01:02:05 시청자와 꿈 이야기\n",
+        )
+
+    def test_document_adds_blank_line_only_before_major_section_changes(self):
+        document = GeneratedTimeline(
+            "소통과 게임",
+            [
+                TimelineEntry("s1", 10, "최근 근황 이야기"),
+                TimelineEntry("s2", 30, "꿈에서 시청자가 나온 이야기"),
+                TimelineEntry(
+                    "s3",
+                    120,
+                    "게임 시작",
+                    section_break_before=True,
+                ),
+                TimelineEntry("s4", 300, "첫 번째 보스 도전"),
+                TimelineEntry(
+                    "s5",
+                    600,
+                    "시청자 참여 대회 시작",
+                    section_break_before=True,
+                ),
+                TimelineEntry(
+                    "s6",
+                    900,
+                    "대회 종료 후 소감",
+                    section_break_before=True,
+                ),
+            ],
+        ).to_document()
+
+        self.assertIn(
+            "00:00:10 최근 근황 이야기\n"
+            "00:00:30 꿈에서 시청자가 나온 이야기\n\n"
+            "00:02:00 게임 시작\n"
+            "00:05:00 첫 번째 보스 도전\n\n"
+            "00:10:00 시청자 참여 대회 시작\n\n"
+            "00:15:00 대회 종료 후 소감\n",
+            document,
         )
 
     def test_overall_summary_covers_representative_broadcast_topics(self):
@@ -421,6 +570,10 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertIn("문체 규칙에 맞게 간결하고 자연스럽게", final_prompt)
         self.assertIn("타임라인 entries만 정리", final_prompt)
         self.assertIn("별도 단계에서 딱 한 번만", final_prompt)
+        self.assertIn("section_break_before", chunk_prompt)
+        self.assertIn("소통에서 게임을 시작", chunk_prompt)
+        self.assertIn("큰 활동 카테고리가 바뀌는 첫 항목만 true", final_prompt)
+        self.assertIn("빈 줄만 만들기 위해 새 항목을 추가하지 않습니다", final_prompt)
         self.assertNotIn("전체 방송 한 줄 요약", final_prompt)
         self.assertNotIn("시작·중간·후반의 대표 흐름", final_prompt)
         self.assertIn("전체 방송 요약이 아니라", chunk_prompt)
@@ -844,7 +997,7 @@ class AnalysisPipelineTests(unittest.TestCase):
 
         self.assertIn("01:00:00 방송 시작", result)
         self.assertEqual(len(recovered.segments), 2)
-        self.assertTrue(result.startswith(f"{AI_TIMELINE_NOTICE}\n\n"))
+        self.assertTrue(result.startswith(f"{DEFAULT_TIMELINE_NOTICE}\n\n"))
         self.assertEqual(result.splitlines()[3], "오늘의 콘텐츠: 최종 라이브")
         self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))
 
@@ -997,9 +1150,145 @@ class AnalysisPipelineTests(unittest.TestCase):
                 )
             recovered = load_cached_transcript(live_vod)
             self.assertEqual([item.text for item in recovered.segments], ["저장할 자막"])
-            self.assertFalse(
-                (Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME).exists()
+            self.assertTrue(
+                (Path(directory) / LIVE_TRANSCRIPT_JOURNAL_FILENAME).is_file()
             )
+
+    def test_restarted_live_analysis_appends_to_existing_journal(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        live_vod.live_broadcast_no = "98765"
+        first_source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="처음 제목",
+            page_url=live_vod.url,
+            runtime_seconds=3_600,
+            stream_url="https://example.test/first.m3u8",
+        )
+        second_source = LiveAudioSource(
+            kind="live",
+            channel_id="sample",
+            streamer_name="샘플",
+            broadcast_no="98765",
+            title="바뀐 제목",
+            page_url=live_vod.url,
+            runtime_seconds=3_700,
+            stream_url="https://example.test/second.m3u8",
+        )
+        first = TranscriptSegment("s000000", 3_600, 3_610, "첫 번째 자막")
+        second = TranscriptSegment("s000000", 3_700, 3_710, "재연결 뒤 자막")
+        current = Transcript(
+            "large-v3-turbo",
+            "ko",
+            3_715,
+            [second],
+        )
+
+        class FakeTranscriber:
+            def transcribe_live(self, source, update, **kwargs):
+                del source, kwargs
+                update(
+                    LiveTranscriptUpdate(
+                        current.model,
+                        current.language,
+                        current.duration_seconds,
+                        (second,),
+                    )
+                )
+                return current
+
+        class NoCallGenerator:
+            def summarize_live_window(self, *args, **kwargs):
+                raise AssertionError("shutdown resume must not summarize")
+
+            def finalize_live_entries(self, *args, **kwargs):
+                raise AssertionError("shutdown resume must not finalize")
+
+        analyzer = LocalWhisperGeminiAnalyzer(
+            AnalyzerConfig(gemini_api_key="test"),
+            transcriber_factory=lambda model, device: FakeTranscriber(),
+            generator_factory=lambda key, model: NoCallGenerator(),
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            journal = _LiveTranscriptJournal(live_vod, first_source)
+            journal.append_update(
+                LiveTranscriptUpdate(
+                    "large-v3-turbo",
+                    "ko",
+                    3_615,
+                    (first,),
+                )
+            )
+            with self.assertRaises(AnalysisCancelled):
+                analyzer.analyze_live(
+                    live_vod,
+                    second_source,
+                    progress=lambda *args: None,
+                    stop_requested=lambda: True,
+                    finalize_requested=lambda: False,
+                    resume_document=(
+                        f"{DEFAULT_TIMELINE_NOTICE}\n\n"
+                        "오늘의 콘텐츠: 첫 번째 주제\n\n"
+                        "01:00:00 첫 번째 자막"
+                    ),
+                )
+
+            recovered = load_cached_transcript(live_vod)
+            self.assertEqual(
+                [segment.text for segment in recovered.segments],
+                ["첫 번째 자막", "재연결 뒤 자막"],
+            )
+            self.assertEqual(
+                [segment.segment_id for segment in recovered.segments],
+                ["s000000", "s000001"],
+            )
+            self.assertEqual(live_capture_position(live_vod), 3_715)
+
+    def test_reconnect_gap_is_logged_once_without_changing_timeline(self):
+        live_vod = sample_vod()
+        live_vod.source_kind = "live"
+        live_vod.url = "https://play.sooplive.com/sample/98765"
+        live_vod.live_broadcast_no = "98765"
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "soop_timeline.services.analyzer.analysis_data_dir",
+            return_value=Path(directory),
+        ):
+            first = record_live_reconnect_gap(live_vod, 3_615, 3_700)
+            second = record_live_reconnect_gap(live_vod, 3_615, 3_700)
+            path = Path(directory) / LIVE_RECONNECT_LOG_FILENAME
+            records = path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(first, 85)
+        self.assertEqual(second, 85)
+        self.assertEqual(len(records), 1)
+        payload = json.loads(records[0])
+        self.assertEqual(payload["missing_range"], "01:00:15~01:01:40")
+
+    def test_saved_live_timeline_entries_are_restored_by_timestamp(self):
+        segments = [
+            TranscriptSegment("s000000", 3_600, 3_610, "첫 번째 자막"),
+            TranscriptSegment("s000001", 3_700, 3_710, "두 번째 자막"),
+        ]
+        entries, titles = _restore_live_timeline(
+            "오늘의 콘텐츠: 첫 제목\n\n"
+            "01:00:02 첫 주제\n\n"
+            "01:01:42 둘째 주제",
+            segments,
+        )
+
+        self.assertEqual(titles, ["첫 제목"])
+        self.assertEqual(
+            [entry.segment_id for entry in entries],
+            ["s000000", "s000001"],
+        )
+        self.assertTrue(entries[1].section_break_before)
 
     def test_live_transcript_journal_appends_only_new_items_and_recovers(self):
         live_vod = sample_vod()

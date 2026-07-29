@@ -28,11 +28,13 @@ class LiveAnalysisWorker(QObject):
         analyzer: LocalWhisperGeminiAnalyzer,
         vod: Vod,
         source: LiveAudioSource,
+        resume_document: str = "",
     ):
         super().__init__()
         self.analyzer = analyzer
         self.vod = vod
         self.source = source
+        self.resume_document = resume_document
         self._skip_finalization = threading.Event()
 
     def request_stop(self, *, finalize: bool) -> None:
@@ -62,6 +64,7 @@ class LiveAnalysisWorker(QObject):
                 stop_requested=thread.isInterruptionRequested,
                 preview=preview,
                 finalize_requested=lambda: not self._skip_finalization.is_set(),
+                resume_document=self.resume_document,
             )
         except AnalysisCancelled:
             self.cancelled.emit(self.vod.vod_id)

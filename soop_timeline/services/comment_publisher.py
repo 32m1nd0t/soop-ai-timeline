@@ -36,6 +36,7 @@ __all__ = [
     "build_post_root_script",
     "build_verify_root_script",
     "build_post_reply_script",
+    "build_mute_media_script",
     "COMMENT_INPUT_SELECTORS",
     "REPLY_INPUT_SELECTORS",
     "SUBMIT_TEXT_HINTS",
@@ -90,6 +91,8 @@ def vod_page_url(vod_id: str) -> str:
     cleaned = str(vod_id).strip()
     if not cleaned:
         raise ValueError("vod_id must not be empty")
+    if not cleaned.isdigit():
+        raise ValueError("vod_id must contain digits only")
     return _VOD_PAGE_TEMPLATE.format(vod_id=cleaned)
 
 
@@ -128,18 +131,74 @@ function __soopLoginId() {
     } catch (_) {}
     return '';
 }
+function __loginButtonPresent() {
+    // Only SOOP's real header sign-in control marks a logged-out session. Broad
+    // class matching wrongly caught logged-in menu items, so require the exact
+    // `btn-login` class AND visible "로그인" text (never a "로그아웃" control).
+    const buttons = document.querySelectorAll('.btn-login, .btn_login');
+    for (const button of buttons) {
+        if (!__vis(button)) { continue; }
+        const text = ((button.innerText || button.textContent || '') + '').replace(/\\s+/g, '');
+        if (text.indexOf('로그인') >= 0 && text.indexOf('로그아웃') < 0) { return true; }
+    }
+    return false;
+}
 function __loggedIn() {
     if (__soopLoginId()) { return true; }
-    try {
-        if (typeof isLogin === 'function') { return !!isLogin(); }
-    } catch (_) {}
-    return false;
+    try { if (typeof isLogin === 'function' && isLogin()) { return true; } } catch (_) {}
+    // SOOP's auth ticket cookie is httpOnly, so isLogin()/getLoginId() read empty
+    // even inside an authenticated session (the profile menu still renders). Fall
+    // back to the DOM: treat as logged out only when the header sign-in button is
+    // visible; otherwise, once the comment chrome has rendered, assume signed in.
+    if (__loginButtonPresent()) { return false; }
+    return !!document.querySelector('#write-inp_comment, #tabComment, .section_selectTab');
+}
+function __commentClickTarget() {
+    // SOOP keeps both desktop and narrow-layout comment controls in the DOM.
+    // querySelector() can therefore return a hidden duplicate. Return only a
+    // control with a real viewport rectangle so WebView2 can dispatch a trusted
+    // mouse click at its centre when SOOP rejects HTMLElement.click().
+    const selectors = [
+        'li[click-target="btn_comment"] button',
+        'li[click-target="btn_comment"]',
+        '#cmmtOpener',
+        '.cmmt_opener',
+        '[aria-controls="tabComment"]',
+        '[data-tab="comment"]'
+    ];
+    const seen = new Set();
+    for (const selector of selectors) {
+        let nodes = [];
+        try { nodes = Array.from(document.querySelectorAll(selector)); } catch (_) { continue; }
+        for (const el of nodes) {
+            if (seen.has(el) || !__vis(el)) { continue; }
+            seen.add(el);
+            const rect = el.getBoundingClientRect();
+            return {
+                el: el,
+                x: rect.left + (rect.width / 2),
+                y: rect.top + (rect.height / 2),
+                tag: el.tagName || '',
+                text: ((el.innerText || el.textContent || '') + '').trim().slice(0, 40)
+            };
+        }
+    }
+    return null;
 }
 function __ensureCommentArea() {
     const wrap = document.querySelector('#tabComment, .comment_wrap');
     if (wrap && !/\\bactive\\b/.test(wrap.className || '')) {
-        const opener = document.querySelector('#cmmtOpener, .cmmt_opener');
+        const opener = Array.from(
+            document.querySelectorAll('#cmmtOpener, .cmmt_opener')
+        ).find(__vis);
         if (opener) { try { opener.click(); } catch (_) {} }
+    }
+    // Narrow layout: comments sit behind a 댓글 tab in .section_selectTab, so the
+    // write box stays hidden (height 0) until that tab is selected.
+    const commentInput = document.querySelector('#write-inp_comment');
+    if (!commentInput || !__vis(commentInput)) {
+        const target = __commentClickTarget();
+        if (target) { try { target.el.click(); } catch (_) {} }
     }
     if (wrap && wrap.scrollIntoView) {
         try { wrap.scrollIntoView({ block: 'center' }); } catch (_) {}
@@ -247,6 +306,7 @@ def build_login_probe_script() -> str:
 __ensureCommentArea();
 const loginId = __soopLoginId();
 const input = __findInput({selectors}, document);
+const commentTarget = input ? null : __commentClickTarget();
 return {{
     ok: true,
     url: location.href,
@@ -254,6 +314,26 @@ return {{
     loggedIn: __loggedIn(),
     loginId: loginId,
     hasCommentInput: !!input,
+    debug: {{
+        loginButtonPresent: __loginButtonPresent(),
+        isLoginFn: (function() {{ try {{ return typeof isLogin === 'function' ? !!isLogin() : 'no-fn'; }} catch (_) {{ return 'ERR'; }} }})(),
+        hasWriteInput: !!document.querySelector('#write-inp_comment'),
+        hasTabComment: !!document.querySelector('#tabComment'),
+        hasSelectTab: !!document.querySelector('.section_selectTab'),
+        commentClickTarget: commentTarget ? {{
+            x: commentTarget.x,
+            y: commentTarget.y,
+            tag: commentTarget.tag,
+            text: commentTarget.text
+        }} : null,
+        loginish: Array.prototype.slice.call(
+            document.querySelectorAll('[class*="login"], [class*="Login"]')
+        ).slice(0, 20).map(function(el) {{
+            return el.tagName + '|' + (((el.className || '') + '').replace(/\\s+/g, '.')) + '|' +
+                ((el.innerText || el.textContent || '') + '').replace(/\\s+/g, '').slice(0, 16) + '|' +
+                (__vis(el) ? 'vis' : 'hid');
+        }}),
+    }},
 }};
 """
     ).strip()
@@ -292,7 +372,9 @@ def build_post_root_script(text: str) -> str:
         + f"""
 if (!__loggedIn()) {{ return {{ ok: false, stage: 'not-logged-in' }}; }}
 __ensureCommentArea();
-const input = __findInput({selectors}, document);
+await __sleep(300);
+let input = __findInput({selectors}, document);
+if (!input) {{ __ensureCommentArea(); await __sleep(450); input = __findInput({selectors}, document); }}
 if (!input) {{ return {{ ok: false, stage: 'find-input' }}; }}
 __setValue(input, {value});
 await __sleep(200);
@@ -314,6 +396,21 @@ const el = __findCommentByText({wanted});
 return {{ ok: !!el, found: !!el, commentCount: document.querySelectorAll('ul.cmmt-list > li').length }};
 """
     ).strip()
+
+
+def build_mute_media_script() -> str:
+    """Silence any audio/video on the page. The background publisher only drives
+    the comment DOM and never needs the VOD's sound."""
+    return """
+try {
+    var media = document.querySelectorAll('video, audio');
+    for (var i = 0; i < media.length; i += 1) {
+        media[i].muted = true;
+        try { media[i].volume = 0; } catch (_) {}
+    }
+} catch (_) {}
+return { ok: true };
+""".strip()
 
 
 def build_post_reply_script(text: str, needle: str) -> str:

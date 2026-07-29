@@ -15,6 +15,7 @@ from soop_timeline.services.transcription import (
     WhisperRuntime,
     _WhisperBackend,
     load_vod_transcript_cache,
+    missing_covered_ranges,
     save_vod_transcript_cache,
 )
 from soop_timeline.services.live_stream import LiveAudioSource
@@ -281,6 +282,134 @@ class VodStreamTests(unittest.TestCase):
         )
         self.assertEqual(iterator.call_args.kwargs["start_seconds"], 85)
         self.assertGreaterEqual(len(checkpoints), 1)
+
+    def test_stream_transcription_skips_whisper_when_live_cache_covers_vod(self):
+        source = VodAudioSource(
+            "123",
+            120,
+            (VodAudioPart(1, 120, "https://vod-a.sooplive.com/audio.m3u8"),),
+        )
+        reusable = Transcript(
+            model="large-v3-turbo",
+            language="ko",
+            duration_seconds=120,
+            segments=[TranscriptSegment("s000000", 30, 40, "기존 라이브 발화")],
+        )
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
+        with patch.object(
+            transcriber,
+            "_prepare_backend",
+            side_effect=AssertionError("Whisper must not load"),
+        ):
+            result = transcriber.transcribe_stream(
+                source,
+                initial_prompt="테스트",
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+                reusable=reusable,
+                reusable_ranges=((0, 120),),
+            )
+
+        self.assertEqual([segment.text for segment in result.segments], ["기존 라이브 발화"])
+        self.assertEqual(result.covered_ranges, ((0.0, 120.0),))
+
+    def test_stream_transcription_only_sends_uncovered_range_to_whisper(self):
+        chunk = AudioChunk(1, 0, bytes(55 * 16_000 * 2))
+
+        class FakePipeline:
+            def transcribe(self, audio, **kwargs):
+                del audio, kwargs
+                return (
+                    iter([SimpleNamespace(start=10, end=12, text="새 앞부분 발화")]),
+                    SimpleNamespace(language="ko"),
+                )
+
+        backend = _WhisperBackend(
+            runtime=WhisperRuntime("cuda", "float16", "테스트 GPU"),
+            model=object(),
+            batched_pipeline=FakePipeline(),
+        )
+        source = VodAudioSource(
+            "123",
+            120,
+            (VodAudioPart(1, 120, "https://vod-a.sooplive.com/audio.m3u8"),),
+        )
+        reusable = Transcript(
+            model="large-v3-turbo",
+            language="ko",
+            duration_seconds=120,
+            segments=[TranscriptSegment("s000000", 60, 70, "기존 라이브 발화")],
+        )
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
+        with patch.object(
+            transcriber,
+            "_prepare_backend",
+            return_value=backend,
+        ), patch(
+            "soop_timeline.services.vod_stream.iter_audio_chunks",
+            return_value=iter([chunk]),
+        ) as iterator:
+            result = transcriber.transcribe_stream(
+                source,
+                initial_prompt="테스트",
+                progress=lambda *args: None,
+                cancelled=lambda: False,
+                reusable=reusable,
+                reusable_ranges=((40, 120),),
+            )
+
+        self.assertEqual(
+            [segment.text for segment in result.segments],
+            ["새 앞부분 발화", "기존 라이브 발화"],
+        )
+        self.assertEqual(iterator.call_args.kwargs["start_seconds"], 0)
+        self.assertEqual(iterator.call_args.kwargs["end_seconds"], 55)
+        self.assertEqual(result.covered_ranges, ((0.0, 120.0),))
+
+    def test_stream_transcription_does_not_mark_unread_gap_as_covered(self):
+        backend = _WhisperBackend(
+            runtime=WhisperRuntime("cuda", "float16", "테스트 GPU"),
+            model=object(),
+            batched_pipeline=object(),
+        )
+        source = VodAudioSource(
+            "123",
+            120,
+            (VodAudioPart(1, 120, "https://vod-a.sooplive.com/audio.m3u8"),),
+        )
+        reusable = Transcript(
+            model="large-v3-turbo",
+            language="ko",
+            duration_seconds=120,
+            segments=[TranscriptSegment("s000000", 60, 70, "기존 라이브 발화")],
+        )
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cuda")
+        with patch.object(
+            transcriber,
+            "_prepare_backend",
+            return_value=backend,
+        ), patch(
+            "soop_timeline.services.vod_stream.iter_audio_chunks",
+            return_value=iter(()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "누락 구간의 오디오"):
+                transcriber.transcribe_stream(
+                    source,
+                    initial_prompt="테스트",
+                    progress=lambda *args: None,
+                    cancelled=lambda: False,
+                    reusable=reusable,
+                    reusable_ranges=((40, 120),),
+                )
+
+    def test_sparse_coverage_reports_only_real_gaps(self):
+        self.assertEqual(
+            missing_covered_ranges(
+                120,
+                ((0, 40), (60, 100), (100, 120)),
+            ),
+            ((40.0, 60.0),),
+        )
 
     def test_live_transcription_keeps_broadcast_runtime_timestamps(self):
         chunks = [

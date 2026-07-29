@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Iterable, TYPE_CHECKING
 
 from .eta import EtaEstimator, format_eta
 
@@ -157,6 +157,9 @@ class Transcript:
     # Flat, time-ordered word timings used to snap timeline starts to the exact
     # moment a quote is spoken. Empty for transcripts made before this existed.
     words: tuple[TranscriptWord, ...] = ()
+    # Audio ranges that were actually inspected. Older VOD caches omitted this
+    # field and represented one contiguous prefix ending at duration_seconds.
+    covered_ranges: tuple[tuple[float, float], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -165,6 +168,9 @@ class Transcript:
             "duration_seconds": self.duration_seconds,
             "segments": [asdict(segment) for segment in self.segments],
             "words": [asdict(word) for word in self.words],
+            "covered_ranges": [
+                [start, end] for start, end in self.covered_ranges
+            ],
         }
 
     @classmethod
@@ -194,13 +200,102 @@ class Transcript:
             if isinstance(raw_words, list)
             else ()
         )
+        raw_covered_ranges = value.get("covered_ranges", [])
+        covered_ranges: list[tuple[float, float]] = []
+        if isinstance(raw_covered_ranges, list):
+            for item in raw_covered_ranges:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                try:
+                    start = max(0.0, float(item[0]))
+                    end = max(start, float(item[1]))
+                except (TypeError, ValueError):
+                    continue
+                if end > start:
+                    covered_ranges.append((start, end))
         return cls(
             model=str(value.get("model", "")),
             language=str(value.get("language", "ko")),
             duration_seconds=float(value.get("duration_seconds", 0.0)),
             segments=segments,
             words=words,
+            covered_ranges=tuple(covered_ranges),
         )
+
+
+def merge_covered_ranges(
+    ranges: Iterable[tuple[float, float]],
+    *,
+    total_duration: float | None = None,
+    join_tolerance: float = 0.25,
+) -> tuple[tuple[float, float], ...]:
+    """Normalize, clip, and union audio coverage ranges."""
+
+    limit = (
+        max(0.0, float(total_duration))
+        if total_duration is not None
+        else None
+    )
+    normalized: list[tuple[float, float]] = []
+    for raw_start, raw_end in ranges:
+        try:
+            start = max(0.0, float(raw_start))
+            end = max(0.0, float(raw_end))
+        except (TypeError, ValueError):
+            continue
+        if limit is not None:
+            start = min(limit, start)
+            end = min(limit, end)
+        if end - start <= 1e-6:
+            continue
+        normalized.append((start, end))
+    normalized.sort()
+
+    merged: list[tuple[float, float]] = []
+    tolerance = max(0.0, float(join_tolerance))
+    for start, end in normalized:
+        if not merged or start > merged[-1][1] + tolerance:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return tuple(merged)
+
+
+def missing_covered_ranges(
+    total_duration: float,
+    covered_ranges: Iterable[tuple[float, float]],
+    *,
+    minimum_seconds: float = 0.5,
+) -> tuple[tuple[float, float], ...]:
+    """Return only the portions of a VOD that still require speech recognition."""
+
+    total = max(0.0, float(total_duration))
+    covered = merge_covered_ranges(
+        covered_ranges,
+        total_duration=total,
+    )
+    missing: list[tuple[float, float]] = []
+    cursor = 0.0
+    minimum = max(0.0, float(minimum_seconds))
+    for start, end in covered:
+        if start - cursor >= minimum:
+            missing.append((cursor, start))
+        cursor = max(cursor, end)
+    if total - cursor >= minimum:
+        missing.append((cursor, total))
+    return tuple(missing)
+
+
+def covered_duration(ranges: Iterable[tuple[float, float]]) -> float:
+    return sum(end - start for start, end in merge_covered_ranges(ranges))
+
+
+def timestamp_in_ranges(
+    seconds: float,
+    ranges: Iterable[tuple[float, float]],
+) -> bool:
+    value = float(seconds)
+    return any(start - 1e-6 <= value <= end + 1e-6 for start, end in ranges)
 
 
 @dataclass(slots=True, frozen=True)
@@ -243,6 +338,14 @@ class _WhisperBackend:
 @dataclass(slots=True, frozen=True)
 class _StreamFailure:
     error: BaseException
+
+
+@dataclass(slots=True, frozen=True)
+class _RangedAudioChunk:
+    chunk: object
+    range_index: int
+    accept_start: float
+    accept_end: float
 
 
 _STREAM_END = object()
@@ -388,11 +491,15 @@ class FasterWhisperTranscriber:
         preview: PreviewCallback | None = None,
         resume: Transcript | None = None,
         checkpoint: CheckpointCallback | None = None,
+        reusable: Transcript | None = None,
+        reusable_ranges: Iterable[tuple[float, float]] = (),
     ) -> Transcript:
         """Transcribe bounded PCM chunks while the next audio chunk is streamed.
 
         Only SOOP's audio-only HLS is read. No complete media or audio file is
         created, and the decoder and batched GPU inference overlap in time.
+        Validated live-caption ranges can be reused so Whisper only receives
+        genuinely missing portions of the completed replay.
         """
         from .vod_stream import (
             DEFAULT_OVERLAP_SECONDS,
@@ -400,11 +507,152 @@ class FasterWhisperTranscriber:
             iter_audio_chunks,
         )
 
+        total_duration = max(0.0, float(source.total_duration_seconds))
+        resume_segments = list(resume.segments) if resume is not None else []
+        resume_boundary = (
+            max(
+                float(getattr(resume, "duration_seconds", 0.0) or 0.0),
+                max((segment.end for segment in resume_segments), default=0.0),
+            )
+            if resume_segments
+            else 0.0
+        )
+        resume_coverage = merge_covered_ranges(
+            (
+                resume.covered_ranges
+                if resume is not None and resume.covered_ranges
+                else ((0.0, resume_boundary),) if resume_segments else ()
+            ),
+            total_duration=total_duration,
+        )
+        reusable_coverage = merge_covered_ranges(
+            reusable_ranges if reusable is not None else (),
+            total_duration=total_duration,
+        )
+        initial_coverage = merge_covered_ranges(
+            (*resume_coverage, *reusable_coverage),
+            total_duration=total_duration,
+        )
+        missing_ranges = missing_covered_ranges(
+            total_duration,
+            initial_coverage,
+        )
+
+        accepted: list[tuple[float, float, str]] = [
+            (segment.start, segment.end, segment.text)
+            for segment in resume_segments
+            if segment.text.strip()
+        ]
+        accepted_words: list[TranscriptWord] = (
+            list(resume.words) if resume is not None else []
+        )
+        if reusable is not None:
+            for segment in reusable.segments:
+                midpoint = (segment.start + segment.end) / 2.0
+                if (
+                    segment.text.strip()
+                    and timestamp_in_ranges(midpoint, reusable_coverage)
+                    and not timestamp_in_ranges(midpoint, resume_coverage)
+                ):
+                    accepted.append((segment.start, segment.end, segment.text))
+            for word in reusable.words:
+                midpoint = (word.start + word.end) / 2.0
+                if (
+                    timestamp_in_ranges(midpoint, reusable_coverage)
+                    and not timestamp_in_ranges(midpoint, resume_coverage)
+                ):
+                    accepted_words.append(word)
+
+        def materialized_segments() -> list[TranscriptSegment]:
+            ordered = sorted(accepted, key=lambda item: (item[0], item[1], item[2]))
+            result: list[TranscriptSegment] = []
+            seen: set[tuple[int, int, str]] = set()
+            for start, end, text in ordered:
+                normalized = " ".join(text.split())
+                if not normalized:
+                    continue
+                key = (
+                    round(start * 1_000),
+                    round(end * 1_000),
+                    normalized.casefold(),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(
+                    TranscriptSegment(
+                        segment_id=f"s{len(result):06d}",
+                        start=start,
+                        end=end,
+                        text=text,
+                    )
+                )
+            return result
+
+        def materialized_words() -> tuple[TranscriptWord, ...]:
+            ordered = sorted(
+                accepted_words,
+                key=lambda word: (word.start, word.end, word.text),
+            )
+            result: list[TranscriptWord] = []
+            seen: set[tuple[int, int, str]] = set()
+            for word in ordered:
+                key = (
+                    round(word.start * 1_000),
+                    round(word.end * 1_000),
+                    word.text,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(word)
+            return tuple(result)
+
+        if resume_segments:
+            progress(
+                5,
+                f"저장된 중간 자막 {len(resume_segments):,}개를 이어서 분석합니다 · "
+                f"확인 완료 {format_timestamp(covered_duration(resume_coverage))}",
+            )
+        if reusable is not None and reusable_coverage:
+            progress(
+                5,
+                f"같은 방송의 라이브 자막 {len(reusable.segments):,}개를 재사용합니다 · "
+                f"중복 제외 {format_timestamp(covered_duration(reusable_coverage))}",
+            )
+        initial_segments = materialized_segments()
+        if preview is not None and initial_segments:
+            preview("transcript", transcript_preview_document(initial_segments))
+
+        if not missing_ranges:
+            if not initial_segments:
+                raise RuntimeError("재사용할 수 있는 자막 구간을 찾지 못했습니다.")
+            progress(
+                68,
+                "전체 다시보기 구간이 기존 자막으로 채워져 Whisper 중복 분석을 "
+                f"건너뜁니다 · 자막 {len(initial_segments):,}개",
+            )
+            return Transcript(
+                model=self.model_name,
+                language=(
+                    (resume.language if resume is not None else "")
+                    or (reusable.language if reusable is not None else "")
+                    or "ko"
+                ),
+                duration_seconds=total_duration,
+                segments=initial_segments,
+                words=materialized_words(),
+                covered_ranges=((0.0, total_duration),),
+            )
+
         backend = self._prepare_backend(progress, cancelled)
         batch_size = 8 if backend.runtime.device == "cuda" else 2
+        missing_duration = covered_duration(missing_ranges)
         progress(
             5,
-            f"{backend.runtime.description} 배치 {batch_size}로 고속 스트림 분석을 시작합니다…",
+            f"{backend.runtime.description} 배치 {batch_size} · "
+            f"기존 자막과 겹치지 않는 {format_timestamp(missing_duration)}만 "
+            "고속 분석합니다…",
         )
 
         work_queue: queue.Queue[object] = queue.Queue(maxsize=2)
@@ -424,34 +672,42 @@ class FasterWhisperTranscriber:
                         return False
             return False
 
-        resume_segments = list(resume.segments) if resume is not None else []
-        resume_boundary = (
-            max(
-                float(getattr(resume, "duration_seconds", 0.0) or 0.0),
-                max((segment.end for segment in resume_segments), default=0.0),
-            )
-            if resume_segments
-            else 0.0
-        )
-        stream_start = max(0.0, resume_boundary - DEFAULT_OVERLAP_SECONDS)
-        if resume_segments:
-            progress(
-                5,
-                f"저장된 중간 자막 {len(resume_segments):,}개를 이어서 분석합니다 · "
-                f"재개 지점 {format_timestamp(resume_boundary)}",
-            )
-            if preview is not None:
-                preview("transcript", transcript_preview_document(resume_segments))
-
         def produce() -> None:
             try:
-                for chunk in iter_audio_chunks(
-                    source,
-                    should_stop,
-                    start_seconds=stream_start,
+                for range_index, (range_start, range_end) in enumerate(
+                    missing_ranges
                 ):
-                    if not put_item(chunk):
-                        return
+                    emitted = False
+                    context_start = max(
+                        0.0,
+                        range_start - DEFAULT_OVERLAP_SECONDS,
+                    )
+                    context_end = min(
+                        total_duration,
+                        range_end + DEFAULT_OVERLAP_SECONDS,
+                    )
+                    for chunk in iter_audio_chunks(
+                        source,
+                        should_stop,
+                        start_seconds=context_start,
+                        end_seconds=context_end,
+                    ):
+                        emitted = True
+                        if not put_item(
+                            _RangedAudioChunk(
+                                chunk=chunk,
+                                range_index=range_index,
+                                accept_start=range_start,
+                                accept_end=range_end,
+                            )
+                        ):
+                            return
+                    if not emitted and not should_stop():
+                        raise RuntimeError(
+                            "누락 구간의 오디오를 읽지 못했습니다: "
+                            f"{format_timestamp(range_start)}~"
+                            f"{format_timestamp(range_end)}"
+                        )
             except BaseException as error:
                 put_item(_StreamFailure(error))
             finally:
@@ -475,17 +731,14 @@ class FasterWhisperTranscriber:
                     if not producer.is_alive() and work_queue.empty():
                         raise RuntimeError("고속 오디오 스트림이 예기치 않게 종료되었습니다.")
 
-        language = "ko"
-        accepted: list[tuple[float, float, str]] = [
-            (segment.start, segment.end, segment.text)
-            for segment in resume_segments
-            if segment.text.strip()
-        ]
-        accepted_words: list[TranscriptWord] = (
-            list(resume.words) if resume is not None else []
+        language = (
+            (resume.language if resume is not None else "")
+            or (reusable.language if reusable is not None else "")
+            or "ko"
         )
-        lower_boundary = resume_boundary
-        eta = EtaEstimator(source.total_duration_seconds)
+        completed_range_ends = [start for start, _end in missing_ranges]
+        lower_boundary = missing_ranges[0][0]
+        eta = EtaEstimator(missing_duration)
         try:
             current_item = get_item()
             if isinstance(current_item, _StreamFailure):
@@ -494,9 +747,13 @@ class FasterWhisperTranscriber:
                 raise RuntimeError("SOOP 오디오 스트림에 분석할 음성이 없습니다.")
 
             while True:
-                if not isinstance(current_item, AudioChunk):
+                if not isinstance(current_item, _RangedAudioChunk) or not isinstance(
+                    current_item.chunk,
+                    AudioChunk,
+                ):
                     raise RuntimeError("고속 오디오 청크 형식이 올바르지 않습니다.")
-                current = current_item
+                current_wrapper = current_item
+                current = current_wrapper.chunk
                 relative_segments, detected_language = self._transcribe_audio_chunk(
                     backend,
                     current,
@@ -510,18 +767,30 @@ class FasterWhisperTranscriber:
                 if isinstance(next_item, _StreamFailure):
                     raise next_item.error
                 has_next = next_item is not _STREAM_END
-                if has_next and not isinstance(next_item, AudioChunk):
+                if has_next and (
+                    not isinstance(next_item, _RangedAudioChunk)
+                    or not isinstance(next_item.chunk, AudioChunk)
+                ):
                     raise RuntimeError("고속 오디오 청크 형식이 올바르지 않습니다.")
 
                 upper_boundary = current.end_seconds
                 if (
                     has_next
-                    and next_item.part_order == current.part_order
-                    and next_item.start_seconds < current.end_seconds
+                    and next_item.range_index == current_wrapper.range_index
+                    and next_item.chunk.part_order == current.part_order
+                    and next_item.chunk.start_seconds < current.end_seconds
                 ):
                     upper_boundary = (
-                        current.end_seconds + next_item.start_seconds
+                        current.end_seconds + next_item.chunk.start_seconds
                     ) / 2.0
+                accept_lower = max(
+                    current_wrapper.accept_start,
+                    lower_boundary,
+                )
+                accept_upper = min(
+                    current_wrapper.accept_end,
+                    upper_boundary,
+                )
 
                 for start, end, text, rel_words in relative_segments:
                     absolute_start = max(
@@ -533,9 +802,9 @@ class FasterWhisperTranscriber:
                         min(current.end_seconds, current.start_seconds + end),
                     )
                     midpoint = (absolute_start + absolute_end) / 2.0
-                    if midpoint + 1e-6 < lower_boundary:
+                    if midpoint + 1e-6 < accept_lower:
                         continue
-                    if has_next and midpoint >= upper_boundary:
+                    if midpoint >= accept_upper:
                         continue
                     accepted.append((absolute_start, absolute_end, text))
                     for word in rel_words:
@@ -547,84 +816,107 @@ class FasterWhisperTranscriber:
                             word_start,
                             min(current.end_seconds, current.start_seconds + word.end),
                         )
-                        accepted_words.append(
-                            TranscriptWord(word_start, word_end, word.text)
-                        )
+                        word_midpoint = (word_start + word_end) / 2.0
+                        if accept_lower <= word_midpoint < accept_upper:
+                            accepted_words.append(
+                                TranscriptWord(word_start, word_end, word.text)
+                            )
 
                 if preview is not None and accepted:
+                    preview_segments = materialized_segments()
                     preview(
                         "transcript",
-                        transcript_preview_document(accepted),
+                        transcript_preview_document(preview_segments),
                     )
 
+                completed_range_ends[current_wrapper.range_index] = max(
+                    completed_range_ends[current_wrapper.range_index],
+                    min(
+                        current_wrapper.accept_end,
+                        max(current_wrapper.accept_start, upper_boundary),
+                    ),
+                )
+                checkpoint_coverage = merge_covered_ranges(
+                    (
+                        *initial_coverage,
+                        *(
+                            (start, completed_range_ends[index])
+                            for index, (start, _end) in enumerate(missing_ranges)
+                            if completed_range_ends[index] > start
+                        ),
+                    ),
+                    total_duration=total_duration,
+                )
                 if checkpoint is not None and accepted:
+                    checkpoint_segments = materialized_segments()
                     checkpoint(
                         Transcript(
                             model=self.model_name,
                             language=language,
-                            duration_seconds=upper_boundary,
-                            segments=[
-                                TranscriptSegment(
-                                    segment_id=f"s{index:06d}",
-                                    start=start,
-                                    end=end,
-                                    text=text,
-                                )
-                                for index, (start, end, text) in enumerate(accepted)
-                                if text.strip()
-                            ],
-                            words=tuple(accepted_words),
+                            duration_seconds=max(
+                                (end for _start, end in checkpoint_coverage),
+                                default=0.0,
+                            ),
+                            segments=checkpoint_segments,
+                            words=materialized_words(),
+                            covered_ranges=checkpoint_coverage,
                         )
                     )
 
-                processed_seconds = min(source.total_duration_seconds, upper_boundary)
+                processed_missing = sum(
+                    max(0.0, completed_range_ends[index] - start)
+                    for index, (start, _end) in enumerate(missing_ranges)
+                )
                 ratio = (
-                    processed_seconds / source.total_duration_seconds
-                    if source.total_duration_seconds > 0
+                    processed_missing / missing_duration
+                    if missing_duration > 0
                     else 0.0
                 )
                 percent = min(68, 5 + int(max(0.0, min(1.0, ratio)) * 63))
                 progress(
                     percent,
-                    "오디오 스트리밍·배치 인식 중… "
-                    f"{format_timestamp(processed_seconds)} / "
-                    f"{format_timestamp(source.total_duration_seconds)} · "
-                    f"{format_eta(eta.remaining_seconds(processed_seconds))}",
+                    "중복 제외 오디오 인식 중… 새 분석 "
+                    f"{format_timestamp(processed_missing)} / "
+                    f"{format_timestamp(missing_duration)} · 전체 위치 "
+                    f"{format_timestamp(min(total_duration, upper_boundary))} · "
+                    f"{format_eta(eta.remaining_seconds(processed_missing))}",
                 )
 
                 if not has_next:
                     break
-                lower_boundary = (
-                    upper_boundary
-                    if next_item.start_seconds < current.end_seconds
-                    else next_item.start_seconds
-                )
+                if next_item.range_index != current_wrapper.range_index:
+                    lower_boundary = next_item.accept_start
+                else:
+                    lower_boundary = (
+                        upper_boundary
+                        if next_item.chunk.start_seconds < current.end_seconds
+                        else max(
+                            next_item.accept_start,
+                            next_item.chunk.start_seconds,
+                        )
+                    )
                 current_item = next_item
         finally:
             stop_event.set()
             producer.join(timeout=2.0)
 
-        segments = [
-            TranscriptSegment(
-                segment_id=f"s{index:06d}",
-                start=start,
-                end=end,
-                text=text,
-            )
-            for index, (start, end, text) in enumerate(accepted)
-            if text.strip()
-        ]
+        segments = materialized_segments()
         if not segments:
             raise RuntimeError("SOOP 오디오에서 음성을 인식하지 못했습니다.")
 
-        duration = max(source.total_duration_seconds, segments[-1].end)
-        progress(68, f"고속 음성 인식 완료 · {len(segments):,}개 구간")
+        duration = max(total_duration, segments[-1].end)
+        progress(
+            68,
+            f"고속 음성 인식 완료 · 기존 구간 재사용 + 누락 구간 분석 · "
+            f"자막 {len(segments):,}개",
+        )
         return Transcript(
             model=self.model_name,
             language=language,
             duration_seconds=duration,
             segments=segments,
-            words=tuple(accepted_words),
+            words=materialized_words(),
+            covered_ranges=((0.0, total_duration),),
         )
 
     def transcribe_live(

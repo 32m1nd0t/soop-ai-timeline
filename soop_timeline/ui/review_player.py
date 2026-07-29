@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 
 from PySide6.QtCore import QTimer, Qt, QUrl, QUrlQuery, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QShortcut
@@ -689,6 +691,48 @@ class ResilientQtWebView2Widget(QtWebView2Widget):
             super().evaluate_js(script, callback)
         except Exception as error:
             self._report_native_failure(f"WebView2 명령 실행 실패: {error}")
+
+    def dispatch_page_click(self, x: float, y: float) -> bool:
+        """Send a trusted left-click to viewport coordinates through WebView2.
+
+        Some SOOP controls ignore JavaScript ``element.click()`` but accept the
+        same browser-level mouse input as a real user click. CDP coordinates are
+        CSS viewport pixels, matching ``getBoundingClientRect()``.
+        """
+
+        webview = getattr(self, "_webview", None)
+        if not self.is_ready or webview is None or not self.native_control_healthy():
+            return False
+        try:
+            click_x = float(x)
+            click_y = float(y)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(click_x) or not math.isfinite(click_y):
+            return False
+        try:
+            core = webview.CoreWebView2
+            for event_type, buttons in (("mousePressed", 1), ("mouseReleased", 0)):
+                payload = json.dumps(
+                    {
+                        "type": event_type,
+                        "x": click_x,
+                        "y": click_y,
+                        "button": "left",
+                        "buttons": buttons,
+                        "clickCount": 1,
+                        "pointerType": "mouse",
+                    },
+                    separators=(",", ":"),
+                )
+                core.CallDevToolsProtocolMethodAsync(
+                    "Input.dispatchMouseEvent",
+                    payload,
+                )
+            return True
+        except Exception as error:
+            logger.warning("WebView2 trusted click failed: %s", error)
+            return False
 
     def closeEvent(self, event) -> None:
         webview = getattr(self, "_webview", None)

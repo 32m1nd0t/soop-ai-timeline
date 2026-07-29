@@ -3,7 +3,7 @@ import unittest
 from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Slot
 
 from soop_timeline.models import Vod
-from soop_timeline.ui.analysis_worker import AnalysisWorker
+from soop_timeline.ui.analysis_worker import AnalysisWorker, PreTranscribeWorker
 
 
 class _FakeAnalyzer:
@@ -26,6 +26,134 @@ class _Receiver(QObject):
 
 
 class AnalysisWorkerTests(unittest.TestCase):
+    def test_pretranscribe_worker_uses_only_fw_transcription(self):
+        vod = Vod(
+            vod_id="fw-only",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="FW 선행 분석",
+            url="https://vod.sooplive.com/player/fw-only",
+            duration_text="1:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="queued",
+            discovered_at="",
+            updated_at="",
+        )
+        transcribed: list[str] = []
+        succeeded: list[str] = []
+        progress_updates: list[tuple[str, int, str]] = []
+
+        class Analyzer:
+            @staticmethod
+            def transcribe_vod(vod, progress, cancelled):
+                self.assertFalse(cancelled())
+                progress(100, "완료")
+                transcribed.append(vod.vod_id)
+
+            @staticmethod
+            def analyze_vod(*args, **kwargs):
+                raise AssertionError("FW 선행 분석에서 Gemini를 호출하면 안 됩니다.")
+
+        worker = PreTranscribeWorker(Analyzer(), vod)
+        worker.succeeded.connect(succeeded.append)
+        worker.progress_changed.connect(
+            lambda vod_id, percent, message: progress_updates.append(
+                (vod_id, percent, message)
+            )
+        )
+
+        worker.run()
+
+        self.assertEqual(transcribed, ["fw-only"])
+        self.assertEqual(succeeded, ["fw-only"])
+        self.assertEqual(progress_updates, [("fw-only", 100, "완료")])
+
+    def test_linked_replay_passes_live_captures_to_analyzer(self):
+        vod = Vod(
+            vod_id="456",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="다시보기",
+            url="https://vod.sooplive.com/player/456",
+            duration_text="1:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="new",
+            discovered_at="",
+            updated_at="",
+        )
+        live = Vod(
+            vod_id="live-456",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="[LIVE] 방송",
+            url="https://play.sooplive.com/sample/987",
+            duration_text="시작 00:10:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="review",
+            discovered_at="",
+            updated_at="",
+            source_kind="live",
+            live_broadcast_no="987",
+        )
+        received: list[tuple[Vod, ...]] = []
+
+        class Analyzer:
+            @staticmethod
+            def analyze_vod(
+                vod,
+                progress,
+                cancelled,
+                preview,
+                reusable_live_vods=(),
+            ):
+                del vod, progress, cancelled, preview
+                received.append(tuple(reusable_live_vods))
+                return "완료"
+
+        worker = AnalysisWorker(
+            Analyzer(),
+            vod,
+            reusable_live_vods=(live,),
+        )
+        worker.run()
+
+        self.assertEqual(received, [(live,)])
+
+    def test_custom_result_vod_id_routes_result_to_target_document(self):
+        vod = Vod(
+            vod_id="456",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="다시보기 원본",
+            url="https://vod.sooplive.com/player/456",
+            duration_text="1:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="new",
+            discovered_at="",
+            updated_at="",
+        )
+        received: list[tuple[str, str]] = []
+        worker = AnalysisWorker(
+            _FakeAnalyzer(),
+            vod,
+            result_vod_id="live-456",
+        )
+        worker.succeeded.connect(
+            lambda vod_id, document: received.append((vod_id, document))
+        )
+
+        worker.run()
+
+        self.assertEqual(received[0][0], "live-456")
+
     def test_success_is_delivered_to_receiver_thread_with_vod_id(self):
         app = QCoreApplication.instance() or QCoreApplication([])
         vod = Vod(

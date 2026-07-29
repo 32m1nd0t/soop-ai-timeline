@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
 from ..models import Vod
 from ..services.text_editing import find_literal_matches, replace_literal_all
 from ..services.timeline_blocks import COMMENT_LIMIT, block_label, split_timeline
-from ..services.timeline_document import ensure_ai_timeline_notice
 from ..services.timeline_timestamp import (
     adjust_timestamp_on_current_line,
     format_timestamp_seconds,
@@ -179,6 +178,7 @@ class TimelineDocumentEditor(QWidget):
     review_completed = Signal(str)
     analysis_requested = Signal(str)
     analysis_cancel_requested = Signal(str)
+    live_reconnect_requested = Signal(str)
     reanalyze_as_vod_requested = Signal(str)
     style_requested = Signal(str)
     line_rewrite_requested = Signal(str, str, str, int, int)
@@ -218,6 +218,9 @@ class TimelineDocumentEditor(QWidget):
         self._manual_snapshot_taken = False
         self._cached_transcript_available = False
         self._cache_present = False
+        self._analysis_running = False
+        self._live_running = False
+        self._live_reconnect_pending = False
         self._final_pending = False
         self._line_rewrite_running = False
         self._last_focused_editor: TimelineTextEdit | None = None
@@ -260,11 +263,22 @@ class TimelineDocumentEditor(QWidget):
             "SOOP 라이브 열기" if self._is_live else "SOOP에서 열기"
         )
         self.open_source_button.clicked.connect(self._open_source_page)
+        self.live_reconnect_button = QPushButton("라이브 재연결")
+        self.live_reconnect_button.setObjectName("primaryButton")
+        self.live_reconnect_button.setToolTip(
+            "저장된 방송 번호로 현재 라이브에 다시 연결합니다. "
+            "기존 자막과 타임라인은 지우지 않고 이어서 작성합니다."
+        )
+        self.live_reconnect_button.setVisible(self._is_live)
+        self.live_reconnect_button.clicked.connect(
+            lambda: self.live_reconnect_requested.emit(self.vod.vod_id)
+        )
         self.player_button = QPushButton("검수 플레이어 열기")
         self.player_button.clicked.connect(self.toggle_review_player)
         self.player_button.setVisible(not self._is_live)
         title_row.addWidget(title, 1)
         title_row.addWidget(self.player_button)
+        title_row.addWidget(self.live_reconnect_button)
         title_row.addWidget(self.open_source_button)
 
         meta = QLabel(
@@ -317,8 +331,9 @@ class TimelineDocumentEditor(QWidget):
         self.reanalyze_vod_button = QPushButton("다시보기 전체로 재분석")
         self.reanalyze_vod_button.setObjectName("primaryButton")
         self.reanalyze_vod_button.setToolTip(
-            "방송이 끝난 뒤, 완성된 다시보기 전체 영상을 처음부터 정식 분석합니다. "
-            "라이브 중 놓친 앞부분까지 포함되고 검수 플레이어도 사용할 수 있습니다."
+            "방송이 끝난 뒤 완성된 다시보기의 전체 범위를 정식 분석합니다. "
+            "같은 방송 번호의 라이브 자막은 재사용하고 실제 누락 구간만 새로 "
+            "인식하며, 검수 플레이어도 사용할 수 있습니다."
         )
         self.reanalyze_vod_button.setVisible(self._is_live)
         self.reanalyze_vod_button.clicked.connect(
@@ -795,9 +810,20 @@ class TimelineDocumentEditor(QWidget):
             self.preview_editor.setTextCursor(cursor)
 
     def set_analysis_running(self, running: bool) -> None:
-        self.analyze_button.setVisible(not running)
+        self._analysis_running = running
+        self._update_live_reconnect_button()
+        self.analyze_button.setVisible(not running and not self._is_live)
+        self.reanalyze_vod_button.setVisible(self._is_live and not running)
         self.cancel_analysis_button.setVisible(running)
+        self.cancel_analysis_button.setText(
+            "분석 취소"
+            if running
+            else ("라이브 종료 및 정리" if self._is_live else "분석 취소")
+        )
         self.analysis_progress.setVisible(running)
+        self.analysis_progress.setRange(0, 100)
+        if running:
+            self.analysis_progress.setValue(0)
         self.copy_all_button.setEnabled(not running)
         self.ready_button.setEnabled(not running)
         self.publish_button.setEnabled(not running)
@@ -823,6 +849,10 @@ class TimelineDocumentEditor(QWidget):
             self.preview_title.setText("분석 중간 결과 · 최종본 아님")
 
     def set_live_running(self, running: bool) -> None:
+        self._live_running = running
+        if running:
+            self._live_reconnect_pending = False
+        self._update_live_reconnect_button()
         self.analyze_button.setVisible(False)
         self.reanalyze_vod_button.setVisible(self._is_live and not running)
         self.cancel_analysis_button.setVisible(running)
@@ -861,6 +891,24 @@ class TimelineDocumentEditor(QWidget):
             self.status_label.setText(
                 "라이브 오디오를 연결하고 방송 경과시간 기준점을 확인합니다…"
             )
+
+    def set_live_reconnect_pending(self, pending: bool) -> None:
+        self._live_reconnect_pending = pending
+        self._update_live_reconnect_button()
+
+    def _update_live_reconnect_button(self) -> None:
+        self.live_reconnect_button.setText(
+            "라이브 재연결 중…"
+            if self._live_reconnect_pending
+            else "라이브 재연결"
+        )
+        self.live_reconnect_button.setEnabled(not self._live_reconnect_pending)
+        self.live_reconnect_button.setVisible(
+            self._is_live
+            and self._review_vod is None
+            and not self._live_running
+            and not self._analysis_running
+        )
 
     def request_live_stop(self) -> None:
         self.cancel_analysis_button.setEnabled(False)
@@ -960,7 +1008,7 @@ class TimelineDocumentEditor(QWidget):
         return [block.text() for block in self._blocks]
 
     def set_text(self, text: str) -> None:
-        self._replace_blocks(split_timeline(ensure_ai_timeline_notice(text)))
+        self._replace_blocks(split_timeline(text))
 
     def reset_work_document(self, text: str) -> None:
         self._save_timer.stop()
@@ -1431,13 +1479,21 @@ class TimelineDocumentEditor(QWidget):
 
     def attach_replay(self, replay: Vod) -> None:
         self._review_vod = replay
+        self._live_reconnect_pending = False
+        self._update_live_reconnect_button()
         self.review_player.set_vod(replay)
         self.player_button.setVisible(True)
         self.insert_time_button.setVisible(True)
         self.open_source_button.setText("SOOP 다시보기 열기")
+        self.reanalyze_vod_button.setText("연결된 다시보기로 전체 재분석")
+        self.reanalyze_vod_button.setToolTip(
+            "연결된 다시보기 전체 범위를 완성하고 결과는 현재 라이브 탭에 표시합니다. "
+            "라이브 자막과 겹치는 구간은 다시 인식하지 않으며 현재 타임라인은 "
+            "이전 버전에 보존됩니다."
+        )
         self.notice.setText(
             "종료된 라이브의 다시보기를 자동으로 연결했습니다. "
-            "라이브 중 만든 타임라인은 그대로 유지되며 검수 플레이어로 전체 방송을 확인할 수 있습니다."
+            "라이브 중 만든 타임라인은 그대로 유지되며, 전체 재분석도 이 탭에서 진행됩니다."
         )
         self.status_label.setText("종료된 라이브에 다시보기를 자동 연결했습니다.")
 

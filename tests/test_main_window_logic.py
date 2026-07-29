@@ -1,8 +1,9 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from soop_timeline.models import VodState
-from soop_timeline.services.timeline_document import ensure_ai_timeline_notice
+from soop_timeline.services.manual_link import ResolvedVodLink
 from soop_timeline.ui.main_window import MainWindow
 
 
@@ -30,7 +31,7 @@ class _TimelineDatabase:
 
 class MainWindowStateLogicTests(unittest.TestCase):
     def test_opening_existing_completed_timeline_does_not_change_state(self):
-        existing = ensure_ai_timeline_notice("완료된 내용")
+        existing = "완료된 내용"
         database = _TimelineDatabase(state=VodState.READY.value, text=existing)
         window = SimpleNamespace(
             database=database,
@@ -43,8 +44,13 @@ class MainWindowStateLogicTests(unittest.TestCase):
         self.assertEqual(database.saved, [])
         self.assertEqual(database.state_changes, [])
 
-    def test_opening_older_timeline_adds_notice_without_reopening_review(self):
-        database = _TimelineDatabase(state=VodState.READY.value, text="완료된 내용")
+    def test_creating_new_timeline_saves_with_review_state(self):
+        class _NoTimelineDatabase(_TimelineDatabase):
+            def get_timeline(self, vod_id: str):
+                del vod_id
+                return None
+
+        database = _NoTimelineDatabase(state=VodState.NEW.value, text="")
         window = SimpleNamespace(
             database=database,
             analyzer=SimpleNamespace(initial_document=lambda vod: "새 문서"),
@@ -52,13 +58,15 @@ class MainWindowStateLogicTests(unittest.TestCase):
 
         text = MainWindow._load_or_create_timeline_text(window, database.vod)
 
-        expected = ensure_ai_timeline_notice("완료된 내용")
-        self.assertEqual(text, expected)
+        self.assertEqual(text, "새 문서")
         self.assertEqual(
             database.saved,
-            [("vod-1", expected, VodState.READY.value)],
+            [("vod-1", "새 문서", VodState.REVIEW.value)],
         )
-        self.assertEqual(database.state_changes, [])
+        self.assertEqual(
+            database.state_changes,
+            [("vod-1", VodState.REVIEW.value)],
+        )
 
     def test_unchanged_ready_timeline_stays_ready_when_editor_closes(self):
         database = _TimelineDatabase(state=VodState.READY.value, text="same")
@@ -108,6 +116,43 @@ class MainWindowStateLogicTests(unittest.TestCase):
 
         self.assertEqual(opened, ["vod-77"])
 
+    def test_vod_header_click_toggles_sort_direction(self):
+        indicators: list[tuple[int, object]] = []
+        shown: list[bool] = []
+        placeholders: list[str] = []
+        loaded: list[bool] = []
+
+        header = SimpleNamespace(
+            setSortIndicatorShown=shown.append,
+            setSortIndicator=lambda column, order: indicators.append(
+                (column, order)
+            ),
+        )
+        combo = SimpleNamespace(
+            blockSignals=lambda blocked: None,
+            setCurrentIndex=lambda index: None,
+            setPlaceholderText=placeholders.append,
+        )
+        window = SimpleNamespace(
+            _VOD_HEADER_SORT_KEYS=MainWindow._VOD_HEADER_SORT_KEYS,
+            _vod_header_sort_column=None,
+            _vod_header_sort_ascending=True,
+            vod_table=SimpleNamespace(horizontalHeader=lambda: header),
+            sort_combo=combo,
+            load_vods=lambda: loaded.append(True),
+        )
+
+        MainWindow._on_vod_header_clicked(window, 3)
+        MainWindow._on_vod_header_clicked(window, 3)
+
+        self.assertEqual(window._vod_header_sort_column, 3)
+        self.assertFalse(window._vod_header_sort_ascending)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(shown, [True, True])
+        self.assertIn("영상 제목 오름차순", placeholders[0])
+        self.assertIn("영상 제목 내림차순", placeholders[1])
+        self.assertNotEqual(indicators[0][1], indicators[1][1])
+
     def test_recovered_queue_item_is_not_removed_before_start_attempt(self):
         calls: list[tuple[str, bool, list[str]]] = []
 
@@ -123,6 +168,10 @@ class MainWindowStateLogicTests(unittest.TestCase):
             _line_rewrite_jobs={},
             _regroup_jobs={},
             _manual_link_job=None,
+            _live_reconnect_job=None,
+            _stale_live_sessions=[],
+            _pretranscribe_jobs={},
+            _pretranscribe_queue=[],
             _analysis_queue=["vod-1"],
             _editor_tabs={},
             database=QueueDatabase(),
@@ -137,6 +186,479 @@ class MainWindowStateLogicTests(unittest.TestCase):
         MainWindow._resume_persisted_analysis(window)
 
         self.assertEqual(calls, [("vod-1", True, ["vod-1"])])
+
+    def test_fw_ready_queue_head_advances_while_next_fw_is_running(self):
+        calls: list[str] = []
+
+        class QueueDatabase:
+            @staticmethod
+            def get_vod(vod_id: str):
+                return SimpleNamespace(vod_id=vod_id, source_kind="vod")
+
+        window = SimpleNamespace(
+            _analysis_jobs={},
+            _live_jobs={},
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _manual_link_job=None,
+            _live_reconnect_job=None,
+            _stale_live_sessions=[],
+            _pretranscribe_jobs={"vod-3": (object(), object())},
+            _pretranscribe_queue=["vod-3"],
+            _analysis_queue=["vod-2", "vod-3"],
+            _editor_tabs={},
+            database=QueueDatabase(),
+            open_timeline=lambda vod_id: None,
+            start_analysis=lambda vod_id, _from_queue=False: calls.append(vod_id),
+        )
+
+        MainWindow._resume_persisted_analysis(window)
+
+        self.assertEqual(calls, ["vod-2"])
+
+    def test_second_analysis_queues_fw_without_starting_another_ai_job(self):
+        queued: list[str] = []
+        state_changes: list[tuple[str, str]] = []
+        editor_messages: list[str] = []
+        status_messages: list[str] = []
+        pretranscribe_resumes: list[bool] = []
+
+        requested = SimpleNamespace(
+            vod_id="vod-2",
+            source_kind="vod",
+            title="두 번째 영상",
+            state=VodState.REVIEW.value,
+        )
+        running = SimpleNamespace(
+            vod_id="vod-1",
+            source_kind="vod",
+            title="첫 번째 영상",
+            state=VodState.ANALYZING.value,
+        )
+
+        class Database:
+            @staticmethod
+            def get_vod(vod_id: str):
+                return requested if vod_id == "vod-2" else running
+
+            @staticmethod
+            def enqueue_analysis(vod_id: str):
+                queued.append(vod_id)
+
+            @staticmethod
+            def set_vod_state(vod_id: str, state: str):
+                state_changes.append((vod_id, state))
+
+        editor = SimpleNamespace(
+            status_label=SimpleNamespace(setText=editor_messages.append)
+        )
+        window = SimpleNamespace(
+            database=Database(),
+            _editor_tabs={"vod-2": editor},
+            _live_reconnect_job=None,
+            _stale_live_sessions=[],
+            _live_jobs={},
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _analysis_jobs={"vod-1": (object(), object())},
+            _analysis_source_ids={"vod-1": "vod-1"},
+            _analysis_queue=[],
+            _pretranscribe_jobs={},
+            _pretranscribe_queue=[],
+            status_label=SimpleNamespace(setText=status_messages.append),
+            load_vods=lambda: None,
+            _resume_pretranscribe_if_idle=lambda: pretranscribe_resumes.append(True),
+        )
+
+        MainWindow.start_analysis(window, "vod-2")
+
+        self.assertEqual(window._analysis_queue, ["vod-2"])
+        self.assertEqual(window._pretranscribe_queue, ["vod-2"])
+        self.assertEqual(queued, ["vod-2"])
+        self.assertEqual(
+            state_changes,
+            [("vod-2", VodState.QUEUED.value)],
+        )
+        self.assertEqual(pretranscribe_resumes, [True])
+        self.assertIn("FW 자막추출", editor_messages[-1])
+        self.assertIn("Gemini", editor_messages[-1])
+        self.assertIn("FW 자막추출", status_messages[-1])
+
+    def test_pretranscribe_can_start_while_an_analysis_is_running(self):
+        started: list[str] = []
+        window = SimpleNamespace(
+            _pretranscribe_jobs={},
+            _pretranscribe_queue=["vod-2"],
+            _MAX_CONCURRENT_PRETRANSCRIBES=3,
+            _close_after_analysis=False,
+            _stale_live_sessions=[],
+            _live_reconnect_job=None,
+            _analysis_jobs={"vod-1": (object(), object())},
+            _analysis_queue=["vod-2"],
+            _live_jobs={},
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _manual_link_job=None,
+            _start_pretranscribe=started.append,
+        )
+
+        MainWindow._resume_pretranscribe_if_idle(window)
+
+        self.assertEqual(started, ["vod-2"])
+
+    def test_pretranscribe_starts_at_most_three_fw_jobs(self):
+        started: list[str] = []
+        jobs: dict[str, tuple[object, object]] = {}
+
+        def start_pretranscribe(vod_id: str) -> None:
+            started.append(vod_id)
+            jobs[vod_id] = (object(), object())
+
+        window = SimpleNamespace(
+            _pretranscribe_jobs=jobs,
+            _pretranscribe_queue=["vod-1", "vod-2", "vod-3", "vod-4"],
+            _MAX_CONCURRENT_PRETRANSCRIBES=3,
+            _close_after_analysis=False,
+            _stale_live_sessions=[],
+            _live_reconnect_job=None,
+            _live_jobs={},
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _manual_link_job=None,
+            _start_pretranscribe=start_pretranscribe,
+        )
+
+        MainWindow._resume_pretranscribe_if_idle(window)
+
+        self.assertEqual(started, ["vod-1", "vod-2", "vod-3"])
+        self.assertEqual(set(jobs), {"vod-1", "vod-2", "vod-3"})
+
+    def test_all_pending_analyses_get_fw_preparation_while_ai_runs(self):
+        window = SimpleNamespace(
+            _close_after_analysis=False,
+            _stale_live_sessions=[],
+            _analysis_jobs={"vod-1": (object(), object())},
+            _analysis_queue=["vod-2", "vod-3"],
+            _pretranscribe_queue=[],
+            _pretranscribe_attempted_ids=set(),
+            _live_jobs={},
+            _live_reconnect_job=None,
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _manual_link_job=None,
+            _resume_pretranscribe_if_idle=lambda: None,
+        )
+
+        with patch(
+            "soop_timeline.ui.main_window.QTimer.singleShot"
+        ) as single_shot:
+            MainWindow._resume_analysis_queue_if_idle(window)
+
+        self.assertEqual(window._pretranscribe_queue, ["vod-2", "vod-3"])
+        single_shot.assert_called_once()
+
+    def test_completed_pretranscribe_is_not_requeued_while_ai_runs(self):
+        window = SimpleNamespace(
+            _close_after_analysis=False,
+            _stale_live_sessions=[],
+            _analysis_jobs={"vod-1": (object(), object())},
+            _analysis_queue=["vod-2"],
+            _pretranscribe_queue=[],
+            _pretranscribe_attempted_ids={"vod-2"},
+            _live_jobs={},
+            _live_reconnect_job=None,
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+            _manual_link_job=None,
+            _resume_pretranscribe_if_idle=lambda: None,
+        )
+
+        with patch(
+            "soop_timeline.ui.main_window.QTimer.singleShot"
+        ) as single_shot:
+            MainWindow._resume_analysis_queue_if_idle(window)
+
+        self.assertEqual(window._pretranscribe_queue, [])
+        single_shot.assert_not_called()
+
+    def test_live_shutdown_preserves_session_for_next_launch(self):
+        saved: list[tuple[str, str, str]] = []
+        states: list[tuple[str, str]] = []
+        running: list[bool] = []
+        messages: list[str] = []
+
+        class Database:
+            @staticmethod
+            def get_timeline(vod_id: str):
+                del vod_id
+                return SimpleNamespace(text="저장본")
+
+            @staticmethod
+            def save_timeline(vod_id: str, text: str, state: str):
+                saved.append((vod_id, text, state))
+
+            @staticmethod
+            def set_vod_state(vod_id: str, state: str):
+                states.append((vod_id, state))
+
+        editor = SimpleNamespace(
+            set_live_running=running.append,
+            status_label=SimpleNamespace(setText=messages.append),
+            text=lambda: "현재 라이브 타임라인",
+        )
+        window = SimpleNamespace(
+            _editor_tabs={"live-1": editor},
+            database=Database(),
+        )
+
+        MainWindow._preserve_live_for_restart(
+            window,
+            "live-1",
+            "application shutdown",
+        )
+
+        self.assertEqual(running, [False])
+        self.assertEqual(
+            saved,
+            [
+                (
+                    "live-1",
+                    "현재 라이브 타임라인",
+                    VodState.ANALYZING.value,
+                )
+            ],
+        )
+        self.assertEqual(
+            states,
+            [("live-1", VodState.ANALYZING.value)],
+        )
+        self.assertIn("자동 재연결", messages[0])
+
+    def test_live_reconnect_terminal_errors_are_not_retried(self):
+        self.assertTrue(
+            MainWindow._is_terminal_live_reconnect_error(
+                "입력한 라이브 방송이 종료되었거나 다른 방송으로 전환되었습니다."
+            )
+        )
+        self.assertFalse(
+            MainWindow._is_terminal_live_reconnect_error(
+                "SOOP 라이브 정보 요청에 실패했습니다."
+            )
+        )
+
+    def test_manual_live_reconnect_requeues_legacy_review_session(self):
+        saved: list[tuple[str, str, str]] = []
+        states: list[tuple[str, str]] = []
+        pending: list[bool] = []
+        retries: list[int] = []
+        messages: list[str] = []
+
+        class Database:
+            @staticmethod
+            def get_vod(vod_id: str):
+                return SimpleNamespace(
+                    vod_id=vod_id,
+                    source_kind="live",
+                    state=VodState.REVIEW.value,
+                    streamer_name="테스트 스트리머",
+                )
+
+            @staticmethod
+            def save_timeline(vod_id: str, text: str, state: str):
+                saved.append((vod_id, text, state))
+
+            @staticmethod
+            def set_vod_state(vod_id: str, state: str):
+                states.append((vod_id, state))
+
+        editor = SimpleNamespace(
+            text=lambda: "기존 라이브 타임라인",
+            set_live_reconnect_pending=pending.append,
+            status_label=SimpleNamespace(setText=messages.append),
+        )
+        window = SimpleNamespace(
+            database=Database(),
+            _editor_tabs={"live-1": editor},
+            _live_jobs={},
+            _live_reconnect_target_id="",
+            _stale_live_sessions=[],
+            _live_reconnect_attempts={"live-1": 3},
+            status_label=SimpleNamespace(setText=messages.append),
+            load_vods=lambda: None,
+            _schedule_live_reconnect_retry=retries.append,
+        )
+
+        MainWindow.reconnect_live_session(window, "live-1")
+
+        self.assertEqual(pending, [True])
+        self.assertEqual(
+            saved,
+            [
+                (
+                    "live-1",
+                    "기존 라이브 타임라인",
+                    VodState.ANALYZING.value,
+                )
+            ],
+        )
+        self.assertEqual(
+            states,
+            [("live-1", VodState.ANALYZING.value)],
+        )
+        self.assertEqual(window._stale_live_sessions, ["live-1"])
+        self.assertNotIn("live-1", window._live_reconnect_attempts)
+        self.assertEqual(retries, [0])
+        self.assertTrue(any("기존 자막과 타임라인은 유지" in item for item in messages))
+
+    def test_replay_resolved_for_live_reanalysis_keeps_original_tab(self):
+        opened: list[str] = []
+        linked: list[tuple[str, str]] = []
+        applied: list[tuple[str, str]] = []
+
+        class Database:
+            @staticmethod
+            def get_vod(vod_id: str):
+                del vod_id
+                return None
+
+            @staticmethod
+            def upsert_external_vod(**kwargs):
+                return SimpleNamespace(
+                    vod_id=kwargs["vod_id"],
+                    streamer_id=7,
+                )
+
+            @staticmethod
+            def link_live_session_to_replay(live_vod_id: str, replay_vod_id: str):
+                linked.append((live_vod_id, replay_vod_id))
+
+        window = SimpleNamespace(
+            database=Database(),
+            _pending_reanalysis_live_id="live-900",
+            _pending_reanalysis_start=None,
+            manual_link_input=SimpleNamespace(clear=lambda: None),
+            status_label=SimpleNamespace(setText=lambda text: None),
+            load_streamers=lambda: None,
+            _select_streamer_tab=lambda streamer_id: None,
+            load_vods=lambda: None,
+            open_timeline=opened.append,
+            _apply_linked_replay=lambda live_id, replay_id: applied.append(
+                (live_id, replay_id)
+            ),
+            _manual_link_failed=lambda message: self.fail(message),
+        )
+        result = ResolvedVodLink(
+            kind="vod",
+            vod_id="777",
+            channel_id="sample",
+            streamer_name="샘플",
+            title="완성된 다시보기",
+            page_url="https://vod.sooplive.com/player/777",
+            duration_text="07:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+        )
+
+        MainWindow._manual_link_resolved(window, result)
+
+        self.assertEqual(linked, [("live-900", "777")])
+        self.assertEqual(applied, [("live-900", "777")])
+        self.assertEqual(opened, ["live-900"])
+        self.assertEqual(window._pending_reanalysis_start, ("live-900", "777"))
+
+    def test_successful_live_reanalysis_converts_tab_to_replay_document(self):
+        saved: list[tuple[str, str, str]] = []
+        states: list[tuple[str, str]] = []
+        revisions: list[tuple[str, str, str]] = []
+        replacements: list[tuple[str, str, str]] = []
+
+        class Database:
+            @staticmethod
+            def get_timeline(vod_id: str):
+                if vod_id == "777":
+                    return SimpleNamespace(text="기존 다시보기 초안")
+                return SimpleNamespace(text="기존 라이브 분석본")
+
+            @staticmethod
+            def create_timeline_revision(vod_id: str, text: str, reason: str):
+                revisions.append((vod_id, text, reason))
+
+            @staticmethod
+            def save_timeline(vod_id: str, text: str, state: str):
+                saved.append((vod_id, text, state))
+
+            @staticmethod
+            def set_vod_state(vod_id: str, state: str):
+                states.append((vod_id, state))
+
+            @staticmethod
+            def remove_analysis_queue(vod_id: str):
+                del vod_id
+
+        live_editor = SimpleNamespace(text=lambda: "기존 라이브 분석본")
+        replay_editor = SimpleNamespace(
+            status_label=SimpleNamespace(setText=lambda text: None)
+        )
+        window = SimpleNamespace(
+            database=Database(),
+            _analysis_source_ids={"live-900": "777"},
+            _analysis_previous_states={
+                "live-900": (VodState.NEW.value, VodState.READY.value)
+            },
+            _editor_tabs={"live-900": live_editor},
+            _replace_live_tab_with_replay=lambda live_id, replay_id, document: (
+                replacements.append((live_id, replay_id, document))
+                or replay_editor
+            ),
+            _refresh_editor_cache_state=lambda vod_id: None,
+            status_label=SimpleNamespace(setText=lambda text: None),
+            load_vods=lambda: None,
+        )
+
+        with patch(
+            "soop_timeline.ui.main_window.has_pending_timeline_finalization",
+            return_value=False,
+        ):
+            MainWindow._analysis_succeeded(
+                window,
+                "live-900",
+                "전체 다시보기 분석 결과",
+            )
+
+        self.assertEqual(
+            saved,
+            [
+                (
+                    "777",
+                    "전체 다시보기 분석 결과",
+                    VodState.REVIEW.value,
+                )
+            ],
+        )
+        self.assertNotIn(
+            ("live-900", "전체 다시보기 분석 결과", VodState.REVIEW.value),
+            saved,
+        )
+        self.assertIn(("777", VodState.REVIEW.value), states)
+        self.assertIn(("live-900", VodState.READY.value), states)
+        self.assertIn(
+            (
+                "777",
+                "기존 라이브 분석본",
+                "라이브 분석본 · 전체 다시보기 재분석 전",
+            ),
+            revisions,
+        )
+        self.assertEqual(
+            replacements,
+            [("live-900", "777", "전체 다시보기 분석 결과")],
+        )
 
 
 if __name__ == "__main__":

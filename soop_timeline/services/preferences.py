@@ -10,6 +10,18 @@ CACHE_RETENTION_SETTING = "transcript_cache_retention_days"
 PRIVACY_NOTICE_SETTING = "privacy_notice_version"
 PRIVACY_NOTICE_VERSION = "1"
 
+# What to do automatically when discovery finds a new VOD:
+#   off        - nothing (default)
+#   transcribe - run only faster-whisper and cache the transcript (no Gemini)
+#   full       - run the whole fw + Gemini timeline draft
+AUTO_ANALYZE_SETTING = "auto_analyze_mode"
+AUTO_ANALYZE_MODES = ("off", "transcribe", "full")
+
+
+def normalized_auto_analyze_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in AUTO_ANALYZE_MODES else "off"
+
 
 @dataclass(frozen=True, slots=True)
 class LiveAIMode:
@@ -71,7 +83,7 @@ def normalized_discovery_interval(value: str | int) -> int:
         minutes = int(value)
     except (TypeError, ValueError):
         return 180
-    return minutes if minutes in {0, 30, 60, 180, 360} else 180
+    return minutes if minutes in {0, 3, 5, 10, 30, 60, 180, 360} else 180
 
 
 def normalized_cache_retention(value: str | int) -> int:

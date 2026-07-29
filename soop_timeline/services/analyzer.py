@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import hashlib
 import json
 from pathlib import Path
@@ -24,12 +27,16 @@ from .gemini_timeline import (
     deduplicate_entries,
 )
 from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
+from .gemini_style import parse_timeline_document
+from .timeline_timestamp import parse_timestamp
 from .timeline_document import initial_timeline_document
 from .transcription import (
     AnalysisCancelled,
     CancelCallback,
+    covered_duration,
     FasterWhisperTranscriber,
     LiveTranscriptUpdate,
+    merge_covered_ranges,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -51,6 +58,8 @@ LIVE_TOPIC_CONFIRMATION_SECONDS = 30
 TIMELINE_CHECKPOINT_FILENAME = "timeline.partial.json"
 LIVE_TRANSCRIPT_FILENAME = "live-transcript.json"
 LIVE_TRANSCRIPT_JOURNAL_FILENAME = "live-transcript.jsonl"
+LIVE_RECONNECT_LOG_FILENAME = "live-reconnect.jsonl"
+LIVE_ANALYSIS_STATE_FILENAME = "live-analysis-state.json"
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,6 +70,13 @@ class AnalyzerConfig:
     gemini_api_key: str = ""
     topic_granularity: str = DEFAULT_TOPIC_GRANULARITY
     live_ai_mode: str = "saving"
+
+
+@dataclass(slots=True, frozen=True)
+class LiveReplayTranscriptReuse:
+    transcript: Transcript
+    covered_ranges: tuple[tuple[float, float], ...]
+    session_count: int
 
 
 class TimelineAnalyzer(ABC):
@@ -98,6 +114,7 @@ class TimelineAnalyzer(ABC):
         progress: ProgressCallback,
         cancelled: CancelCallback,
         preview: PreviewCallback | None = None,
+        reusable_live_vods: Iterable[Vod] = (),
     ) -> str:
         raise NotImplementedError
 
@@ -133,8 +150,9 @@ class ReviewDraftAnalyzer(TimelineAnalyzer):
         progress: ProgressCallback,
         cancelled: CancelCallback,
         preview: PreviewCallback | None = None,
+        reusable_live_vods: Iterable[Vod] = (),
     ) -> str:
-        del vod, progress, cancelled, preview
+        del vod, progress, cancelled, preview, reusable_live_vods
         raise RuntimeError(self.unavailable_reason)
 
 
@@ -387,6 +405,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         progress: ProgressCallback,
         cancelled: CancelCallback,
         preview: PreviewCallback | None = None,
+        reusable_live_vods: Iterable[Vod] = (),
     ) -> str:
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
@@ -412,11 +431,24 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             from .vod_stream import fetch_vod_audio_source
 
             source = fetch_vod_audio_source(vod, progress, cancelled)
+            live_reuse = build_live_replay_transcript_reuse(
+                vod,
+                reusable_live_vods,
+                replay_duration=source.total_duration_seconds,
+                replay_partial=partial,
+            )
             transcriber = self._transcriber_factory(
                 self.config.whisper_model,
                 self.config.whisper_device,
             )
             prompt = build_whisper_prompt(vod, live=False)
+            if live_reuse is not None:
+                progress(
+                    8,
+                    f"같은 방송의 라이브 자막 {len(live_reuse.transcript.segments):,}개를 "
+                    f"재사용합니다 · 중복 제외 "
+                    f"{format_timestamp(covered_duration(live_reuse.covered_ranges))}",
+                )
 
             def transcription_progress(percent: int, message: str) -> None:
                 normalized = max(0, min(68, percent))
@@ -429,6 +461,16 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 cancelled=cancelled,
                 preview=preview,
                 resume=partial,
+                reusable=(
+                    live_reuse.transcript
+                    if live_reuse is not None
+                    else None
+                ),
+                reusable_ranges=(
+                    live_reuse.covered_ranges
+                    if live_reuse is not None
+                    else ()
+                ),
                 checkpoint=lambda snapshot: save_vod_transcript_cache(
                     partial_path,
                     vod.vod_id,
@@ -478,6 +520,76 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             progress(100, f"AI 타임라인 생성이 완료되었습니다{suffix}.")
         return timeline.to_document()
 
+    def transcribe_vod(
+        self,
+        vod: Vod,
+        progress: ProgressCallback,
+        cancelled: CancelCallback,
+    ) -> None:
+        """Run only faster-whisper and cache the transcript (no AI timeline).
+
+        Used by background auto-processing so the slow STT is ready before the
+        user decides to generate a timeline. Reuses any cached transcript and
+        resumes from a partial capture if one exists.
+        """
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            raise RuntimeError("faster-whisper가 설치되지 않았습니다.")
+
+        cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
+        partial_path = analysis_data_dir(vod.vod_id) / "transcript.partial.json"
+        transcript = load_vod_transcript_cache(
+            cache_path,
+            vod.vod_id,
+            vod.url,
+            self.config.whisper_model,
+        )
+        if transcript is not None:
+            progress(100, f"이미 저장된 자막 {len(transcript.segments):,}개가 있습니다.")
+            return
+
+        partial = load_vod_transcript_cache(
+            partial_path,
+            vod.vod_id,
+            vod.url,
+            self.config.whisper_model,
+        )
+        from .vod_stream import fetch_vod_audio_source
+
+        source = fetch_vod_audio_source(vod, progress, cancelled)
+        transcriber = self._transcriber_factory(
+            self.config.whisper_model,
+            self.config.whisper_device,
+        )
+        prompt = build_whisper_prompt(vod, live=False)
+
+        def transcription_progress(percent: int, message: str) -> None:
+            progress(max(0, min(99, percent)), message)
+
+        transcript = transcriber.transcribe_stream(
+            source,
+            initial_prompt=prompt,
+            progress=transcription_progress,
+            cancelled=cancelled,
+            preview=None,
+            resume=partial,
+            checkpoint=lambda snapshot: save_vod_transcript_cache(
+                partial_path,
+                vod.vod_id,
+                vod.url,
+                snapshot,
+            ),
+        )
+        save_vod_transcript_cache(
+            cache_path,
+            vod.vod_id,
+            vod.url,
+            transcript,
+        )
+        partial_path.unlink(missing_ok=True)
+        progress(100, f"자막 {len(transcript.segments):,}개 구간을 저장했습니다.")
+
     def analyze_live(
         self,
         vod: Vod,
@@ -486,6 +598,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         stop_requested: CancelCallback,
         preview: PreviewCallback | None = None,
         finalize_requested: CancelCallback | None = None,
+        resume_document: str = "",
     ) -> str:
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
@@ -512,11 +625,53 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             f"예상 시간당 약 {live_mode.estimated_calls_per_hour}회 + "
             "종료 시 타임라인 정리·전체 제목 각 1회",
         )
-        candidates: list[TimelineEntry] = []
-        titles: list[str] = []
+        # Live timestamps remain compatible if the user changes Whisper models
+        # between launches, so never discard an earlier live capture here.
+        prior_transcript = load_cached_transcript(vod)
+        prior_segments = (
+            list(prior_transcript.segments) if prior_transcript is not None else []
+        )
+        candidates, titles = _restore_live_timeline(
+            resume_document,
+            prior_segments,
+        )
+        summary_floor = source.runtime_seconds
         last_summary_end = source.runtime_seconds
         next_summary_at = source.runtime_seconds + live_mode.first_summary_seconds
-        transcript_journal = _LiveTranscriptJournal(vod, source)
+        if prior_segments and prior_transcript is not None:
+            summary_floor = prior_segments[0].start
+            prior_end = max(
+                float(prior_transcript.duration_seconds),
+                prior_segments[-1].end,
+            )
+            saved_summary_end = _load_live_summary_watermark(vod)
+            if saved_summary_end is not None:
+                last_summary_end = max(
+                    summary_floor,
+                    min(saved_summary_end, prior_end),
+                )
+            elif candidates:
+                # Older releases did not persist a summary watermark. Live
+                # requests normally run once per configured interval, so
+                # replay only a bounded tail instead of an entire long topic.
+                inferred_tail = max(
+                    300.0,
+                    float(live_mode.interval_seconds)
+                    + LIVE_TOPIC_CONFIRMATION_SECONDS
+                    + LIVE_SUMMARY_OVERLAP_SECONDS,
+                )
+                last_summary_end = max(summary_floor, prior_end - inferred_tail)
+            else:
+                last_summary_end = summary_floor
+            if prior_end > last_summary_end + 10:
+                # The first post-reconnect Whisper update also summarizes any
+                # durable text that had not reached Gemini before shutdown.
+                next_summary_at = source.runtime_seconds
+        transcript_journal = _LiveTranscriptJournal(
+            vod,
+            source,
+            resume=prior_transcript,
+        )
 
         def emit_timeline() -> None:
             if preview is None or not candidates:
@@ -549,7 +704,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 next_summary_at = latest_end + live_mode.interval_seconds
                 return
             window_start = max(
-                source.runtime_seconds,
+                summary_floor,
                 last_summary_end - LIVE_SUMMARY_OVERLAP_SECONDS,
             )
             window = [
@@ -592,6 +747,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             last_summary_end = stable_end
             next_summary_at = latest_end + live_mode.interval_seconds
             emit_timeline()
+            _save_live_summary_watermark(vod, last_summary_end)
 
         # Whisper stays in its own consumer thread. Gemini can therefore wait,
         # retry, or time out without stopping the live HLS decoder and losing
@@ -601,16 +757,31 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         transcription_result: list[Transcript] = []
         transcription_failure: list[BaseException] = []
         internal_stop = threading.Event()
+        segment_offset = len(prior_segments)
+        live_segments: list[TranscriptSegment] = list(prior_segments)
+        live_language = (
+            prior_transcript.language if prior_transcript is not None else "ko"
+        )
+        live_duration = (
+            float(prior_transcript.duration_seconds)
+            if prior_transcript is not None
+            else 0.0
+        )
 
         def effective_stop_requested() -> bool:
             return internal_stop.is_set() or stop_requested()
 
         def on_update(update: LiveTranscriptUpdate | Transcript) -> None:
             if isinstance(update, LiveTranscriptUpdate):
-                transcript_journal.append_update(update)
+                normalized: LiveTranscriptUpdate | Transcript = (
+                    _offset_live_update(update, segment_offset)
+                )
+                transcript_journal.append_update(normalized)
             else:
-                transcript_journal.append(update)
-            updates.put(update)
+                current = _offset_live_transcript(update, segment_offset)
+                normalized = _merge_live_transcripts(prior_transcript, current)
+                transcript_journal.append(normalized)
+            updates.put(normalized)
 
         def run_transcription() -> None:
             try:
@@ -635,9 +806,6 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         )
         transcription_thread.start()
 
-        live_segments: list[TranscriptSegment] = []
-        live_language = "ko"
-        live_duration = source.runtime_seconds
         reached_end = False
 
         def apply_update(update: object) -> None:
@@ -695,14 +863,22 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             raise transcription_failure[0]
         if not transcription_result:
             raise RuntimeError("라이브 음성 인식 작업이 결과 없이 종료되었습니다.")
-        transcript = transcription_result[0]
+        current_transcript = _offset_live_transcript(
+            transcription_result[0],
+            segment_offset,
+        )
+        transcript = _merge_live_transcripts(prior_transcript, current_transcript)
         if not transcript.segments:
+            if not should_finalize():
+                raise AnalysisCancelled(
+                    "프로그램 종료를 위해 라이브 자동 재연결 상태만 저장했습니다."
+                )
             raise RuntimeError("라이브 방송에서 인식 가능한 음성을 찾지 못했습니다.")
-        transcript_journal.finalize(transcript)
         if not should_finalize():
             raise AnalysisCancelled(
                 "프로그램 종료를 위해 새 Gemini 최종 요청 없이 라이브 자막만 저장했습니다."
             )
+        transcript_journal.finalize(transcript)
 
         latest_end = transcript.segments[-1].end
         if not candidates or latest_end > last_summary_end + 10:
@@ -724,6 +900,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             if preview is not None:
                 preview("live_timeline", fallback.to_document())
             self._capture_usage(generator)
+            _clear_live_summary_watermark(vod)
             return fallback.to_document()
 
         progress(0, "라이브 타임라인의 중복과 전체 제목을 최종 정리합니다…")
@@ -739,10 +916,221 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         self._capture_usage(generator)
         suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
         progress(100, f"라이브 타임라인 생성이 완료되었습니다{suffix}.")
+        _clear_live_summary_watermark(vod)
         return final.to_document()
 
 
 LocalWhisperAIAnalyzer = LocalWhisperGeminiAnalyzer
+
+
+def _offset_live_update(
+    update: LiveTranscriptUpdate,
+    segment_offset: int,
+) -> LiveTranscriptUpdate:
+    """Make segment identifiers unique across application restarts."""
+
+    segments: list[TranscriptSegment] = []
+    for fallback_index, segment in enumerate(update.segments):
+        raw_id = segment.segment_id
+        local_index = fallback_index
+        if raw_id.startswith("s") and raw_id[1:].isdigit():
+            local_index = int(raw_id[1:])
+        segments.append(
+            TranscriptSegment(
+                segment_id=f"s{segment_offset + local_index:06d}",
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+            )
+        )
+    return LiveTranscriptUpdate(
+        model=update.model,
+        language=update.language,
+        duration_seconds=update.duration_seconds,
+        segments=tuple(segments),
+        words=tuple(update.words),
+    )
+
+
+def _offset_live_transcript(
+    transcript: Transcript,
+    segment_offset: int,
+) -> Transcript:
+    return Transcript(
+        model=transcript.model,
+        language=transcript.language,
+        duration_seconds=transcript.duration_seconds,
+        segments=[
+            TranscriptSegment(
+                segment_id=f"s{segment_offset + index:06d}",
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+            )
+            for index, segment in enumerate(transcript.segments)
+        ],
+        words=tuple(transcript.words),
+        covered_ranges=tuple(transcript.covered_ranges),
+    )
+
+
+def _merge_live_transcripts(
+    earlier: Transcript | None,
+    later: Transcript | None,
+) -> Transcript:
+    """Merge reconnect captures by absolute broadcast time and remove exact overlap."""
+
+    if earlier is None and later is None:
+        return Transcript("", "ko", 0.0, [], ())
+    if earlier is None:
+        assert later is not None
+        return _offset_live_transcript(later, 0)
+    if later is None:
+        return _offset_live_transcript(earlier, 0)
+
+    ordered_segments = sorted(
+        [*earlier.segments, *later.segments],
+        key=lambda segment: (segment.start, segment.end, segment.text),
+    )
+    merged_segments: list[TranscriptSegment] = []
+    seen_segments: set[tuple[int, int, str]] = set()
+    for segment in ordered_segments:
+        key = (
+            round(segment.start * 1_000),
+            round(segment.end * 1_000),
+            " ".join(segment.text.split()).casefold(),
+        )
+        if key in seen_segments:
+            continue
+        seen_segments.add(key)
+        merged_segments.append(
+            TranscriptSegment(
+                segment_id=f"s{len(merged_segments):06d}",
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+            )
+        )
+
+    ordered_words = sorted(
+        [*earlier.words, *later.words],
+        key=lambda word: (word.start, word.end, word.text),
+    )
+    merged_words: list[TranscriptWord] = []
+    seen_words: set[tuple[int, int, str]] = set()
+    for word in ordered_words:
+        key = (
+            round(word.start * 1_000),
+            round(word.end * 1_000),
+            word.text,
+        )
+        if key in seen_words:
+            continue
+        seen_words.add(key)
+        merged_words.append(word)
+
+    return Transcript(
+        model=later.model or earlier.model,
+        language=later.language or earlier.language,
+        duration_seconds=max(
+            float(earlier.duration_seconds),
+            float(later.duration_seconds),
+        ),
+        segments=merged_segments,
+        words=tuple(merged_words),
+        covered_ranges=merge_covered_ranges(
+            (*earlier.covered_ranges, *later.covered_ranges)
+        ),
+    )
+
+
+def _restore_live_timeline(
+    document: str,
+    transcript_segments: list[TranscriptSegment],
+) -> tuple[list[TimelineEntry], list[str]]:
+    """Restore the saved live draft so reconnect previews append instead of replace."""
+
+    if not document.strip():
+        return [], []
+    parsed = parse_timeline_document(document)
+    starts = [segment.start for segment in transcript_segments]
+    restored: list[TimelineEntry] = []
+
+    for entry in parsed.entries:
+        seconds = parse_timestamp(entry.timestamp)
+        if seconds is None:
+            continue
+        segment_id = f"resume-{len(restored):06d}"
+        if transcript_segments:
+            insertion = bisect_left(starts, float(seconds))
+            nearby = {
+                max(0, min(len(transcript_segments) - 1, insertion + delta))
+                for delta in (-2, -1, 0, 1)
+            }
+
+            def distance(index: int) -> float:
+                segment = transcript_segments[index]
+                if segment.start <= seconds <= segment.end:
+                    return 0.0
+                return min(abs(segment.start - seconds), abs(segment.end - seconds))
+
+            nearest = min(nearby, key=distance)
+            segment_id = transcript_segments[nearest].segment_id
+        section_break = bool(
+            restored
+            and entry.line_index > 0
+            and not parsed.lines[entry.line_index - 1].strip()
+        )
+        restored.append(
+            TimelineEntry(
+                segment_id=segment_id,
+                start=float(seconds),
+                summary=entry.summary,
+                topic_key=entry.summary,
+                section_break_before=section_break,
+            )
+        )
+
+    titles = [parsed.content_title] if parsed.content_title.strip() else []
+    return deduplicate_entries(restored), titles
+
+
+def _load_live_summary_watermark(vod: Vod) -> float | None:
+    path = analysis_data_dir(vod.vod_id) / LIVE_ANALYSIS_STATE_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or str(payload.get("url", "")) != vod.url
+        ):
+            return None
+        return max(0.0, float(payload["last_summary_end"]))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _save_live_summary_watermark(vod: Vod, seconds: float) -> None:
+    path = analysis_data_dir(vod.vod_id) / LIVE_ANALYSIS_STATE_FILENAME
+    payload = {
+        "version": 1,
+        "url": vod.url,
+        "last_summary_end": max(0.0, float(seconds)),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _clear_live_summary_watermark(vod: Vod) -> None:
+    path = analysis_data_dir(vod.vod_id) / LIVE_ANALYSIS_STATE_FILENAME
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _save_live_transcript_snapshot(
@@ -779,10 +1167,35 @@ def _live_source_payload(vod: Vod, source: object) -> dict[str, object]:
     }
 
 
+def _same_live_transcript(left: Transcript, right: Transcript) -> bool:
+    if (
+        len(left.segments) != len(right.segments)
+        or len(left.words) != len(right.words)
+        or abs(left.duration_seconds - right.duration_seconds) > 0.01
+    ):
+        return False
+    if not left.segments:
+        return True
+    left_first, left_last = left.segments[0], left.segments[-1]
+    right_first, right_last = right.segments[0], right.segments[-1]
+    return (
+        left_first.start == right_first.start
+        and left_first.text == right_first.text
+        and left_last.end == right_last.end
+        and left_last.text == right_last.text
+    )
+
+
 class _LiveTranscriptJournal:
     """Append only newly recognized live text, then compact once at completion."""
 
-    def __init__(self, vod: Vod, source: object):
+    def __init__(
+        self,
+        vod: Vod,
+        source: object,
+        *,
+        resume: Transcript | None = None,
+    ):
         self.vod = vod
         self.source = source
         root = analysis_data_dir(vod.vod_id)
@@ -793,11 +1206,17 @@ class _LiveTranscriptJournal:
         self.duration_seconds = 0.0
         recovered = _load_live_transcript_journal(self.path, vod, None)
         if recovered is not None:
-            self.segment_count = len(recovered.segments)
-            self.word_count = len(recovered.words)
-            self.duration_seconds = recovered.duration_seconds
+            if resume is not None and not _same_live_transcript(recovered, resume):
+                self._reset()
+                self.append(resume)
+            else:
+                self.segment_count = len(recovered.segments)
+                self.word_count = len(recovered.words)
+                self.duration_seconds = recovered.duration_seconds
         else:
             self._reset()
+            if resume is not None:
+                self.append(resume)
 
     def _reset(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1010,6 +1429,19 @@ def load_live_transcript_cache(
     expected_model: str | None,
 ) -> Transcript | None:
     cache_path = Path(path)
+    snapshot = _load_live_transcript_snapshot(cache_path, vod, expected_model)
+    journal_path = cache_path.with_name(LIVE_TRANSCRIPT_JOURNAL_FILENAME)
+    journal = _load_live_transcript_journal(journal_path, vod, expected_model)
+    if snapshot is not None and journal is not None:
+        return _merge_live_transcripts(snapshot, journal)
+    return journal or snapshot
+
+
+def _load_live_transcript_snapshot(
+    cache_path: Path,
+    vod: Vod,
+    expected_model: str | None,
+) -> Transcript | None:
     if cache_path.is_file():
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -1027,8 +1459,7 @@ def load_live_transcript_cache(
                     return transcript
         except (OSError, ValueError, TypeError, KeyError):
             pass
-    journal_path = cache_path.with_name(LIVE_TRANSCRIPT_JOURNAL_FILENAME)
-    return _load_live_transcript_journal(journal_path, vod, expected_model)
+    return None
 
 
 def _load_live_transcript_journal(
@@ -1135,3 +1566,399 @@ def load_cached_transcript(
         return transcript if transcript.segments else None
     except (OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def build_live_replay_transcript_reuse(
+    replay_vod: Vod,
+    live_vods: Iterable[Vod],
+    *,
+    replay_duration: float,
+    replay_partial: Transcript | None = None,
+) -> LiveReplayTranscriptReuse | None:
+    """Reuse live STT only when the completed replay's time axis is verified.
+
+    An exact SOOP broadcast number is mandatory. Alignment is accepted when a
+    live capture reaches the replay ending, or when an existing replay partial
+    transcript contains matching speech at the same timestamps.
+    """
+
+    total = max(0.0, float(replay_duration))
+    broadcast_no = replay_vod.live_broadcast_no.strip()
+    if total <= 0 or not broadcast_no or replay_vod.source_kind == "live":
+        return None
+
+    candidates: list[
+        tuple[Vod, Transcript, tuple[tuple[float, float], ...]]
+    ] = []
+    alignment_verified = False
+    end_tolerance = min(300.0, max(45.0, total * 0.005))
+    for live_vod in live_vods:
+        if (
+            live_vod.source_kind != "live"
+            or live_vod.streamer_id != replay_vod.streamer_id
+            or live_vod.live_broadcast_no.strip() != broadcast_no
+        ):
+            continue
+        transcript = load_cached_transcript(live_vod)
+        if transcript is None or not transcript.segments:
+            continue
+        coverage = _live_capture_coverage(
+            live_vod,
+            transcript,
+            replay_duration=total,
+        )
+        if not coverage:
+            continue
+        capture_end = max(end for _start, end in coverage)
+        if 0.0 <= total - capture_end <= 5.0:
+            coverage = merge_covered_ranges(
+                (*coverage, (capture_end, total)),
+                total_duration=total,
+            )
+        candidates.append((live_vod, transcript, coverage))
+        capture_end = max(end for _start, end in coverage)
+        if abs(total - capture_end) <= end_tolerance:
+            alignment_verified = True
+        elif replay_partial is not None and _transcripts_share_time_axis(
+            replay_partial,
+            transcript,
+            coverage,
+        ):
+            alignment_verified = True
+
+    if not candidates or not alignment_verified:
+        return None
+
+    candidates.sort(key=lambda item: item[2][0][0])
+    used_ranges: tuple[tuple[float, float], ...] = ()
+    merged: Transcript | None = None
+    used_sessions = 0
+    for _live_vod, transcript, coverage in candidates:
+        new_ranges = _subtract_covered_ranges(coverage, used_ranges)
+        if not new_ranges:
+            continue
+        filtered = _filter_transcript_to_ranges(
+            transcript,
+            new_ranges,
+            replay_duration=total,
+        )
+        if not filtered.segments:
+            continue
+        merged = _merge_live_transcripts(merged, filtered)
+        used_ranges = merge_covered_ranges(
+            (*used_ranges, *new_ranges),
+            total_duration=total,
+        )
+        used_sessions += 1
+
+    if merged is None or not merged.segments or not used_ranges:
+        return None
+    merged.covered_ranges = used_ranges
+    return LiveReplayTranscriptReuse(
+        transcript=merged,
+        covered_ranges=used_ranges,
+        session_count=used_sessions,
+    )
+
+
+def _live_capture_coverage(
+    vod: Vod,
+    transcript: Transcript,
+    *,
+    replay_duration: float,
+) -> tuple[tuple[float, float], ...]:
+    total = max(0.0, float(replay_duration))
+    capture_end = min(
+        total,
+        max(
+            float(transcript.duration_seconds),
+            max((segment.end for segment in transcript.segments), default=0.0),
+        ),
+    )
+    if capture_end <= 0:
+        return ()
+
+    starts: list[float] = []
+    duration_text = vod.duration_text.strip()
+    if duration_text.startswith("시작 "):
+        parsed = parse_timestamp(duration_text[3:].strip())
+        if parsed is not None:
+            starts.append(float(parsed))
+
+    root = analysis_data_dir(vod.vod_id)
+    for path in (
+        root / LIVE_TRANSCRIPT_FILENAME,
+        root / LIVE_TRANSCRIPT_JOURNAL_FILENAME,
+    ):
+        try:
+            if path.name == LIVE_TRANSCRIPT_FILENAME:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                first_line = path.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                ).splitlines()[0]
+                payload = json.loads(first_line)
+            source = payload.get("source", {}) if isinstance(payload, dict) else {}
+            if isinstance(source, dict) and "runtime_start_seconds" in source:
+                runtime_start = float(source["runtime_start_seconds"])
+                if runtime_start >= 0:
+                    starts.append(runtime_start)
+        except (OSError, IndexError, ValueError, TypeError):
+            continue
+
+    if transcript.segments:
+        starts.append(max(0.0, float(transcript.segments[0].start)))
+    capture_start = min(starts) if starts else 0.0
+    capture_start = min(capture_end, max(0.0, capture_start))
+    coverage: tuple[tuple[float, float], ...] = (
+        (capture_start, capture_end),
+    )
+
+    gaps: list[tuple[float, float]] = []
+    gap_path = root / LIVE_RECONNECT_LOG_FILENAME
+    try:
+        lines = gap_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+            if (
+                not isinstance(record, dict)
+                or record.get("type") != "reconnect_gap"
+                or str(record.get("broadcast_no", "")) != vod.live_broadcast_no
+            ):
+                continue
+            gaps.append(
+                (
+                    float(record["missing_start_seconds"]),
+                    float(record["missing_end_seconds"]),
+                )
+            )
+        except (ValueError, TypeError, KeyError):
+            continue
+    return _subtract_covered_ranges(coverage, gaps)
+
+
+def _subtract_covered_ranges(
+    ranges: Iterable[tuple[float, float]],
+    exclusions: Iterable[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    remaining = list(merge_covered_ranges(ranges))
+    for excluded_start, excluded_end in merge_covered_ranges(exclusions):
+        updated: list[tuple[float, float]] = []
+        for start, end in remaining:
+            if excluded_end <= start or excluded_start >= end:
+                updated.append((start, end))
+                continue
+            if excluded_start > start:
+                updated.append((start, min(end, excluded_start)))
+            if excluded_end < end:
+                updated.append((max(start, excluded_end), end))
+        remaining = updated
+    return merge_covered_ranges(remaining)
+
+
+def _filter_transcript_to_ranges(
+    transcript: Transcript,
+    ranges: Iterable[tuple[float, float]],
+    *,
+    replay_duration: float,
+) -> Transcript:
+    coverage = merge_covered_ranges(
+        ranges,
+        total_duration=replay_duration,
+    )
+    segments = [
+        segment
+        for segment in transcript.segments
+        if any(
+            start
+            <= (segment.start + segment.end) / 2.0
+            <= end
+            for start, end in coverage
+        )
+    ]
+    words = tuple(
+        word
+        for word in transcript.words
+        if any(
+            start <= (word.start + word.end) / 2.0 <= end
+            for start, end in coverage
+        )
+    )
+    return Transcript(
+        model=transcript.model,
+        language=transcript.language,
+        duration_seconds=max((end for _start, end in coverage), default=0.0),
+        segments=[
+            TranscriptSegment(
+                segment_id=f"s{index:06d}",
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+            )
+            for index, segment in enumerate(segments)
+        ],
+        words=words,
+        covered_ranges=coverage,
+    )
+
+
+def _transcripts_share_time_axis(
+    replay: Transcript,
+    live: Transcript,
+    live_ranges: Iterable[tuple[float, float]],
+) -> bool:
+    replay_end = max(
+        float(replay.duration_seconds),
+        max((segment.end for segment in replay.segments), default=0.0),
+    )
+    ranges = [
+        (start, min(end, replay_end))
+        for start, end in live_ranges
+        if start < replay_end and min(end, replay_end) - start >= 60.0
+    ]
+    if not ranges:
+        return False
+    anchor_end = max(end for _start, end in ranges)
+    anchor_start = max(
+        min(start for start, _end in ranges),
+        anchor_end - 8 * 60,
+    )
+
+    def sample(transcript: Transcript) -> str:
+        text = " ".join(
+            segment.text
+            for segment in transcript.segments
+            if anchor_start
+            <= (segment.start + segment.end) / 2.0
+            <= anchor_end
+        )
+        return "".join(character.casefold() for character in text if character.isalnum())[
+            :12_000
+        ]
+
+    replay_text = sample(replay)
+    live_text = sample(live)
+    if len(replay_text) < 80 or len(live_text) < 80:
+        return False
+    return SequenceMatcher(
+        None,
+        replay_text,
+        live_text,
+        autojunk=True,
+    ).ratio() >= 0.28
+
+
+def live_capture_position(vod: Vod) -> float:
+    """Return the last broadcast second durably processed by live STT."""
+
+    if vod.source_kind != "live":
+        return 0.0
+    transcript = load_cached_transcript(vod)
+    position = (
+        float(transcript.duration_seconds) if transcript is not None else 0.0
+    )
+    root = analysis_data_dir(vod.vod_id)
+
+    snapshot_path = root / LIVE_TRANSCRIPT_FILENAME
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        source = payload.get("source", {})
+        if (
+            isinstance(source, dict)
+            and source.get("kind") == "soop_live"
+            and str(source.get("url", "")) == vod.url
+        ):
+            raw_transcript = payload.get("transcript", {})
+            if isinstance(raw_transcript, dict):
+                position = max(
+                    position,
+                    float(raw_transcript.get("duration_seconds", 0.0) or 0.0),
+                )
+    except (OSError, ValueError, TypeError):
+        pass
+
+    journal_path = root / LIVE_TRANSCRIPT_JOURNAL_FILENAME
+    try:
+        lines = journal_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines()
+        header = json.loads(lines[0]) if lines else {}
+        source = header.get("source", {}) if isinstance(header, dict) else {}
+        if (
+            isinstance(source, dict)
+            and source.get("kind") == "soop_live"
+            and str(source.get("url", "")) == vod.url
+        ):
+            for line in lines[1:]:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict) and record.get("type") == "append":
+                        position = max(
+                            position,
+                            float(record.get("duration_seconds", 0.0) or 0.0),
+                        )
+                except (ValueError, TypeError):
+                    continue
+    except (OSError, ValueError, TypeError):
+        pass
+    return max(0.0, position)
+
+
+def record_live_reconnect_gap(
+    vod: Vod,
+    last_captured_seconds: float,
+    resumed_runtime_seconds: float,
+) -> float:
+    """Append a structured record for audio that could not be observed offline."""
+
+    start = max(0.0, float(last_captured_seconds))
+    end = max(0.0, float(resumed_runtime_seconds))
+    missing = max(0.0, end - start)
+    if missing <= 1.0:
+        return 0.0
+
+    path = analysis_data_dir(vod.vod_id) / LIVE_RECONNECT_LOG_FILENAME
+    record = {
+        "type": "reconnect_gap",
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "vod_id": vod.vod_id,
+        "broadcast_no": vod.live_broadcast_no,
+        "missing_start_seconds": round(start, 3),
+        "missing_end_seconds": round(end, 3),
+        "missing_seconds": round(missing, 3),
+        "missing_range": f"{format_timestamp(start)}~{format_timestamp(end)}",
+    }
+
+    # Starting the app repeatedly before a new chunk is captured must not
+    # duplicate the same gap record.
+    try:
+        existing = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if existing:
+            previous = json.loads(existing[-1])
+            if (
+                isinstance(previous, dict)
+                and abs(
+                    float(previous.get("missing_start_seconds", -1.0)) - start
+                )
+                <= 1.0
+                and abs(float(previous.get("missing_end_seconds", -1.0)) - end)
+                <= 1.0
+            ):
+                return missing
+    except (OSError, ValueError, TypeError):
+        pass
+
+    with path.open("a", encoding="utf-8", newline="\n") as destination:
+        destination.write(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        destination.flush()
+    return missing

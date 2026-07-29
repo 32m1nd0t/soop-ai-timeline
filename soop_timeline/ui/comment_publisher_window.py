@@ -15,6 +15,7 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -30,6 +31,7 @@ from ..services.comment_publisher import (
     PublicationPlan,
     build_comment_dump_script,
     build_login_probe_script,
+    build_mute_media_script,
     build_post_reply_script,
     build_post_root_script,
     build_verify_root_script,
@@ -47,6 +49,9 @@ _SOOP_HOME = "https://www.sooplive.com/"
 _SETTLE_MS = 1800
 _VERIFY_RETRY_MS = 1500
 _MAX_VERIFY_ATTEMPTS = 3
+_COMMENT_CLICK_RECHECK_MS = 700
+_MAX_COMMENT_OPEN_ATTEMPTS = 4
+_BACKGROUND_WINDOW_POSITION = -10_000
 
 
 class SoopCommentPublisher(QFrame):
@@ -54,6 +59,7 @@ class SoopCommentPublisher(QFrame):
 
     closed = Signal()
     status_changed = Signal(str)
+    published = Signal(str)
 
     def __init__(self, vod: Vod, blocks: list[str], parent: QWidget | None = None):
         super().__init__(parent)
@@ -75,10 +81,20 @@ class SoopCommentPublisher(QFrame):
         self._verify_attempts = 0
         # Auto-drive: log in if needed, then post after a single confirm.
         self._auto_posted = False
+        # Background mode: the caller already confirmed, so skip the in-window
+        # confirm and run minimized; only surface the window when login is needed.
+        self._auto_confirmed = False
         self._login_redirect_done = False
+        self._background_rendering = False
+        self._comment_click_in_flight = False
+        self._comment_open_attempts = 0
         self._login_poll_timer = QTimer(self)
         self._login_poll_timer.setInterval(2500)
         self._login_poll_timer.timeout.connect(self._poll_login)
+        # Keep the VOD audio/video muted while we drive the comment DOM.
+        self._mute_timer = QTimer(self)
+        self._mute_timer.setInterval(1000)
+        self._mute_timer.timeout.connect(self._mute_media)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -174,11 +190,50 @@ class SoopCommentPublisher(QFrame):
         self.show()
         self.raise_()
         self.activateWindow()
+        self._mute_timer.start()
         if not self._loaded:
             self._loaded = True
             self.web_view.load_url(vod_page_url(self.vod.vod_id))
 
+    def open_in_background(self) -> None:
+        """Run auto-post in a normally rendered, off-screen WebView2 window.
+
+        A minimized WebView2 gives SOOP's responsive comment controls zero-sized
+        rectangles. Keep the page rendered off screen so the trusted comment-tab
+        click can be dispatched without stealing focus from the user.
+        """
+        self._auto_confirmed = True
+        self._background_rendering = True
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.move(_BACKGROUND_WINDOW_POSITION, _BACKGROUND_WINDOW_POSITION)
+        self.showNormal()
+        self.lower()
+        self._mute_timer.start()
+        if not self._loaded:
+            self._loaded = True
+            self.web_view.load_url(vod_page_url(self.vod.vod_id))
+
+    def _reveal(self) -> None:
+        """Bring the off-screen/background window forward — e.g. to sign in."""
+        self._background_rendering = False
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            target = screen.availableGeometry().center() - self.rect().center()
+            self.move(target)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _mute_media(self) -> None:
+        try:
+            self.web_view.evaluate_js(build_mute_media_script())
+        except Exception:
+            pass
+
     def reload_vod_page(self) -> None:
+        self._comment_click_in_flight = False
+        self._comment_open_attempts = 0
         self._set_status("VOD 페이지를 다시 불러옵니다…")
         self.web_view.load_url(vod_page_url(self.vod.vod_id))
 
@@ -191,6 +246,7 @@ class SoopCommentPublisher(QFrame):
         self._start_login_poll()
 
     def _on_dom_loaded(self) -> None:
+        self._mute_media()
         if self._busy:
             return
         self.web_view.evaluate_js(build_login_probe_script(), self._on_login_probe)
@@ -206,6 +262,16 @@ class SoopCommentPublisher(QFrame):
         logged_in = bool(payload.get("loggedIn"))
         login_id = str(payload.get("loginId", ""))
         self._logged_in = logged_in
+        # SOOP's VOD page is a SPA: DOMContentLoaded fires before its scripts
+        # define isLogin() or render the comment area, so the first probes see an
+        # empty page. Only trust a logged-out reading once the page has hydrated.
+        debug = payload.get("debug") or {}
+        page_ready = (
+            debug.get("isLoginFn") not in (None, "no-fn")
+            or bool(debug.get("hasWriteInput"))
+            or bool(debug.get("hasTabComment"))
+            or bool(debug.get("hasSelectTab"))
+        )
         ready = logged_in and on_vod_page and has_input
         self.publish_button.setEnabled(ready and bool(self._blocks) and not self._busy)
 
@@ -215,6 +281,8 @@ class SoopCommentPublisher(QFrame):
         if ready:
             # Logged in and the box is present: stop waiting and drive posting.
             self._stop_login_poll()
+            self._comment_click_in_flight = False
+            self._comment_open_attempts = 0
             who = f" · 아이디 {login_id}" if login_id else ""
             if self._auto_posted:
                 self._set_status(f"로그인 확인됨{who}.")
@@ -225,32 +293,53 @@ class SoopCommentPublisher(QFrame):
             return
 
         if logged_in and not on_vod_page:
-            # Login finished on the SOOP home/login page; return to the VOD page
-            # and the next probe will auto-post.
-            self._stop_login_poll()
+            # Signed in on the home/login page: go to the VOD page and keep
+            # polling until it hydrates. (Do NOT stop the poll here — the VOD
+            # page's first probe fires before its SPA finishes loading.)
             self._set_status("로그인 확인됨. VOD 페이지로 이동합니다…")
             self.web_view.load_url(vod_page_url(self.vod.vod_id))
-            return
-
-        if logged_in and on_vod_page and not has_input:
-            # Comment area may still be loading; keep re-probing briefly.
-            self._set_status(
-                f"로그인 확인됨({login_id}). 댓글 영역을 불러오는 중…"
-            )
             self._start_login_poll()
             return
 
-        # Not logged in: open the login page once, then poll until login lands.
+        if on_vod_page and not page_ready:
+            # Still loading: keep polling instead of trusting the empty page.
+            self._set_status("VOD 페이지를 불러오는 중… 로그인 상태를 확인합니다…")
+            self._start_login_poll()
+            return
+
+        if on_vod_page and logged_in and not has_input:
+            # SOOP ignores HTMLElement.click() for this responsive tab in
+            # WebView2. Dispatch a browser-level mouse click at the visible
+            # target reported by the probe, then check the input again quickly.
+            if self._try_open_comment_tab(debug):
+                self._set_status("로그인 확인됨. 댓글 탭을 자동으로 여는 중…")
+                self._start_login_poll()
+                return
+            if self._comment_open_attempts >= _MAX_COMMENT_OPEN_ATTEMPTS:
+                self._reveal()
+                self._set_status(
+                    "댓글 탭을 자동으로 열지 못했습니다. "
+                    "화면의 댓글 탭을 한 번 눌러 주세요."
+                )
+            else:
+                self._set_status("로그인 확인됨. 댓글 영역을 불러오는 중…")
+            self._start_login_poll()
+            return
+
+        # Genuinely signed out (page hydrated, or on the home page): surface the
+        # window, open the login page once, then keep polling until the session
+        # appears. This is what recovers an expired background login.
         if not self._login_redirect_done:
             self._login_redirect_done = True
+            self._reveal()
             self._set_status(
-                "로그인이 필요합니다. 로그인 페이지를 엽니다. "
+                "로그인이 풀렸습니다. 로그인 페이지를 엽니다. "
                 "로그인하면 자동으로 VOD로 돌아와 등록을 이어갑니다."
             )
             self.web_view.load_url(_SOOP_HOME)
-            self._start_login_poll()
         else:
             self._set_status("로그인을 기다리는 중… 로그인하면 자동으로 이어집니다.")
+        self._start_login_poll()
 
     def _start_login_poll(self) -> None:
         if not self._login_poll_timer.isActive():
@@ -264,6 +353,41 @@ class SoopCommentPublisher(QFrame):
         if self._busy:
             return
         self.web_view.evaluate_js(build_login_probe_script(), self._on_login_probe)
+
+    def _try_open_comment_tab(self, debug: object) -> bool:
+        if (
+            self._comment_click_in_flight
+            or self._comment_open_attempts >= _MAX_COMMENT_OPEN_ATTEMPTS
+            or not isinstance(debug, dict)
+        ):
+            return False
+        target = debug.get("commentClickTarget")
+        if not isinstance(target, dict):
+            return False
+        try:
+            x = float(target["x"])
+            y = float(target["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._comment_open_attempts += 1
+        if not self.web_view.dispatch_page_click(x, y):
+            logger.warning(
+                "SOOP comment tab trusted click failed at %.1f, %.1f",
+                x,
+                y,
+            )
+            return False
+        self._comment_click_in_flight = True
+        QTimer.singleShot(
+            _COMMENT_CLICK_RECHECK_MS,
+            self._after_comment_tab_click,
+        )
+        return True
+
+    def _after_comment_tab_click(self) -> None:
+        self._comment_click_in_flight = False
+        if not self._busy:
+            self._poll_login()
 
     # -- Diagnostics ---------------------------------------------------------
     def dump_comment_dom(self) -> None:
@@ -294,7 +418,7 @@ class SoopCommentPublisher(QFrame):
         )
 
     # -- Publishing ----------------------------------------------------------
-    def start_publish(self) -> None:
+    def start_publish(self, confirmed: bool = False) -> None:
         if self._busy:
             return
         if not self._blocks:
@@ -306,19 +430,20 @@ class SoopCommentPublisher(QFrame):
             QMessageBox.information(self, "등록할 내용 없음", str(error))
             return
 
-        reply_count = len(plan.replies)
-        confirm = QMessageBox.question(
-            self,
-            "SOOP에 실제 등록",
-            f"'{self.vod.title}' 영상에 댓글 1개"
-            + (f"와 대댓글 {reply_count}개" if reply_count else "")
-            + "를 지금 실제로 등록합니다.\n\n"
-            "등록된 댓글은 SOOP에서 직접 삭제해야 지워집니다. 계속할까요?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+        if not confirmed and not self._auto_confirmed:
+            reply_count = len(plan.replies)
+            confirm = QMessageBox.question(
+                self,
+                "SOOP에 실제 등록",
+                f"'{self.vod.title}' 영상에 댓글 1개"
+                + (f"와 대댓글 {reply_count}개" if reply_count else "")
+                + "를 지금 실제로 등록합니다.\n\n"
+                "등록된 댓글은 SOOP에서 직접 삭제해야 지워집니다. 계속할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
 
         self._busy = True
         self._stop_login_poll()
@@ -406,16 +531,19 @@ class SoopCommentPublisher(QFrame):
     def _publish_done(self) -> None:
         self._finish_busy()
         replies_done = max(0, self._posted_count - 1)
-        self._set_status(f"완료: 댓글 1개 + 대댓글 {replies_done}개 등록했습니다.")
-        QMessageBox.information(
-            self,
-            "등록 완료",
-            f"댓글 1개와 대댓글 {replies_done}개를 등록했습니다.\n"
-            "SOOP 페이지에서 실제 반영을 확인해 주세요.",
+        summary = (
+            f"댓글 1개와 대댓글 {replies_done}개를 등록했습니다."
+            if replies_done
+            else "댓글 1개를 등록했습니다."
         )
+        self._set_status(f"완료: {summary}")
+        self.published.emit(summary)
+        # Background auto-post cleans up after itself; the main window notifies.
+        self.close()
 
     def _publish_failed(self, label: str, payload: dict | None) -> None:
         self._finish_busy()
+        self._reveal()
         stage = payload.get("stage") if isinstance(payload, dict) else None
         stage_hint = {
             "not-logged-in": "로그인이 풀렸습니다. 다시 로그인한 뒤 시도하세요.",
@@ -463,6 +591,7 @@ class SoopCommentPublisher(QFrame):
 
     def closeEvent(self, event) -> None:
         self._stop_login_poll()
+        self._mute_timer.stop()
         try:
             self.web_view.evaluate_js(build_close_script())
         except Exception:

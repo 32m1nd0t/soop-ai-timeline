@@ -86,6 +86,27 @@ class GeminiStyleTests(unittest.TestCase):
         )
         self.assertIn(original, result)
 
+    def test_rebuild_preserves_major_section_blank_lines(self):
+        parsed = parse_timeline_document(
+            "오늘의 콘텐츠: 소통과 게임\n\n"
+            "00:00:10 최근 근황 이야기\n\n"
+            "00:20:00 게임 시작\n"
+        )
+        result = parsed.rebuild(
+            {
+                "content_title": "소통과 게임",
+                "entries": [
+                    {"line_id": "line_0000", "summary": "최근 근황 토크"},
+                    {"line_id": "line_0001", "summary": "게임 플레이 시작"},
+                ],
+            }
+        )
+
+        self.assertIn(
+            "00:00:10 최근 근황 토크\n\n00:20:00 게임 플레이 시작",
+            result,
+        )
+
     def test_prompt_requires_dry_neutral_style_without_structure_changes(self):
         prompt = build_style_prompt(parse_timeline_document(SOURCE_DOCUMENT))
         self.assertIn("간결하고 자연스러운", prompt)

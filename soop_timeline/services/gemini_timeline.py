@@ -14,7 +14,7 @@ from .ai_provider import (
 )
 from .eta import EtaEstimator, format_eta
 from .gemini_style import DRY_TIMELINE_STYLE_GUIDE
-from .timeline_document import AI_TIMELINE_NOTICE_LINES
+from .timeline_document import timeline_notice
 from .transcription import (
     AnalysisCancelled,
     CancelCallback,
@@ -87,6 +87,7 @@ class TimelineEntry:
     topic_key: str = ""
     decision: str = "new"
     quote: str = ""
+    section_break_before: bool = False
 
 
 def _compact_text(value: str) -> str:
@@ -291,6 +292,7 @@ def enforce_broadcast_ending_quotes(
                 summary="",
                 topic_key=entry.topic_key or "방송 종료",
                 quote=quote,
+                section_break_before=True,
             )
         )
     return result
@@ -672,6 +674,7 @@ class TimelineGenerationState:
                     "topic_key": entry.topic_key,
                     "decision": entry.decision,
                     "quote": entry.quote,
+                    "section_break_before": entry.section_break_before,
                 }
                 for entry in self.entries
             ],
@@ -697,6 +700,7 @@ class TimelineGenerationState:
                             str(raw.get("decision", "new"))
                         ),
                         quote=str(raw.get("quote", "")),
+                        section_break_before=raw.get("section_break_before") is True,
                     )
                 )
         raw_titles = value.get("titles", [])
@@ -721,17 +725,22 @@ class GeneratedTimeline:
     entries: list[TimelineEntry]
 
     def to_document(self) -> str:
-        lines = [
-            *AI_TIMELINE_NOTICE_LINES,
-            "",
-            f"오늘의 콘텐츠: {self.content_title.strip()}",
-            "",
-        ]
-        lines.extend(
-            f"{format_timestamp(entry.start)} {text}"
-            for entry in self.entries
-            if (text := format_entry_text(entry))
-        )
+        lines: list[str] = []
+        notice = timeline_notice()
+        if notice:
+            lines.extend(notice.split("\n"))
+            lines.append("")
+        lines.append(f"오늘의 콘텐츠: {self.content_title.strip()}")
+        lines.append("")
+        wrote_entry = False
+        for entry in self.entries:
+            text = format_entry_text(entry)
+            if not text:
+                continue
+            if wrote_entry and entry.section_break_before and lines[-1] != "":
+                lines.append("")
+            lines.append(f"{format_timestamp(entry.start)} {text}")
+            wrote_entry = True
         return "\n".join(lines).rstrip() + "\n"
 
 
@@ -764,8 +773,23 @@ TIMELINE_ENTRY_SCHEMA = {
                 "간결하고 자연스러운 한 줄로. 합니다/입니다체는 피함"
             ),
         },
+        "section_break_before": {
+            "type": "boolean",
+            "description": (
+                "이 항목 앞에서 방송의 큰 활동 단계가 바뀌면 true. 단순 대화 "
+                "주제 전환은 false. 소통↔게임, 게임 변경, 일반 플레이↔대회·합방·"
+                "기획 콘텐츠, 콘텐츠 종료 후 후일담·원래 활동 복귀처럼 방송의 "
+                "큰 카테고리가 바뀌는 경우만 true"
+            ),
+        },
     },
-    "required": ["segment_id", "decision", "topic_key", "summary"],
+    "required": [
+        "segment_id",
+        "decision",
+        "topic_key",
+        "summary",
+        "section_break_before",
+    ],
 }
 
 
@@ -1212,7 +1236,8 @@ def build_chunk_prompt(
     )
     prior = deduplicate_entries(previous_entries or [])[-8:]
     previous_topic_text = "\n".join(
-        f"- {format_timestamp(entry.start)} [{entry.topic_key or entry.summary}] {entry.summary}"
+        f"- {format_timestamp(entry.start)} [{entry.topic_key or entry.summary}] "
+        f"{'[큰 구간 시작] ' if entry.section_break_before else ''}{entry.summary}"
         for entry in prior
     ) or "- 없음"
     media_label = "라이브 방송" if vod.source_kind == "live" else "다시보기"
@@ -1253,6 +1278,17 @@ def build_chunk_prompt(
 - `new`: 이전과 다른 주제가 실제로 시작됨. 새 topic_key와 시작 segment_id를 반환합니다.
 - `return`: 사이에 다른 주제가 이어진 뒤 과거 주제로 복귀함. 과거와 같은 topic_key를 사용하고 복귀 시작 segment_id를 반환합니다.
 
+큰 활동 구간 줄바꿈 판정:
+- `section_break_before`는 대화 주제가 아니라 방송의 큰 활동 카테고리가 바뀌는 경우에만 true입니다. 대부분의 `new`·`return` 항목은 false입니다.
+- 소통 중 꿈·음식·최근 근황처럼 이야기 소재만 달라지면 false입니다.
+- 같은 게임 안에서 매치·퀘스트·보스·전략·사건이 바뀌는 정도도 false입니다.
+- 소통에서 게임을 시작하거나 게임을 끝내고 소통으로 돌아갈 때, 플레이할 게임 자체를 바꿀 때는 true입니다.
+- 일반 게임 플레이에서 대회·합방·시청자 참여·공식 이벤트·별도 기획 콘텐츠가 시작될 때는 true입니다.
+- 해당 대회·합방·기획 콘텐츠가 끝나고 후일담·일반 게임·소통으로 넘어갈 때도 true입니다.
+- 방송 마무리·종료 인사가 시작되는 항목은 true입니다.
+- 45분 자막 창의 시작, 긴 시간 경과, 잠깐의 자리 비움만으로는 true로 만들지 않습니다.
+- 줄바꿈만 만들기 위한 항목을 새로 추가하지 말고, 새 큰 활동 구간에서 원래 남길 첫 타임라인 항목에 표시합니다.
+
 출력 규칙:
 - content_title은 전체 방송 요약이 아니라 `이번 자막` 구간에서 실제로 다룬 중심 내용을 나타내는 임시 소제목입니다. 영상 제목을 복사하지 않습니다.
 - segment_id는 반드시 아래 `이번 자막`에 실제로 존재하는 값만 사용합니다. 직전 주제의 ID는 반환하지 않습니다.
@@ -1290,7 +1326,8 @@ def build_final_prompt(
 ) -> str:
     candidate_text = "\n".join(
         f"{entry.segment_id} | {format_timestamp(entry.start)} | "
-        f"{entry.decision} | {entry.topic_key or entry.summary} | "
+        f"{entry.decision} | section_break_before={str(entry.section_break_before).lower()} | "
+        f"{entry.topic_key or entry.summary} | "
         f"{('인용: ' + entry.quote + ' | ') if entry.quote else ''}{entry.summary}"
         for entry in entries
     )
@@ -1328,6 +1365,9 @@ def build_final_prompt(
 - 스트리머 본인이 현재 방송을 끝내겠다고 말한 종료 인사·방종 예고 후보는 짧더라도 병합하거나 삭제하지 않습니다. 방송 종료를 부정·가정하거나 타인의 방송을 언급한 말은 이 규칙에 포함하지 않습니다.
 - 시간순으로 정렬합니다.
 - 전체 방송을 대표 흐름 몇 개로 압축하기 위해 정상적인 주제 전환 후보를 삭제하지 않습니다. 각 후보는 아래 주제 묶음 규칙만으로 유지·병합합니다.
+- `section_break_before`는 후보 값을 그대로 복사하지 말고 전체 방송 흐름을 보고 다시 판정합니다. 첫 최종 항목은 false입니다.
+- 단순 대화 소재 변화나 같은 게임 안의 국면 변화는 false입니다. 소통↔게임, 플레이할 게임 변경, 일반 플레이↔대회·합방·시청자 참여·별도 기획 콘텐츠, 해당 콘텐츠 종료 후 후일담·원래 활동 복귀, 방송 마무리처럼 큰 활동 카테고리가 바뀌는 첫 항목만 true입니다.
+- 빈 줄만 만들기 위해 새 항목을 추가하지 않습니다. 기존에 유지할 첫 항목에 section_break_before를 표시합니다.
 - 인용으로 쓸지 요약으로 쓸지는 각 항목의 내용으로 결정합니다. 좋은 대표 발언은 인용으로, 상황·활동·이야기 흐름은 요약으로 남깁니다.
 - 인용과 요약을 개수로 맞추거나 시간 구간별로 한 방식에 몰지 마세요(예: 앞부분은 전부 요약, 뒷부분은 전부 인용 금지). 한 항목씩 그 내용에 맞게 정합니다.
 - 후보에 `인용:`이 있으면 그 발언을 quote에 그대로 담고 summary는 비웁니다(인용문의 말투·종결어미는 고치지 않습니다). quote만으로 상황을 알 수 없을 때만 summary에 아주 짧은 보충을 답니다.
@@ -1461,6 +1501,7 @@ def entries_from_payload(
                 topic_key=topic_key or summary or quote,
                 decision=decision,
                 quote=quote,
+                section_break_before=raw.get("section_break_before") is True,
             )
         )
     ordered_segments = sorted(segment_lookup.values(), key=lambda item: item.start)

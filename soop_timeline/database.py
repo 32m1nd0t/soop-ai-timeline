@@ -410,24 +410,72 @@ class Database:
             clauses.append("v.streamer_id = ?")
             params.append(streamer_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        state_rank = (
+            "CASE v.state "
+            "WHEN 'analyzing' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 "
+            "WHEN 'review' THEN 3 WHEN 'new' THEN 4 WHEN 'ready' THEN 5 "
+            "WHEN 'copied' THEN 6 WHEN 'published' THEN 7 ELSE 8 END"
+        )
+        duration_text = "TRIM(REPLACE(v.duration_text, '시작 ', ''))"
+        duration_seconds = (
+            "CASE "
+            f"WHEN {duration_text} GLOB '*:*:*' THEN "
+            f"CAST(SUBSTR({duration_text}, 1, INSTR({duration_text}, ':') - 1) AS INTEGER) * 3600 + "
+            f"CAST(SUBSTR({duration_text}, INSTR({duration_text}, ':') + 1, 2) AS INTEGER) * 60 + "
+            f"CAST(SUBSTR({duration_text}, -2) AS INTEGER) "
+            f"WHEN {duration_text} GLOB '*:*' THEN "
+            f"CAST(SUBSTR({duration_text}, 1, INSTR({duration_text}, ':') - 1) AS INTEGER) * 60 + "
+            f"CAST(SUBSTR({duration_text}, -2) AS INTEGER) "
+            "ELSE 0 END"
+        )
+        numeric_vod_id = (
+            "CASE WHEN v.vod_id GLOB '[0-9]*' "
+            "THEN CAST(v.vod_id AS INTEGER) END"
+        )
+        newest = (
+            "CASE WHEN v.source_kind = 'live' THEN 0 ELSE 1 END, "
+            f"{numeric_vod_id} DESC, "
+            "v.discovered_at DESC"
+        )
+        oldest = (
+            "CASE WHEN v.source_kind = 'live' THEN 1 ELSE 0 END, "
+            f"{numeric_vod_id} ASC, "
+            "v.discovered_at ASC"
+        )
         order_by = {
-            "newest": (
-                "CASE WHEN v.source_kind = 'live' THEN 0 ELSE 1 END, "
-                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN CAST(v.vod_id AS INTEGER) END DESC, "
-                "v.discovered_at DESC"
-            ),
-            "oldest": (
-                "CASE WHEN v.source_kind = 'live' THEN 1 ELSE 0 END, "
-                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN CAST(v.vod_id AS INTEGER) END ASC, "
-                "v.discovered_at ASC"
-            ),
+            "newest": newest,
+            "oldest": oldest,
             "recent_work": "v.updated_at DESC, v.discovered_at DESC",
             "status": (
-                "CASE v.state "
-                "WHEN 'analyzing' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 "
-                "WHEN 'review' THEN 3 WHEN 'new' THEN 4 WHEN 'ready' THEN 5 "
-                "WHEN 'copied' THEN 6 WHEN 'published' THEN 7 ELSE 8 END, "
-                "v.updated_at DESC"
+                f"{state_rank}, v.updated_at DESC"
+            ),
+            "state_asc": f"{state_rank} ASC, v.updated_at DESC",
+            "state_desc": f"{state_rank} DESC, v.updated_at DESC",
+            "streamer_asc": (
+                "s.display_name COLLATE NOCASE ASC, v.title COLLATE NOCASE ASC"
+            ),
+            "streamer_desc": (
+                "s.display_name COLLATE NOCASE DESC, v.title COLLATE NOCASE ASC"
+            ),
+            "title_asc": (
+                "v.title COLLATE NOCASE ASC, s.display_name COLLATE NOCASE ASC"
+            ),
+            "title_desc": (
+                "v.title COLLATE NOCASE DESC, s.display_name COLLATE NOCASE ASC"
+            ),
+            "memo_asc": "v.memo COLLATE NOCASE ASC, v.updated_at DESC",
+            "memo_desc": "v.memo COLLATE NOCASE DESC, v.updated_at DESC",
+            "duration_asc": f"{duration_seconds} ASC, {newest}",
+            "duration_desc": f"{duration_seconds} DESC, {newest}",
+            "published_asc": oldest,
+            "published_desc": newest,
+            "vod_id_asc": (
+                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN 0 ELSE 1 END, "
+                f"{numeric_vod_id} ASC, v.vod_id COLLATE NOCASE ASC"
+            ),
+            "vod_id_desc": (
+                "CASE WHEN v.vod_id GLOB '[0-9]*' THEN 0 ELSE 1 END, "
+                f"{numeric_vod_id} DESC, v.vod_id COLLATE NOCASE DESC"
             ),
         }.get(sort, "")
         if not order_by:
@@ -464,7 +512,7 @@ class Database:
         placeholders = ",".join("?" for _ in requested)
         replays = self.connection.execute(
             f"""
-            SELECT vod_id, title
+            SELECT vod_id, title, live_broadcast_no
             FROM vods
             WHERE streamer_id = ?
               AND source_kind != 'live'
@@ -481,7 +529,7 @@ class Database:
         )
         candidates = self.connection.execute(
             """
-            SELECT vod_id, title, discovered_at
+            SELECT vod_id, title, live_broadcast_no, discovered_at
             FROM vods
             WHERE streamer_id = ?
               AND source_kind = 'live'
@@ -509,12 +557,23 @@ class Database:
             if replay_id in used_replays:
                 continue
             replay_title = _normalized_broadcast_title(str(replay["title"]))
-            matches = [
-                candidate
-                for candidate in available
-                if replay_title
-                and _normalized_broadcast_title(str(candidate["title"])) == replay_title
-            ]
+            replay_broadcast_no = str(replay["live_broadcast_no"] or "")
+            matches = []
+            if replay_broadcast_no:
+                matches = [
+                    candidate
+                    for candidate in available
+                    if str(candidate["live_broadcast_no"] or "")
+                    == replay_broadcast_no
+                ]
+            if not matches:
+                matches = [
+                    candidate
+                    for candidate in available
+                    if replay_title
+                    and _normalized_broadcast_title(str(candidate["title"]))
+                    == replay_title
+                ]
             if not matches and len(fresh_ids) == 1 and replay_id in fresh_ids and len(available) == 1:
                 matches = [available[0]]
             if not matches:
@@ -531,6 +590,68 @@ class Database:
         self.connection.commit()
         return linked
 
+    def link_live_session_to_replay(
+        self,
+        live_vod_id: str,
+        replay_vod_id: str,
+    ) -> None:
+        """Explicitly link a live work session to the replay selected by the user."""
+        live = self.connection.execute(
+            """
+            SELECT vod_id, streamer_id, source_kind, linked_vod_id
+            FROM vods
+            WHERE vod_id = ?
+            """,
+            (live_vod_id,),
+        ).fetchone()
+        replay = self.connection.execute(
+            """
+            SELECT vod_id, streamer_id, source_kind
+            FROM vods
+            WHERE vod_id = ?
+            """,
+            (replay_vod_id,),
+        ).fetchone()
+        if live is None or replay is None:
+            raise ValueError("라이브 세션 또는 다시보기 기록을 찾지 못했습니다.")
+        if str(live["source_kind"]) != "live":
+            raise ValueError("연결 대상이 라이브 분석 기록이 아닙니다.")
+        if str(replay["source_kind"]) == "live":
+            raise ValueError("라이브 주소가 아니라 완성된 다시보기를 연결해야 합니다.")
+        if int(live["streamer_id"]) != int(replay["streamer_id"]):
+            raise ValueError("같은 스트리머의 다시보기만 연결할 수 있습니다.")
+
+        current = str(live["linked_vod_id"] or "")
+        if current:
+            if current == replay_vod_id:
+                return
+            current_exists = self.connection.execute(
+                "SELECT 1 FROM vods WHERE vod_id = ?",
+                (current,),
+            ).fetchone()
+            if current_exists is not None:
+                raise ValueError("이미 다른 다시보기가 연결된 라이브 기록입니다.")
+
+        duplicate = self.connection.execute(
+            """
+            SELECT vod_id
+            FROM vods
+            WHERE source_kind = 'live'
+              AND linked_vod_id = ?
+              AND vod_id != ?
+            LIMIT 1
+            """,
+            (replay_vod_id, live_vod_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError("이 다시보기는 다른 라이브 분석 기록에 이미 연결되어 있습니다.")
+
+        self.connection.execute(
+            "UPDATE vods SET linked_vod_id = ?, updated_at = ? WHERE vod_id = ?",
+            (replay_vod_id, utc_now(), live_vod_id),
+        )
+        self.connection.commit()
+
     def list_recent_unlinked_live_sessions(self, *, days: int = 2) -> list[str]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat(
             timespec="seconds"
@@ -544,6 +665,31 @@ class Database:
             (cutoff,),
         ).fetchall()
         return [str(row["vod_id"]) for row in rows]
+
+    def list_live_sessions_for_broadcast(
+        self,
+        streamer_id: int,
+        broadcast_no: str,
+    ) -> list[Vod]:
+        """Return every saved capture belonging to one exact SOOP broadcast."""
+
+        value = str(broadcast_no).strip()
+        if not value:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT v.*, s.channel_id, s.display_name AS streamer_name,
+                   s.glossary AS streamer_glossary
+            FROM vods v
+            JOIN streamers s ON s.id = v.streamer_id
+            WHERE v.streamer_id = ?
+              AND v.source_kind = 'live'
+              AND v.live_broadcast_no = ?
+            ORDER BY v.discovered_at ASC
+            """,
+            (streamer_id, value),
+        ).fetchall()
+        return [self._vod_from_row(row) for row in rows]
 
     def get_vod(self, vod_id: str) -> Vod | None:
         row = self.connection.execute(
@@ -718,26 +864,18 @@ class Database:
         return pending
 
     def recover_stale_live_sessions(self) -> list[str]:
+        """Return interrupted live sessions without discarding resumable state.
+
+        Live transcript journals are append-only and can be continued after an
+        application restart.  Keeping both the VOD and document in ``analyzing``
+        distinguishes an application shutdown from an intentional live stop,
+        which moves the session to ``review``.
+        """
         rows = self.connection.execute(
             "SELECT vod_id FROM vods WHERE source_kind = 'live' AND state = ?",
             (VodState.ANALYZING.value,),
         ).fetchall()
-        vod_ids = [str(row["vod_id"]) for row in rows]
-        if vod_ids:
-            placeholders = ",".join("?" for _ in vod_ids)
-            now = utc_now()
-            with self.connection:
-                self.connection.execute(
-                    f"UPDATE vods SET state = ?, updated_at = ? "
-                    f"WHERE vod_id IN ({placeholders})",
-                    (VodState.FAILED.value, now, *vod_ids),
-                )
-                self.connection.execute(
-                    f"UPDATE timeline_documents SET status = ?, updated_at = ? "
-                    f"WHERE vod_id IN ({placeholders})",
-                    (VodState.FAILED.value, now, *vod_ids),
-                )
-        return vod_ids
+        return [str(row["vod_id"]) for row in rows]
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.connection.execute(

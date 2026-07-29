@@ -47,6 +47,26 @@ class ResolvedVodLink:
     duration_text: str
     published_text: str
     thumbnail_url: str
+    source_broadcast_no: str = ""
+
+
+def _source_broadcast_no(data: dict[str, object]) -> str:
+    """Return the original live broadcast number embedded in VOD metadata."""
+    direct = str(data.get("broad_no") or "").strip()
+    if direct.isdigit():
+        return direct
+
+    files = data.get("files")
+    if not isinstance(files, list):
+        return ""
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        file_info_key = str(item.get("file_info_key") or "").strip()
+        match = re.fullmatch(r"\d{8}_[^_]+_(\d+)_\d+", file_info_key)
+        if match is not None:
+            return match.group(1)
+    return ""
 
 
 def parse_soop_link(value: str) -> ParsedSoopLink:
@@ -184,4 +204,5 @@ def resolve_vod_link(
         duration_text=format_timestamp(duration_seconds) if duration_seconds else "",
         published_text=str(data.get("write_tm") or "").strip(),
         thumbnail_url=str(data.get("thumb") or "").strip(),
+        source_broadcast_no=_source_broadcast_no(data),
     )

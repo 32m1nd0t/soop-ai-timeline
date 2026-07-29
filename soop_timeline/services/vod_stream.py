@@ -196,6 +196,7 @@ def iter_audio_chunks(
     chunk_seconds: int = DEFAULT_CHUNK_SECONDS,
     overlap_seconds: int = DEFAULT_OVERLAP_SECONDS,
     start_seconds: float = 0.0,
+    end_seconds: float | None = None,
 ) -> Iterator[AudioChunk]:
     """Decode audio-only HLS into bounded in-memory PCM chunks."""
     if chunk_seconds <= 0:
@@ -204,10 +205,20 @@ def iter_audio_chunks(
         raise ValueError("overlap_seconds must be between 0 and chunk_seconds")
 
     resume_at = max(0.0, float(start_seconds or 0.0))
+    stop_at = (
+        min(
+            source.total_duration_seconds,
+            max(resume_at, float(end_seconds)),
+        )
+        if end_seconds is not None
+        else source.total_duration_seconds
+    )
     part_offset = 0.0
     for part in source.parts:
         if cancelled():
             raise AnalysisCancelled("분석을 취소했습니다.")
+        if part_offset >= stop_at:
+            break
         if part_offset + part.duration_seconds <= resume_at:
             part_offset += part.duration_seconds
             continue
@@ -218,6 +229,7 @@ def iter_audio_chunks(
             chunk_seconds=chunk_seconds,
             overlap_seconds=overlap_seconds,
             skip_seconds=max(0.0, resume_at - part_offset),
+            stop_seconds=min(part.duration_seconds, stop_at - part_offset),
         )
         part_offset += part.duration_seconds
 
@@ -230,6 +242,7 @@ def _iter_part_audio_chunks(
     chunk_seconds: int,
     overlap_seconds: int,
     skip_seconds: float = 0.0,
+    stop_seconds: float | None = None,
 ) -> Iterator[AudioChunk]:
     try:
         import av
@@ -242,7 +255,13 @@ def _iter_part_audio_chunks(
     buffer = bytearray()
     skip_bytes = max(0, int(skip_seconds * WHISPER_SAMPLE_RATE) * 2)
     local_start_samples = skip_bytes // 2
+    stop_sample = (
+        max(local_start_samples, int(float(stop_seconds) * WHISPER_SAMPLE_RATE))
+        if stop_seconds is not None
+        else None
+    )
     emitted = False
+    reached_stop = False
     options = {
         "headers": (
             f"Referer: {VOD_ORIGIN}/\r\n"
@@ -281,6 +300,20 @@ def _iter_part_audio_chunks(
                             skip_bytes -= removed
                         if not frame_bytes:
                             continue
+                        if stop_sample is not None:
+                            buffered_samples = len(buffer) // 2
+                            remaining_samples = (
+                                stop_sample
+                                - local_start_samples
+                                - buffered_samples
+                            )
+                            if remaining_samples <= 0:
+                                reached_stop = True
+                                break
+                            maximum_bytes = remaining_samples * 2
+                            if len(frame_bytes) >= maximum_bytes:
+                                frame_bytes = frame_bytes[:maximum_bytes]
+                                reached_stop = True
                         buffer.extend(frame_bytes)
                         while len(buffer) >= target_bytes:
                             chunk_bytes = bytes(buffer[:target_bytes])
@@ -295,14 +328,31 @@ def _iter_part_audio_chunks(
                             emitted = True
                             del buffer[:advance_bytes]
                             local_start_samples += advance_bytes // 2
+                        if reached_stop:
+                            break
+                    if reached_stop:
+                        break
+                if reached_stop:
+                    break
 
-            for converted in _resampled_frames(resampler.resample(None)):
-                frame_bytes = _audio_frame_to_s16(converted)
-                if skip_bytes:
-                    removed = min(skip_bytes, len(frame_bytes))
-                    frame_bytes = frame_bytes[removed:]
-                    skip_bytes -= removed
-                buffer.extend(frame_bytes)
+            if not reached_stop:
+                for converted in _resampled_frames(resampler.resample(None)):
+                    frame_bytes = _audio_frame_to_s16(converted)
+                    if skip_bytes:
+                        removed = min(skip_bytes, len(frame_bytes))
+                        frame_bytes = frame_bytes[removed:]
+                        skip_bytes -= removed
+                    if stop_sample is not None:
+                        buffered_samples = len(buffer) // 2
+                        remaining_samples = (
+                            stop_sample
+                            - local_start_samples
+                            - buffered_samples
+                        )
+                        if remaining_samples <= 0:
+                            break
+                        frame_bytes = frame_bytes[: remaining_samples * 2]
+                    buffer.extend(frame_bytes)
     except AnalysisCancelled:
         raise
     except RuntimeError:

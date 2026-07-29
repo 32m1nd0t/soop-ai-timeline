@@ -97,6 +97,45 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(document.text, text)
         self.assertEqual(vod.state, VodState.READY.value)
 
+    def test_lists_all_live_captures_for_exact_broadcast(self):
+        first = self.database.upsert_external_vod(
+            vod_id="live-one",
+            channel_id="sample-live",
+            streamer_name="샘플",
+            title="[LIVE] 첫 연결",
+            url="https://play.sooplive.com/sample-live/987",
+            source_kind="live",
+            live_broadcast_no="987",
+        )
+        self.database.upsert_external_vod(
+            vod_id="live-two",
+            channel_id="sample-live",
+            streamer_name="샘플",
+            title="[LIVE] 재연결",
+            url="https://play.sooplive.com/sample-live/987",
+            source_kind="live",
+            live_broadcast_no="987",
+        )
+        self.database.upsert_external_vod(
+            vod_id="live-other",
+            channel_id="sample-live",
+            streamer_name="샘플",
+            title="[LIVE] 다른 방송",
+            url="https://play.sooplive.com/sample-live/654",
+            source_kind="live",
+            live_broadcast_no="654",
+        )
+
+        sessions = self.database.list_live_sessions_for_broadcast(
+            first.streamer_id,
+            "987",
+        )
+
+        self.assertEqual(
+            {vod.vod_id for vod in sessions},
+            {"live-one", "live-two"},
+        )
+
     def test_vod_memo_persists_without_reopening_completed_work(self):
         streamer = self.database.add_streamer("memo-user", "메모")
         self.database.upsert_discovered_vods(
@@ -233,7 +272,7 @@ class DatabaseTests(unittest.TestCase):
             "마이곰이\n월드 오브 워크래프트",
         )
 
-    def test_stale_live_session_is_marked_failed_for_recovery(self):
+    def test_stale_live_session_remains_analyzing_for_auto_reconnect(self):
         vod = self.database.upsert_external_vod(
             vod_id="live-stale",
             channel_id="live-user",
@@ -244,7 +283,10 @@ class DatabaseTests(unittest.TestCase):
             state=VodState.ANALYZING.value,
         )
         self.assertEqual(self.database.recover_stale_live_sessions(), [vod.vod_id])
-        self.assertEqual(self.database.get_vod(vod.vod_id).state, VodState.FAILED.value)
+        self.assertEqual(
+            self.database.get_vod(vod.vod_id).state,
+            VodState.ANALYZING.value,
+        )
 
     def test_list_vods_filters_by_streamer_and_supports_sort_orders(self):
         first = self.database.add_streamer("first-user", "첫 번째")
@@ -290,6 +332,61 @@ class DatabaseTests(unittest.TestCase):
             ["100", "300"],
         )
 
+    def test_list_vods_supports_clickable_header_sort_orders(self):
+        beta = self.database.add_streamer("beta-user", "Beta")
+        alpha = self.database.add_streamer("alpha-user", "Alpha")
+        self.database.upsert_discovered_vods(
+            beta.id,
+            [
+                {
+                    "vod_id": "10",
+                    "title": "Zulu",
+                    "url": "https://vod.sooplive.com/player/10",
+                    "duration": "02:00",
+                },
+                {
+                    "vod_id": "20",
+                    "title": "Alpha",
+                    "url": "https://vod.sooplive.com/player/20",
+                    "duration": "00:30",
+                },
+            ],
+        )
+        self.database.upsert_discovered_vods(
+            alpha.id,
+            [
+                {
+                    "vod_id": "15",
+                    "title": "Middle",
+                    "url": "https://vod.sooplive.com/player/15",
+                    "duration": "01:00:00",
+                }
+            ],
+        )
+        self.database.set_vod_state("10", VodState.READY.value)
+        self.database.set_vod_state("20", VodState.ANALYZING.value)
+
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(sort="title_asc")],
+            ["20", "15", "10"],
+        )
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(sort="duration_asc")],
+            ["20", "10", "15"],
+        )
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(sort="vod_id_desc")],
+            ["20", "15", "10"],
+        )
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(sort="streamer_asc")],
+            ["15", "20", "10"],
+        )
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods(sort="state_asc")][0],
+            "20",
+        )
+
     def test_finished_replay_is_linked_to_matching_live_session(self):
         streamer = self.database.add_streamer("live-link-user", "라이브 연결")
         live = self.database.upsert_external_vod(
@@ -318,6 +415,73 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             self.database.get_vod(live.vod_id).linked_vod_id,
             "777001",
+        )
+
+    def test_broadcast_number_links_replay_even_when_title_changed(self):
+        streamer = self.database.add_streamer("title-change-user", "제목 변경")
+        first = self.database.upsert_external_vod(
+            vod_id="live-901-20260723000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 시작할 때 제목",
+            url="https://play.sooplive.com/title-change-user/901",
+            source_kind="live",
+            live_broadcast_no="901",
+        )
+        self.database.upsert_external_vod(
+            vod_id="live-902-20260724000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 다른 방송",
+            url="https://play.sooplive.com/title-change-user/902",
+            source_kind="live",
+            live_broadcast_no="902",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777002",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="중간에 완전히 바꾼 제목",
+            url="https://vod.sooplive.com/player/777002",
+            source_kind="manual_vod",
+            live_broadcast_no="901",
+        )
+
+        links = self.database.auto_link_live_sessions(
+            streamer.id,
+            [replay.vod_id],
+        )
+
+        self.assertEqual(links, [(first.vod_id, replay.vod_id)])
+
+    def test_user_can_explicitly_link_unmatched_replay_to_live_session(self):
+        streamer = self.database.add_streamer("manual-link-user", "수동 연결")
+        live = self.database.upsert_external_vod(
+            vod_id="live-903-20260725000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 원래 제목",
+            url="https://play.sooplive.com/manual-link-user/903",
+            source_kind="live",
+            live_broadcast_no="903",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777003",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="전혀 다른 다시보기 제목",
+            url="https://vod.sooplive.com/player/777003",
+            source_kind="manual_vod",
+        )
+
+        self.database.link_live_session_to_replay(
+            live.vod_id,
+            replay.vod_id,
+        )
+
+        self.assertEqual(
+            self.database.get_vod(live.vod_id).linked_vod_id,
+            replay.vod_id,
         )
 
 

@@ -59,6 +59,11 @@ class ManualLinkTests(unittest.TestCase):
                 "total_file_duration": 3_723_000,
                 "write_tm": "2026-07-21 10:00",
                 "thumb": "https://videoimg.sooplive.com/thumb.jpg",
+                "files": [
+                    {
+                        "file_info_key": "20260721_AB12CD34_987654321_1",
+                    }
+                ],
             },
         }
         parsed = parse_soop_link("https://vod.sooplive.com/player/123")
@@ -72,6 +77,7 @@ class ManualLinkTests(unittest.TestCase):
         self.assertEqual(result.channel_id, "sample")
         self.assertEqual(result.duration_text, "01:02:03")
         self.assertEqual(result.title, "수동 영상")
+        self.assertEqual(result.source_broadcast_no, "987654321")
 
     def test_live_source_uses_screen_runtime_and_low_quality_hls(self):
         live_payload = {
