@@ -417,6 +417,82 @@ class DatabaseTests(unittest.TestCase):
             "777001",
         )
 
+    def test_linked_live_work_is_migrated_to_single_replay_item(self):
+        streamer = self.database.add_streamer("merge-live-user", "라이브 통합")
+        live = self.database.upsert_external_vod(
+            vod_id="live-904-20260726000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 통합할 방송",
+            url="https://play.sooplive.com/merge-live-user/904",
+            source_kind="live",
+            live_broadcast_no="904",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777004",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="통합할 방송 다시보기",
+            url="https://vod.sooplive.com/player/777004",
+            source_kind="manual_vod",
+        )
+        self.database.save_timeline(
+            live.vod_id,
+            "라이브 최신 타임라인",
+            VodState.READY.value,
+        )
+        self.database.set_vod_state(live.vod_id, VodState.READY.value)
+        self.database.update_vod_memo(live.vod_id, "라이브 메모")
+        self.database.create_timeline_revision(
+            live.vod_id,
+            "라이브 이전 버전",
+            "라이브 자동 저장",
+        )
+        self.database.save_timeline(
+            replay.vod_id,
+            "다시보기 기존 초안",
+            VodState.REVIEW.value,
+        )
+        self.database.update_vod_memo(replay.vod_id, "다시보기 메모")
+        self.database.link_live_session_to_replay(live.vod_id, replay.vod_id)
+
+        self.assertEqual(
+            self.database.list_pending_live_replay_migrations(),
+            [(live.vod_id, replay.vod_id)],
+        )
+        self.assertEqual(
+            [vod.vod_id for vod in self.database.list_vods()],
+            [replay.vod_id],
+        )
+
+        self.assertTrue(
+            self.database.migrate_live_session_work(live.vod_id, replay.vod_id)
+        )
+        self.assertFalse(
+            self.database.migrate_live_session_work(live.vod_id, replay.vod_id)
+        )
+
+        migrated_replay = self.database.get_vod(replay.vod_id)
+        retained_live = self.database.get_vod(live.vod_id)
+        self.assertIsNotNone(migrated_replay)
+        self.assertIsNotNone(retained_live)
+        self.assertTrue(retained_live.hidden)
+        self.assertEqual(migrated_replay.live_broadcast_no, "904")
+        self.assertEqual(migrated_replay.state, VodState.READY.value)
+        self.assertEqual(
+            migrated_replay.memo,
+            "다시보기 메모\n\n[라이브 작업에서 이전]\n라이브 메모",
+        )
+        self.assertEqual(
+            self.database.get_timeline(replay.vod_id).text,
+            "라이브 최신 타임라인",
+        )
+        revisions = self.database.list_timeline_revisions(replay.vod_id)
+        self.assertIn("라이브 최신 타임라인", [item.text for item in revisions])
+        self.assertIn("라이브 이전 버전", [item.text for item in revisions])
+        self.assertIn("다시보기 기존 초안", [item.text for item in revisions])
+        self.assertEqual(self.database.list_pending_live_replay_migrations(), [])
+
     def test_broadcast_number_links_replay_even_when_title_changed(self):
         streamer = self.database.add_streamer("title-change-user", "제목 변경")
         first = self.database.upsert_external_vod(

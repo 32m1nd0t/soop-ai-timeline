@@ -692,7 +692,7 @@ class MainWindowStateLogicTests(unittest.TestCase):
         self.assertEqual(retries, [0])
         self.assertTrue(any("기존 자막과 타임라인은 유지" in item for item in messages))
 
-    def test_replay_resolved_for_live_reanalysis_keeps_original_tab(self):
+    def test_replay_resolved_for_live_reanalysis_opens_merged_replay_tab(self):
         opened: list[str] = []
         linked: list[tuple[str, str]] = []
         applied: list[tuple[str, str]] = []
@@ -745,8 +745,59 @@ class MainWindowStateLogicTests(unittest.TestCase):
 
         self.assertEqual(linked, [("live-900", "777")])
         self.assertEqual(applied, [("live-900", "777")])
-        self.assertEqual(opened, ["live-900"])
+        self.assertEqual(opened, ["777"])
         self.assertEqual(window._pending_reanalysis_start, ("live-900", "777"))
+
+    def test_linked_reanalysis_runs_on_replay_after_live_work_migration(self):
+        applied: list[tuple[str, str]] = []
+        opened: list[str] = []
+        analysis_calls: list[tuple[str, dict[str, object]]] = []
+        live = SimpleNamespace(
+            vod_id="live-900",
+            streamer_id=7,
+            source_kind="live",
+            linked_vod_id="777",
+            live_broadcast_no="900",
+        )
+        replay = SimpleNamespace(
+            vod_id="777",
+            streamer_id=7,
+            source_kind="vod",
+        )
+
+        class Database:
+            @staticmethod
+            def get_vod(vod_id: str):
+                return live if vod_id == live.vod_id else replay
+
+            @staticmethod
+            def list_live_sessions_for_broadcast(streamer_id: int, broadcast_no: str):
+                self.assertEqual((streamer_id, broadcast_no), (7, "900"))
+                return [live]
+
+        window = SimpleNamespace(
+            database=Database(),
+            _active_jobs=lambda: [],
+            _apply_linked_replay=lambda live_id, replay_id: applied.append(
+                (live_id, replay_id)
+            ),
+            open_timeline=opened.append,
+            _editor_tabs={"777": object()},
+            start_analysis=lambda vod_id, **kwargs: analysis_calls.append(
+                (vod_id, kwargs)
+            ),
+        )
+
+        MainWindow._start_linked_replay_reanalysis(window, "live-900", "777")
+
+        self.assertEqual(applied, [("live-900", "777")])
+        self.assertEqual(opened, ["777"])
+        self.assertEqual(analysis_calls[0][0], "777")
+        self.assertNotIn("target_vod_id", analysis_calls[0][1])
+        self.assertEqual(
+            analysis_calls[0][1]["reusable_live_vods"],
+            (live,),
+        )
 
     def test_successful_live_reanalysis_converts_tab_to_replay_document(self):
         saved: list[tuple[str, str, str]] = []

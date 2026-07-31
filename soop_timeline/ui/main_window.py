@@ -169,6 +169,7 @@ class MainWindow(QMainWindow):
         self._replay_link_attempts: dict[str, int] = {}
         self._replay_link_scheduled: set[str] = set()
         self._replay_link_inflight: set[str] = set()
+        self._replay_merge_scheduled: set[str] = set()
         self._update_reply: QNetworkReply | None = None
         self._update_check_silent = True
         self._stale_live_sessions = self.database.recover_stale_live_sessions()
@@ -226,6 +227,11 @@ class MainWindow(QMainWindow):
             if app is not None:
                 # The close button hides to the tray, so don't quit on window close.
                 app.setQuitOnLastWindowClosed(False)
+
+        for live_vod_id, replay_vod_id in (
+            self.database.list_pending_live_replay_migrations()
+        ):
+            self._apply_linked_replay(live_vod_id, replay_vod_id)
 
         self.load_streamers()
         self.load_vods()
@@ -989,9 +995,9 @@ class MainWindow(QMainWindow):
                 self.load_streamers()
                 self._select_streamer_tab(vod.streamer_id)
                 self.load_vods()
-                self.open_timeline(reanalysis_live_id)
+                self.open_timeline(vod.vod_id)
                 self.status_label.setText(
-                    "다시보기를 연결했습니다. 기존 라이브 탭에서 전체 분석을 준비합니다."
+                    "다시보기를 연결하고 라이브 작업을 옮겼습니다. 전체 분석을 준비합니다."
                 )
                 return
 
@@ -1152,7 +1158,7 @@ class MainWindow(QMainWindow):
             )
         else:
             linked = (
-                f" · 종료된 라이브 {self._linked_replay_count}개 다시보기 연결"
+                f" · 종료된 라이브 {self._linked_replay_count}개 작업 통합"
                 if self._linked_replay_count
                 else ""
             )
@@ -1264,6 +1270,10 @@ class MainWindow(QMainWindow):
         live_vod_id: str,
         replay_vod_id: str,
         document: str,
+        *,
+        status_message: str = (
+            "전체 다시보기 분석 완료 · 라이브 분석본은 버전 기록에 보존했습니다."
+        ),
     ) -> TimelineDocumentEditor | None:
         live_editor = self._editor_tabs.get(live_vod_id)
         replay = self.database.get_vod(replay_vod_id)
@@ -1319,9 +1329,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(new_index, replay.title)
         self.tabs.setCurrentIndex(new_index)
         self._refresh_editor_cache_state(replay_vod_id)
-        replay_editor.status_label.setText(
-            "전체 다시보기 분석 완료 · 라이브 분석본은 버전 기록에 보존했습니다."
-        )
+        replay_editor.status_label.setText(status_message)
         return replay_editor
 
     def open_comment_publisher(self, vod_id: str) -> None:
@@ -1556,11 +1564,72 @@ class MainWindow(QMainWindow):
         replay = self.database.get_vod(replay_vod_id)
         if replay is None:
             return
-        editor = self._editor_tabs.get(live_vod_id)
-        if editor is not None:
-            editor.attach_replay(replay)
+        if self._vod_active_job(live_vod_id) or self._vod_active_job(replay_vod_id):
+            if live_vod_id not in self._replay_merge_scheduled:
+                self._replay_merge_scheduled.add(live_vod_id)
+                QTimer.singleShot(
+                    1_000,
+                    lambda live_id=live_vod_id, replay_id=replay_vod_id: (
+                        self._retry_linked_replay_merge(live_id, replay_id)
+                    ),
+                )
+            return
+
+        self._replay_merge_scheduled.discard(live_vod_id)
+        live_editor = self._editor_tabs.get(live_vod_id)
+        replay_editor = self._editor_tabs.get(replay_vod_id)
+        if live_editor is not None:
+            self._save_timeline(live_vod_id, live_editor.text())
+            live_editor.flush_memo_save()
+        if replay_editor is not None:
+            self._save_timeline(replay_vod_id, replay_editor.text())
+            replay_editor.flush_memo_save()
+
+        try:
+            self.database.migrate_live_session_work(
+                live_vod_id,
+                replay_vod_id,
+            )
+        except ValueError as error:
+            logger.warning(
+                "Could not migrate linked live work %s -> %s: %s",
+                live_vod_id,
+                replay_vod_id,
+                error,
+            )
+            self.status_label.setText(f"라이브 작업 이전 실패: {error}")
+            return
+
+        document = self.database.get_timeline(replay_vod_id)
+        migrated_text = document.text if document is not None else ""
+        message = "라이브 작업을 새 다시보기 항목으로 이전했습니다."
+        if live_editor is not None:
+            self._replace_live_tab_with_replay(
+                live_vod_id,
+                replay_vod_id,
+                migrated_text,
+                status_message=message,
+            )
+        else:
+            replay = self.database.get_vod(replay_vod_id) or replay
+            if replay_editor is not None:
+                replay_editor.set_text(migrated_text)
+                replay_editor.memo_editor.blockSignals(True)
+                replay_editor.memo_editor.setPlainText(replay.memo)
+                replay_editor.memo_editor.blockSignals(False)
+                replay_editor._last_saved_memo = replay.memo
+                replay_editor.status_label.setText(message)
+
         self._replay_link_attempts.pop(live_vod_id, None)
         self._replay_link_inflight.discard(live_vod_id)
+
+    def _retry_linked_replay_merge(
+        self,
+        live_vod_id: str,
+        replay_vod_id: str,
+    ) -> None:
+        self._replay_merge_scheduled.discard(live_vod_id)
+        self._apply_linked_replay(live_vod_id, replay_vod_id)
 
     def _schedule_replay_link_check(
         self,
@@ -2491,7 +2560,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._resume_analysis_queue_if_idle)
 
     def reanalyze_live_as_vod(self, live_vod_id: str) -> None:
-        """Analyze a finished live broadcast while keeping its original tab."""
+        """Analyze a finished live broadcast from its merged replay item."""
         if self._active_jobs():
             QMessageBox.information(
                 self,
@@ -2513,8 +2582,8 @@ class MainWindow(QMainWindow):
                 f"'{replay.title}' 다시보기 전체 범위를 완성할까요?\n\n"
                 "같은 방송 번호로 확인된 라이브 자막은 그대로 재사용하고, "
                 "앱이 꺼져 있었던 구간 등 실제 누락 부분만 새로 분석합니다.\n\n"
-                "현재 라이브 타임라인은 이전 버전에 보존되고, "
-                "분석 결과는 새 탭이 아닌 지금 탭에 표시됩니다.",
+                "현재 라이브 타임라인은 다시보기 항목과 버전 기록에 보존되고, "
+                "라이브 탭은 다시보기 탭으로 바뀝니다.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2582,20 +2651,19 @@ class MainWindow(QMainWindow):
                 "라이브 기록에 연결된 실제 다시보기를 확인하지 못했습니다.",
             )
             return
-        self.open_timeline(live_vod_id)
-        editor = self._editor_tabs.get(live_vod_id)
-        if editor is None:
-            return
-        editor.attach_replay(replay)
         reusable_live_vods = self.database.list_live_sessions_for_broadcast(
             live_vod.streamer_id,
             live_vod.live_broadcast_no,
         )
         if not reusable_live_vods:
             reusable_live_vods = [live_vod]
+        self._apply_linked_replay(live_vod_id, replay_vod_id)
+        self.open_timeline(replay_vod_id)
+        editor = self._editor_tabs.get(replay_vod_id)
+        if editor is None:
+            return
         self.start_analysis(
             replay.vod_id,
-            target_vod_id=live_vod_id,
             revision_reason="전체 다시보기 재분석 전 · 라이브 분석본",
             reusable_live_vods=tuple(reusable_live_vods),
         )
@@ -2617,6 +2685,17 @@ class MainWindow(QMainWindow):
         editor = self._editor_tabs.get(target_vod_id)
         if source_vod is None or target_vod is None or editor is None:
             return
+        if (
+            not reusable_live_vods
+            and source_vod.source_kind != "live"
+            and getattr(source_vod, "live_broadcast_no", "")
+        ):
+            reusable_live_vods = tuple(
+                self.database.list_live_sessions_for_broadcast(
+                    source_vod.streamer_id,
+                    source_vod.live_broadcast_no,
+                )
+            )
         if self._live_reconnect_job is not None or self._stale_live_sessions:
             editor.status_label.setText(
                 "기존 라이브 자동 재연결을 먼저 처리하고 있습니다."

@@ -90,6 +90,12 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_analysis_queue_position
             ON analysis_queue(position);
+
+            CREATE TABLE IF NOT EXISTS live_replay_migrations (
+                live_vod_id TEXT PRIMARY KEY REFERENCES vods(vod_id) ON DELETE CASCADE,
+                replay_vod_id TEXT NOT NULL REFERENCES vods(vod_id) ON DELETE CASCADE,
+                migrated_at TEXT NOT NULL
+            );
             """
         )
         vod_columns = {
@@ -399,7 +405,10 @@ class Database:
         hidden: bool = False,
     ) -> list[Vod]:
         params: list[object] = [1 if hidden else 0]
-        clauses: list[str] = ["v.hidden = ?"]
+        clauses: list[str] = [
+            "v.hidden = ?",
+            "NOT (v.source_kind = 'live' AND v.linked_vod_id != '')",
+        ]
         if states is not None:
             state_list = list(states)
             if state_list:
@@ -665,6 +674,230 @@ class Database:
             (cutoff,),
         ).fetchall()
         return [str(row["vod_id"]) for row in rows]
+
+    def list_pending_live_replay_migrations(self) -> list[tuple[str, str]]:
+        """Return linked live sessions whose user work has not moved yet."""
+
+        rows = self.connection.execute(
+            """
+            SELECT live.vod_id AS live_vod_id, live.linked_vod_id AS replay_vod_id
+            FROM vods live
+            JOIN vods replay ON replay.vod_id = live.linked_vod_id
+            LEFT JOIN live_replay_migrations migration
+              ON migration.live_vod_id = live.vod_id
+            WHERE live.source_kind = 'live'
+              AND live.linked_vod_id != ''
+              AND replay.source_kind != 'live'
+              AND migration.live_vod_id IS NULL
+            ORDER BY live.discovered_at ASC
+            """
+        ).fetchall()
+        return [
+            (str(row["live_vod_id"]), str(row["replay_vod_id"]))
+            for row in rows
+        ]
+
+    def migrate_live_session_work(
+        self,
+        live_vod_id: str,
+        replay_vod_id: str,
+    ) -> bool:
+        """Move live timeline work onto its replay while retaining live cache metadata."""
+
+        live = self.connection.execute(
+            """
+            SELECT vod_id, streamer_id, source_kind, linked_vod_id,
+                   live_broadcast_no, memo, state
+            FROM vods WHERE vod_id = ?
+            """,
+            (live_vod_id,),
+        ).fetchone()
+        replay = self.connection.execute(
+            """
+            SELECT vod_id, streamer_id, source_kind, memo, state
+            FROM vods WHERE vod_id = ?
+            """,
+            (replay_vod_id,),
+        ).fetchone()
+        if live is None or replay is None:
+            raise ValueError("라이브 세션 또는 다시보기 기록을 찾지 못했습니다.")
+        if str(live["source_kind"]) != "live":
+            raise ValueError("이전 대상이 라이브 분석 기록이 아닙니다.")
+        if str(replay["source_kind"]) == "live":
+            raise ValueError("라이브 작업은 완성된 다시보기로만 이전할 수 있습니다.")
+        if int(live["streamer_id"]) != int(replay["streamer_id"]):
+            raise ValueError("같은 스트리머의 다시보기로만 작업을 이전할 수 있습니다.")
+        if str(live["linked_vod_id"] or "") != replay_vod_id:
+            raise ValueError("라이브 기록에 연결된 다시보기가 일치하지 않습니다.")
+
+        migrated = self.connection.execute(
+            """
+            SELECT replay_vod_id FROM live_replay_migrations
+            WHERE live_vod_id = ?
+            """,
+            (live_vod_id,),
+        ).fetchone()
+        if migrated is not None:
+            if str(migrated["replay_vod_id"]) != replay_vod_id:
+                raise ValueError("라이브 작업이 이미 다른 다시보기로 이전되었습니다.")
+            return False
+
+        live_document = self.connection.execute(
+            "SELECT text, status FROM timeline_documents WHERE vod_id = ?",
+            (live_vod_id,),
+        ).fetchone()
+        replay_document = self.connection.execute(
+            "SELECT text, status FROM timeline_documents WHERE vod_id = ?",
+            (replay_vod_id,),
+        ).fetchone()
+        now = utc_now()
+        live_text = str(live_document["text"]) if live_document is not None else ""
+        replay_text = (
+            str(replay_document["text"]) if replay_document is not None else ""
+        )
+        preserved_states = {
+            VodState.READY.value,
+            VodState.COPIED.value,
+            VodState.PUBLISHED.value,
+            VodState.SKIPPED.value,
+        }
+        migrated_state = (
+            str(live["state"])
+            if str(live["state"]) in preserved_states
+            else VodState.REVIEW.value
+        )
+
+        replay_memo = str(replay["memo"] or "").strip()
+        live_memo = str(live["memo"] or "").strip()
+        if not replay_memo:
+            merged_memo = live_memo
+        elif live_memo and live_memo != replay_memo:
+            merged_memo = f"{replay_memo}\n\n[라이브 작업에서 이전]\n{live_memo}"
+        else:
+            merged_memo = replay_memo
+
+        with self.connection:
+            if replay_text.strip() and replay_text != live_text:
+                self.connection.execute(
+                    """
+                    INSERT INTO timeline_revisions(vod_id, text, reason, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        replay_vod_id,
+                        replay_text,
+                        "다시보기 기존 작업 · 라이브 통합 전",
+                        now,
+                    ),
+                )
+
+            self.connection.execute(
+                "UPDATE timeline_revisions SET vod_id = ? WHERE vod_id = ?",
+                (replay_vod_id, live_vod_id),
+            )
+
+            if live_text.strip():
+                latest = self.connection.execute(
+                    """
+                    SELECT text FROM timeline_revisions
+                    WHERE vod_id = ? ORDER BY id DESC LIMIT 1
+                    """,
+                    (replay_vod_id,),
+                ).fetchone()
+                if latest is None or str(latest["text"]) != live_text:
+                    self.connection.execute(
+                        """
+                        INSERT INTO timeline_revisions(vod_id, text, reason, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            replay_vod_id,
+                            live_text,
+                            "라이브 작업에서 이전",
+                            now,
+                        ),
+                    )
+                self.connection.execute(
+                    """
+                    INSERT INTO timeline_documents(vod_id, text, status, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(vod_id) DO UPDATE SET
+                        text = excluded.text,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at
+                    """,
+                    (replay_vod_id, live_text, migrated_state, now),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE vods
+                    SET state = ?, memo = ?,
+                        live_broadcast_no = CASE
+                            WHEN live_broadcast_no = '' THEN ?
+                            ELSE live_broadcast_no
+                        END,
+                        updated_at = ?
+                    WHERE vod_id = ?
+                    """,
+                    (
+                        migrated_state,
+                        merged_memo,
+                        str(live["live_broadcast_no"] or ""),
+                        now,
+                        replay_vod_id,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE vods
+                    SET memo = ?,
+                        live_broadcast_no = CASE
+                            WHEN live_broadcast_no = '' THEN ?
+                            ELSE live_broadcast_no
+                        END,
+                        updated_at = ?
+                    WHERE vod_id = ?
+                    """,
+                    (
+                        merged_memo,
+                        str(live["live_broadcast_no"] or ""),
+                        now,
+                        replay_vod_id,
+                    ),
+                )
+
+            self.connection.execute(
+                "DELETE FROM analysis_queue WHERE vod_id = ?",
+                (live_vod_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM timeline_documents WHERE vod_id = ?",
+                (live_vod_id,),
+            )
+            self.connection.execute(
+                "UPDATE vods SET hidden = 1, updated_at = ? WHERE vod_id = ?",
+                (now, live_vod_id),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM timeline_revisions
+                WHERE vod_id = ? AND id NOT IN (
+                    SELECT id FROM timeline_revisions
+                    WHERE vod_id = ? ORDER BY id DESC LIMIT 50
+                )
+                """,
+                (replay_vod_id, replay_vod_id),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO live_replay_migrations(
+                    live_vod_id, replay_vod_id, migrated_at
+                ) VALUES (?, ?, ?)
+                """,
+                (live_vod_id, replay_vod_id, now),
+            )
+        return True
 
     def list_live_sessions_for_broadcast(
         self,
