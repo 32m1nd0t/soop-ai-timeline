@@ -815,6 +815,7 @@ class TimelineDocumentEditor(QWidget):
         self.analyze_button.setVisible(not running and not self._is_live)
         self.reanalyze_vod_button.setVisible(self._is_live and not running)
         self.cancel_analysis_button.setVisible(running)
+        self.cancel_analysis_button.setEnabled(running)
         self.cancel_analysis_button.setText(
             "분석 취소"
             if running
@@ -847,6 +848,21 @@ class TimelineDocumentEditor(QWidget):
             self.preview_card.setVisible(True)
         elif self.preview_card.isVisible():
             self.preview_title.setText("분석 중간 결과 · 최종본 아님")
+
+    def set_analysis_queued(
+        self,
+        message: str,
+        percent: int | None = None,
+    ) -> None:
+        if not self._analysis_running:
+            self.set_analysis_running(True)
+        self.cancel_analysis_button.setText("분석 대기 취소")
+        if percent is None:
+            self.analysis_progress.setRange(0, 0)
+        else:
+            self.analysis_progress.setRange(0, 100)
+            self.analysis_progress.setValue(max(0, min(100, percent)))
+        self.status_label.setText(message)
 
     def set_live_running(self, running: bool) -> None:
         self._live_running = running

@@ -251,7 +251,8 @@ class MainWindowStateLogicTests(unittest.TestCase):
                 state_changes.append((vod_id, state))
 
         editor = SimpleNamespace(
-            status_label=SimpleNamespace(setText=editor_messages.append)
+            status_label=SimpleNamespace(setText=editor_messages.append),
+            set_analysis_queued=lambda message: editor_messages.append(message),
         )
         window = SimpleNamespace(
             database=Database(),
@@ -285,6 +286,109 @@ class MainWindowStateLogicTests(unittest.TestCase):
         self.assertIn("FW 자막추출", editor_messages[-1])
         self.assertIn("Gemini", editor_messages[-1])
         self.assertIn("FW 자막추출", status_messages[-1])
+
+    def test_queued_analysis_is_reflected_in_an_opened_editor(self):
+        queued_messages: list[str] = []
+        editor = SimpleNamespace(
+            _analysis_running=False,
+            _live_running=False,
+            set_analysis_queued=lambda message: queued_messages.append(message),
+        )
+        window = SimpleNamespace(
+            _editor_tabs={"vod-2": editor},
+            _live_jobs={},
+            _analysis_jobs={},
+            _analysis_source_ids={},
+            _analysis_queue=["vod-1", "vod-2"],
+            _pretranscribe_jobs={},
+            _active_analysis_target_id=lambda vod_id: None,
+        )
+
+        MainWindow._sync_editor_analysis_state(window, "vod-2")
+
+        self.assertEqual(len(queued_messages), 1)
+        self.assertIn("대기열 2번째", queued_messages[0])
+
+    def test_active_analysis_can_be_resolved_from_its_source_vod(self):
+        window = SimpleNamespace(
+            _analysis_jobs={"live-1": (object(), object())},
+            _analysis_source_ids={"live-1": "vod-2"},
+        )
+
+        target = MainWindow._active_analysis_target_id(window, "vod-2")
+
+        self.assertEqual(target, "live-1")
+
+    def test_queued_analysis_cancel_updates_editor_and_interrupts_fw(self):
+        interrupted: list[bool] = []
+        removed: list[str] = []
+        state_changes: list[tuple[str, str]] = []
+        editor_running: list[bool] = []
+        editor_messages: list[str] = []
+
+        thread = SimpleNamespace(
+            requestInterruption=lambda: interrupted.append(True)
+        )
+        editor = SimpleNamespace(
+            set_analysis_running=editor_running.append,
+            status_label=SimpleNamespace(setText=editor_messages.append),
+        )
+        database = SimpleNamespace(
+            remove_analysis_queue=removed.append,
+            set_vod_state=lambda vod_id, state: state_changes.append(
+                (vod_id, state)
+            ),
+        )
+        window = SimpleNamespace(
+            _analysis_jobs={},
+            _analysis_queue=["vod-2"],
+            _pretranscribe_queue=["vod-2"],
+            _pretranscribe_jobs={"vod-2": (thread, object())},
+            _live_jobs={},
+            _editor_tabs={"vod-2": editor},
+            _active_analysis_target_id=lambda vod_id: None,
+            database=database,
+            status_label=SimpleNamespace(setText=lambda message: None),
+            load_vods=lambda: None,
+        )
+
+        MainWindow._cancel_or_dequeue(window, "vod-2")
+
+        self.assertEqual(window._analysis_queue, [])
+        self.assertEqual(window._pretranscribe_queue, [])
+        self.assertEqual(interrupted, [True])
+        self.assertEqual(removed, ["vod-2"])
+        self.assertEqual(
+            state_changes,
+            [("vod-2", VodState.REVIEW.value)],
+        )
+        self.assertEqual(editor_running, [False])
+        self.assertIn("취소", editor_messages[-1])
+
+    def test_running_analysis_cancel_accepts_source_vod_id(self):
+        interrupted: list[bool] = []
+        progress_messages: list[tuple[int, str]] = []
+        thread = SimpleNamespace(
+            requestInterruption=lambda: interrupted.append(True)
+        )
+        editor = SimpleNamespace(
+            analysis_progress=SimpleNamespace(value=lambda: 42),
+            set_analysis_progress=lambda percent, message: progress_messages.append(
+                (percent, message)
+            ),
+        )
+        window = SimpleNamespace(
+            _live_jobs={},
+            _analysis_jobs={"live-1": (thread, object())},
+            _editor_tabs={"live-1": editor},
+            _active_analysis_target_id=lambda vod_id: "live-1",
+        )
+
+        MainWindow.cancel_analysis(window, "vod-2")
+
+        self.assertEqual(interrupted, [True])
+        self.assertEqual(progress_messages[0][0], 42)
+        self.assertIn("취소를 요청", progress_messages[0][1])
 
     def test_pretranscribe_can_start_while_an_analysis_is_running(self):
         started: list[str] = []

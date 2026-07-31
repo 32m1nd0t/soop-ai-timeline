@@ -1207,6 +1207,7 @@ class MainWindow(QMainWindow):
     def open_timeline(self, vod_id: str) -> None:
         existing_editor = self._editor_tabs.get(vod_id)
         if existing_editor is not None:
+            self._sync_editor_analysis_state(vod_id)
             self.tabs.setCurrentWidget(existing_editor)
             return
 
@@ -1217,6 +1218,7 @@ class MainWindow(QMainWindow):
         editor = self._create_timeline_editor(vod, text)
         self._editor_tabs[vod_id] = editor
         self._refresh_editor_cache_state(vod_id)
+        self._sync_editor_analysis_state(vod_id)
         title = vod.title if len(vod.title) <= 22 else f"{vod.title[:21]}…"
         index = self.tabs.addTab(editor, title)
         self.tabs.setTabToolTip(index, vod.title)
@@ -1243,7 +1245,7 @@ class MainWindow(QMainWindow):
         editor.memo_changed.connect(self._save_vod_memo)
         editor.review_completed.connect(self._mark_review_complete)
         editor.analysis_requested.connect(self.start_analysis)
-        editor.analysis_cancel_requested.connect(self.cancel_analysis)
+        editor.analysis_cancel_requested.connect(self._cancel_or_dequeue)
         editor.live_reconnect_requested.connect(self.reconnect_live_session)
         editor.reanalyze_as_vod_requested.connect(self.reanalyze_live_as_vod)
         editor.style_requested.connect(self.start_style_correction)
@@ -1444,6 +1446,51 @@ class MainWindow(QMainWindow):
     def _refresh_all_editor_cache_states(self) -> None:
         for vod_id in list(self._editor_tabs):
             self._refresh_editor_cache_state(vod_id)
+
+    def _active_analysis_target_id(self, vod_id: str) -> str | None:
+        if vod_id in self._analysis_jobs:
+            return vod_id
+        for target_vod_id, source_vod_id in self._analysis_source_ids.items():
+            if (
+                source_vod_id == vod_id
+                and target_vod_id in self._analysis_jobs
+            ):
+                return target_vod_id
+        return None
+
+    def _sync_editor_analysis_state(self, vod_id: str) -> None:
+        editor = self._editor_tabs.get(vod_id)
+        if editor is None:
+            return
+        if vod_id in self._live_jobs:
+            if not editor._live_running:
+                editor.set_live_running(True)
+            return
+
+        target_vod_id = self._active_analysis_target_id(vod_id)
+        if target_vod_id is not None:
+            if not editor._analysis_running:
+                editor.set_analysis_running(True)
+                editor.set_analysis_progress(
+                    0,
+                    "AI 분석이 진행 중입니다. ‘분석 취소’로 중단할 수 있습니다.",
+                )
+            return
+
+        if vod_id in self._analysis_queue:
+            if vod_id in self._pretranscribe_jobs:
+                message = "FW 자막추출 중 · 완료 후 Gemini 분석을 시작합니다."
+            else:
+                queue_position = self._analysis_queue.index(vod_id) + 1
+                message = (
+                    f"AI 분석 대기 중 · 대기열 {queue_position}번째 · "
+                    "앞선 작업이 끝나면 자동으로 시작합니다."
+                )
+            editor.set_analysis_queued(message)
+            return
+
+        if editor._analysis_running:
+            editor.set_analysis_running(False)
 
     @Slot(str)
     def show_cached_transcript(self, vod_id: str) -> None:
@@ -2281,6 +2328,7 @@ class MainWindow(QMainWindow):
                 self._analysis_queue.append(vod_id)
                 self.database.enqueue_analysis(vod_id)
                 self.database.set_vod_state(vod_id, VodState.QUEUED.value)
+                self._sync_editor_analysis_state(vod_id)
             self.load_vods()
             self._resume_analysis_queue_if_idle()
             return
@@ -2361,12 +2409,18 @@ class MainWindow(QMainWindow):
         percent: int,
         message: str,
     ) -> None:
-        del vod_id
         self.status_label.setText(
             "FW 자막추출 병렬 실행 "
             f"{len(self._pretranscribe_jobs)}/{self._MAX_CONCURRENT_PRETRANSCRIBES}"
             f" · {percent}% · Gemini 미사용 · {message}"
         )
+        if vod_id in self._analysis_queue:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_analysis_queued(
+                    f"FW 자막추출 {percent}% · 완료 후 Gemini 분석을 시작합니다. · {message}",
+                    percent,
+                )
 
     def _pretranscribe_succeeded(self, vod_id: str) -> None:
         if vod_id in self._pretranscribe_queue:
@@ -2377,6 +2431,11 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 f"FW 자막추출 완료 · Gemini 분석 순서 대기{tail}"
             )
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_analysis_queued(
+                    f"FW 자막추출 완료 · Gemini 분석 순서 대기{tail}"
+                )
         else:
             self.status_label.setText(f"백그라운드 FW 자막추출 완료{tail}")
 
@@ -2606,7 +2665,7 @@ class MainWindow(QMainWindow):
             if source_vod_id not in self._pretranscribe_queue:
                 self._pretranscribe_queue.append(source_vod_id)
             if editor is not None:
-                editor.status_label.setText(
+                editor.set_analysis_queued(
                     f"FW 자막추출 중/대기 · Gemini 정리는 '{running_title}' 완료 후 시작"
                 )
             self.status_label.setText(
@@ -2633,7 +2692,7 @@ class MainWindow(QMainWindow):
                     source_vod_id,
                     VodState.QUEUED.value,
                 )
-            editor.status_label.setText(
+            editor.set_analysis_queued(
                 "FW 자막추출 중 · 완료 후 Gemini 분석을 시작합니다."
             )
             self.load_vods()
@@ -3302,12 +3361,17 @@ class MainWindow(QMainWindow):
                 "라이브 종료 요청됨 · 남은 자막과 AI 최종 타임라인을 정리합니다…"
             )
             return
-        job = self._analysis_jobs.get(vod_id)
+        target_vod_id = self._active_analysis_target_id(vod_id)
+        job = (
+            self._analysis_jobs.get(target_vod_id)
+            if target_vod_id is not None
+            else None
+        )
         if job is None:
             return
         thread, _ = job
         thread.requestInterruption()
-        editor = self._editor_tabs.get(vod_id)
+        editor = self._editor_tabs.get(target_vod_id)
         if editor is not None:
             editor.set_analysis_progress(
                 editor.analysis_progress.value(),
@@ -3640,7 +3704,10 @@ class MainWindow(QMainWindow):
         )
 
     def _cancel_or_dequeue(self, vod_id: str) -> None:
-        if vod_id in self._analysis_jobs or vod_id in self._live_jobs:
+        if (
+            self._active_analysis_target_id(vod_id) is not None
+            or vod_id in self._live_jobs
+        ):
             self.cancel_analysis(vod_id)
             return
         if vod_id in self._analysis_queue:
@@ -3654,6 +3721,7 @@ class MainWindow(QMainWindow):
             self.database.set_vod_state(vod_id, VodState.REVIEW.value)
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
+                editor.set_analysis_running(False)
                 editor.status_label.setText(
                     "FW 자막추출 및 Gemini 분석 대기를 취소했습니다."
                 )
@@ -3683,14 +3751,7 @@ class MainWindow(QMainWindow):
             return
         widget = self.tabs.widget(index)
         if isinstance(widget, TimelineDocumentEditor):
-            if (
-                widget.vod.vod_id in self._analysis_jobs
-                or widget.vod.vod_id in self._analysis_queue
-                or widget.vod.vod_id in self._style_jobs
-                or widget.vod.vod_id in self._line_rewrite_jobs
-                or widget.vod.vod_id in self._live_jobs
-                or widget.vod.vod_id in self._regroup_jobs
-            ):
+            if self._vod_active_job(widget.vod.vod_id):
                 QMessageBox.information(
                     self,
                     "분석 작업 중",
