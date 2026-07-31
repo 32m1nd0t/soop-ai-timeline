@@ -319,6 +319,50 @@ class MainWindowStateLogicTests(unittest.TestCase):
 
         self.assertEqual(target, "live-1")
 
+    def test_auxiliary_ai_job_is_reflected_in_an_opened_editor(self):
+        cancel_labels: list[str] = []
+        editor = SimpleNamespace(
+            _analysis_running=False,
+            _live_running=False,
+            _auxiliary_ai_running=False,
+            set_auxiliary_ai_running=lambda running, label="": cancel_labels.append(
+                label if running else "stopped"
+            ),
+        )
+        window = SimpleNamespace(
+            _editor_tabs={"live-1": editor},
+            _live_jobs={},
+            _analysis_jobs={},
+            _analysis_source_ids={},
+            _analysis_queue=[],
+            _active_analysis_target_id=lambda vod_id: None,
+            _active_auxiliary_ai_job=lambda vod_id: (
+                "live-1",
+                "저장 자막 재정리",
+                object(),
+            ),
+        )
+
+        MainWindow._sync_editor_analysis_state(window, "live-1")
+
+        self.assertEqual(cancel_labels, ["저장 자막 재정리 취소"])
+
+    def test_linked_replay_resolves_to_live_regroup_job(self):
+        thread = object()
+        database = SimpleNamespace(
+            get_vod=lambda vod_id: SimpleNamespace(linked_vod_id="vod-2")
+        )
+        window = SimpleNamespace(
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={"live-1": (thread, object())},
+            database=database,
+        )
+
+        job = MainWindow._active_auxiliary_ai_job(window, "vod-2")
+
+        self.assertEqual(job, ("live-1", "저장 자막 재정리", thread))
+
     def test_queued_analysis_cancel_updates_editor_and_interrupts_fw(self):
         interrupted: list[bool] = []
         removed: list[str] = []
@@ -389,6 +433,34 @@ class MainWindowStateLogicTests(unittest.TestCase):
         self.assertEqual(interrupted, [True])
         self.assertEqual(progress_messages[0][0], 42)
         self.assertIn("취소를 요청", progress_messages[0][1])
+
+    def test_auxiliary_ai_cancel_interrupts_job_and_updates_button(self):
+        interrupted: list[bool] = []
+        cancel_requests: list[str] = []
+        thread = SimpleNamespace(
+            requestInterruption=lambda: interrupted.append(True)
+        )
+        editor = SimpleNamespace(
+            request_auxiliary_ai_cancel=cancel_requests.append,
+        )
+        window = SimpleNamespace(
+            _live_jobs={},
+            _analysis_jobs={},
+            _analysis_queue=[],
+            _editor_tabs={"live-1": editor},
+            _active_analysis_target_id=lambda vod_id: None,
+            _active_auxiliary_ai_job=lambda vod_id: (
+                "live-1",
+                "저장 자막 재정리",
+                thread,
+            ),
+            status_label=SimpleNamespace(setText=lambda message: None),
+        )
+
+        MainWindow._cancel_or_dequeue(window, "live-1")
+
+        self.assertEqual(interrupted, [True])
+        self.assertEqual(cancel_requests, ["저장 자막 재정리"])
 
     def test_pretranscribe_can_start_while_an_analysis_is_running(self):
         started: list[str] = []

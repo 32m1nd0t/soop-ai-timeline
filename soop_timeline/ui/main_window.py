@@ -1458,6 +1458,26 @@ class MainWindow(QMainWindow):
                 return target_vod_id
         return None
 
+    def _active_auxiliary_ai_job(
+        self,
+        vod_id: str,
+    ) -> tuple[str, str, QThread] | None:
+        job_groups = (
+            ("문체 교정", self._style_jobs),
+            ("한 줄 AI 변환", self._line_rewrite_jobs),
+            ("주제 다시 묶기", self._regroup_jobs),
+        )
+        for job_name, jobs in job_groups:
+            job = jobs.get(vod_id)
+            if job is not None:
+                return vod_id, job_name, job[0]
+
+        for target_vod_id, job in self._regroup_jobs.items():
+            target_vod = self.database.get_vod(target_vod_id)
+            if target_vod is not None and target_vod.linked_vod_id == vod_id:
+                return target_vod_id, "저장 자막 재정리", job[0]
+        return None
+
     def _sync_editor_analysis_state(self, vod_id: str) -> None:
         editor = self._editor_tabs.get(vod_id)
         if editor is None:
@@ -1489,8 +1509,17 @@ class MainWindow(QMainWindow):
             editor.set_analysis_queued(message)
             return
 
+        auxiliary_job = self._active_auxiliary_ai_job(vod_id)
+        if auxiliary_job is not None:
+            _, job_name, _ = auxiliary_job
+            if not editor._auxiliary_ai_running:
+                editor.set_auxiliary_ai_running(True, f"{job_name} 취소")
+            return
+
         if editor._analysis_running:
             editor.set_analysis_running(False)
+        if editor._auxiliary_ai_running:
+            editor.set_auxiliary_ai_running(False)
 
     @Slot(str)
     def show_cached_transcript(self, vod_id: str) -> None:
@@ -3616,24 +3645,12 @@ class MainWindow(QMainWindow):
         return f"다른 AI 작업이 진행 중입니다.\n{instruction}"
 
     def _vod_active_job(self, vod_id: str) -> bool:
-        linked_regroup_source_active = False
-        for target_vod_id in self._regroup_jobs:
-            target_vod = self.database.get_vod(target_vod_id)
-            if (
-                target_vod is not None
-                and target_vod.linked_vod_id == vod_id
-            ):
-                linked_regroup_source_active = True
-                break
         return (
             vod_id in self._analysis_jobs
             or vod_id in self._analysis_source_ids.values()
             or vod_id in self._analysis_queue
             or vod_id in self._live_jobs
-            or vod_id in self._style_jobs
-            or vod_id in self._line_rewrite_jobs
-            or vod_id in self._regroup_jobs
-            or linked_regroup_source_active
+            or self._active_auxiliary_ai_job(vod_id) is not None
         )
 
     def _show_vod_context_menu(self, pos) -> None:
@@ -3730,14 +3747,15 @@ class MainWindow(QMainWindow):
             )
             self.load_vods()
             return
-        job = (
-            self._style_jobs.get(vod_id)
-            or self._line_rewrite_jobs.get(vod_id)
-            or self._regroup_jobs.get(vod_id)
-        )
-        if job is not None:
-            job[0].requestInterruption()
-            self.status_label.setText("진행 중인 AI 작업 취소를 요청했습니다…")
+        auxiliary_job = self._active_auxiliary_ai_job(vod_id)
+        if auxiliary_job is not None:
+            target_vod_id, job_name, thread = auxiliary_job
+            thread.requestInterruption()
+            for editor_vod_id in {vod_id, target_vod_id}:
+                editor = self._editor_tabs.get(editor_vod_id)
+                if editor is not None:
+                    editor.request_auxiliary_ai_cancel(job_name)
+            self.status_label.setText(f"{job_name} 취소를 요청했습니다…")
 
     def open_vod_from_row(self, row: int, column: int) -> None:
         del column
@@ -3752,11 +3770,23 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         if isinstance(widget, TimelineDocumentEditor):
             if self._vod_active_job(widget.vod.vod_id):
-                QMessageBox.information(
-                    self,
-                    "분석 작업 중",
-                    "AI 작업을 취소하거나 완료한 뒤 탭을 닫으세요.",
+                message = QMessageBox(self)
+                message.setWindowTitle("분석 작업 중")
+                message.setIcon(QMessageBox.Icon.Information)
+                message.setText(
+                    "AI 작업을 취소하거나 완료한 뒤 탭을 닫으세요."
                 )
+                cancel_button = message.addButton(
+                    "작업 취소",
+                    QMessageBox.ButtonRole.DestructiveRole,
+                )
+                message.addButton(
+                    "계속 작업",
+                    QMessageBox.ButtonRole.RejectRole,
+                )
+                message.exec()
+                if message.clickedButton() is cancel_button:
+                    self._cancel_or_dequeue(widget.vod.vod_id)
                 return
             widget.flush_memo_save()
             self._save_timeline(widget.vod.vod_id, widget.text())

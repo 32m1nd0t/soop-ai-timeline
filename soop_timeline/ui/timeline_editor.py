@@ -220,6 +220,7 @@ class TimelineDocumentEditor(QWidget):
         self._cache_present = False
         self._analysis_running = False
         self._live_running = False
+        self._auxiliary_ai_running = False
         self._live_reconnect_pending = False
         self._final_pending = False
         self._line_rewrite_running = False
@@ -736,6 +737,7 @@ class TimelineDocumentEditor(QWidget):
     def set_line_rewrite_running(self, running: bool, mode: str = "") -> None:
         self._line_rewrite_running = running
         self._update_line_rewrite_buttons()
+        self.set_auxiliary_ai_running(running, "한 줄 AI 변환 취소")
         self.analyze_button.setEnabled(not running and self._analyzer_available)
         self.style_button.setEnabled(not running and self._style_available)
         self.regroup_button.setEnabled(
@@ -924,6 +926,7 @@ class TimelineDocumentEditor(QWidget):
             and self._review_vod is None
             and not self._live_running
             and not self._analysis_running
+            and not self._auxiliary_ai_running
         )
 
     def request_live_stop(self) -> None:
@@ -934,6 +937,7 @@ class TimelineDocumentEditor(QWidget):
         )
 
     def set_style_running(self, running: bool) -> None:
+        self.set_auxiliary_ai_running(running, "AI 문체 교정 취소")
         self.style_button.setEnabled(not running and self._style_available)
         self.style_button.setText("문체 교정 중…" if running else "AI 문체 교정")
         self.analyze_button.setEnabled(not running and self._analyzer_available)
@@ -954,6 +958,40 @@ class TimelineDocumentEditor(QWidget):
         self.work_reset_button.setEnabled(not running)
         if running:
             self.status_label.setText("AI 문체를 교정합니다…")
+
+    def set_auxiliary_ai_running(
+        self,
+        running: bool,
+        cancel_text: str = "AI 작업 취소",
+    ) -> None:
+        self._auxiliary_ai_running = running
+        self.analyze_button.setVisible(
+            not self._is_live and not running and not self._analysis_running
+        )
+        self.reanalyze_vod_button.setVisible(
+            self._is_live
+            and not running
+            and not self._analysis_running
+            and not self._live_running
+        )
+        if running:
+            self.cancel_analysis_button.setVisible(True)
+            self.cancel_analysis_button.setEnabled(True)
+            self.cancel_analysis_button.setText(cancel_text)
+        elif not self._analysis_running and not self._live_running:
+            self.cancel_analysis_button.setVisible(False)
+            self.cancel_analysis_button.setEnabled(False)
+            self.cancel_analysis_button.setText(
+                "라이브 종료 및 정리" if self._is_live else "분석 취소"
+            )
+        self._update_live_reconnect_button()
+
+    def request_auxiliary_ai_cancel(self, job_name: str = "AI 작업") -> None:
+        self.cancel_analysis_button.setEnabled(False)
+        self.cancel_analysis_button.setText("취소 요청됨…")
+        self.status_label.setText(
+            f"{job_name} 취소를 요청했습니다. 현재 요청이 끝날 때까지 기다려주세요…"
+        )
 
     def apply_analysis_result(self, text: str) -> None:
         self.set_text(text)
@@ -1434,6 +1472,10 @@ class TimelineDocumentEditor(QWidget):
             self.review_player.seek_relative(seconds)
 
     def set_regroup_running(self, running: bool) -> None:
+        self.set_auxiliary_ai_running(
+            running,
+            "저장 자막 재정리 취소" if self._is_live else "주제 다시 묶기 취소",
+        )
         self.regroup_button.setEnabled(
             not running and self._analyzer_available and self._cached_transcript_available
         )
