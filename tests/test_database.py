@@ -97,6 +97,32 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(document.text, text)
         self.assertEqual(vod.state, VodState.READY.value)
 
+    def test_unchanged_timeline_save_keeps_edit_timestamp(self):
+        streamer = self.database.add_streamer("stable-timestamp-user")
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "78",
+                    "title": "방송",
+                    "url": "https://vod.sooplive.com/player/78",
+                }
+            ],
+        )
+        self.database.save_timeline("78", "변경 없는 본문", VodState.REVIEW.value)
+        self.database.connection.execute(
+            "UPDATE timeline_documents SET updated_at = ? WHERE vod_id = ?",
+            ("2026-07-30T00:00:00.000001+00:00", "78"),
+        )
+        self.database.connection.commit()
+
+        self.database.save_timeline("78", "변경 없는 본문", VodState.REVIEW.value)
+
+        self.assertEqual(
+            self.database.get_timeline("78").updated_at,
+            "2026-07-30T00:00:00.000001+00:00",
+        )
+
     def test_lists_all_live_captures_for_exact_broadcast(self):
         first = self.database.upsert_external_vod(
             vod_id="live-one",
@@ -288,6 +314,41 @@ class DatabaseTests(unittest.TestCase):
             VodState.ANALYZING.value,
         )
 
+    def test_hidden_or_linked_live_session_is_not_recovered(self):
+        linked = self.database.upsert_external_vod(
+            vod_id="live-linked-stale",
+            channel_id="live-stale-filter-user",
+            streamer_name="라이브",
+            title="연결된 라이브",
+            url="https://play.sooplive.com/live-stale-filter-user/11",
+            source_kind="live",
+            state=VodState.ANALYZING.value,
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777099",
+            channel_id="live-stale-filter-user",
+            streamer_name="라이브",
+            title="연결된 다시보기",
+            url="https://vod.sooplive.com/player/777099",
+            source_kind="manual_vod",
+        )
+        hidden = self.database.upsert_external_vod(
+            vod_id="live-hidden-stale",
+            channel_id="live-stale-filter-user",
+            streamer_name="라이브",
+            title="숨긴 라이브",
+            url="https://play.sooplive.com/live-stale-filter-user/12",
+            source_kind="live",
+            state=VodState.ANALYZING.value,
+        )
+        self.database.link_live_session_to_replay(linked.vod_id, replay.vod_id)
+        self.database.connection.execute(
+            "UPDATE vods SET hidden = 1 WHERE vod_id = ?", (hidden.vod_id,)
+        )
+        self.database.connection.commit()
+
+        self.assertEqual(self.database.recover_stale_live_sessions(), [])
+
     def test_list_vods_filters_by_streamer_and_supports_sort_orders(self):
         first = self.database.add_streamer("first-user", "첫 번째")
         second = self.database.add_streamer("second-user", "두 번째")
@@ -453,6 +514,15 @@ class DatabaseTests(unittest.TestCase):
             "다시보기 기존 초안",
             VodState.REVIEW.value,
         )
+        self.database.connection.execute(
+            "UPDATE timeline_documents SET updated_at = ? WHERE vod_id = ?",
+            ("2026-07-26T00:00:00.000001+00:00", replay.vod_id),
+        )
+        self.database.connection.execute(
+            "UPDATE timeline_documents SET updated_at = ? WHERE vod_id = ?",
+            ("2026-07-26T00:00:00.000002+00:00", live.vod_id),
+        )
+        self.database.connection.commit()
         self.database.update_vod_memo(replay.vod_id, "다시보기 메모")
         self.database.link_live_session_to_replay(live.vod_id, replay.vod_id)
 
@@ -492,6 +562,185 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("라이브 이전 버전", [item.text for item in revisions])
         self.assertIn("다시보기 기존 초안", [item.text for item in revisions])
         self.assertEqual(self.database.list_pending_live_replay_migrations(), [])
+
+    def test_completed_replay_is_not_overwritten_by_delayed_live_migration(self):
+        streamer = self.database.add_streamer("delayed-merge-user", "지연 통합")
+        live = self.database.upsert_external_vod(
+            vod_id="live-905-20260727000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 지연 통합 방송",
+            url="https://play.sooplive.com/delayed-merge-user/905",
+            source_kind="live",
+            live_broadcast_no="905",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777005",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="지연 통합 방송 다시보기",
+            url="https://vod.sooplive.com/player/777005",
+            source_kind="manual_vod",
+        )
+        self.database.save_timeline(live.vod_id, "라이브 초안", VodState.REVIEW.value)
+        self.database.save_timeline(
+            replay.vod_id, "완료된 다시보기 전체 분석", VodState.READY.value
+        )
+        self.database.set_vod_state(replay.vod_id, VodState.READY.value)
+        self.database.link_live_session_to_replay(live.vod_id, replay.vod_id)
+
+        self.assertTrue(
+            self.database.migrate_live_session_work(live.vod_id, replay.vod_id)
+        )
+
+        self.assertEqual(
+            self.database.get_timeline(replay.vod_id).text,
+            "완료된 다시보기 전체 분석",
+        )
+        self.assertEqual(
+            self.database.get_vod(replay.vod_id).state,
+            VodState.READY.value,
+        )
+        self.assertIn(
+            "라이브 초안",
+            [
+                revision.text
+                for revision in self.database.list_timeline_revisions(replay.vod_id)
+            ],
+        )
+
+    def test_completed_replay_document_status_is_not_overwritten(self):
+        streamer = self.database.add_streamer("newer-merge-user", "완료 통합")
+        live = self.database.upsert_external_vod(
+            vod_id="live-906-20260728000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 최신 통합 방송",
+            url="https://play.sooplive.com/newer-merge-user/906",
+            source_kind="live",
+            live_broadcast_no="906",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777006",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="최신 통합 방송 다시보기",
+            url="https://vod.sooplive.com/player/777006",
+            source_kind="manual_vod",
+        )
+        self.database.save_timeline(live.vod_id, "오래된 라이브 초안")
+        self.database.save_timeline(
+            replay.vod_id,
+            "방금 완료된 다시보기 분석",
+            VodState.READY.value,
+        )
+        self.database.link_live_session_to_replay(live.vod_id, replay.vod_id)
+
+        self.database.migrate_live_session_work(live.vod_id, replay.vod_id)
+
+        self.assertEqual(
+            self.database.get_timeline(replay.vod_id).text,
+            "방금 완료된 다시보기 분석",
+        )
+        self.assertEqual(
+            self.database.get_vod(replay.vod_id).state,
+            VodState.READY.value,
+        )
+
+    def test_newer_replay_review_is_not_overwritten_by_live_migration(self):
+        streamer = self.database.add_streamer("newer-review-user", "최신 검수본")
+        live = self.database.upsert_external_vod(
+            vod_id="live-907-20260729000000000000",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="[LIVE] 최신 검수 방송",
+            url="https://play.sooplive.com/newer-review-user/907",
+            source_kind="live",
+            live_broadcast_no="907",
+        )
+        replay = self.database.upsert_external_vod(
+            vod_id="777008",
+            channel_id=streamer.channel_id,
+            streamer_name=streamer.display_name,
+            title="최신 검수 방송 다시보기",
+            url="https://vod.sooplive.com/player/777008",
+            source_kind="manual_vod",
+        )
+        self.database.save_timeline(live.vod_id, "이전 라이브 초안")
+        self.database.save_timeline(replay.vod_id, "분석 전 다시보기 초안")
+        self.database.create_timeline_revision(
+            replay.vod_id,
+            "분석 전 다시보기 초안",
+            "AI 분석 전",
+        )
+        self.database.save_timeline(replay.vod_id, "새 다시보기 분석본")
+        self.database.link_live_session_to_replay(live.vod_id, replay.vod_id)
+
+        self.database.migrate_live_session_work(live.vod_id, replay.vod_id)
+
+        self.assertEqual(
+            self.database.get_timeline(replay.vod_id).text,
+            "새 다시보기 분석본",
+        )
+        self.assertIn(
+            "이전 라이브 초안",
+            [
+                revision.text
+                for revision in self.database.list_timeline_revisions(replay.vod_id)
+            ],
+        )
+
+    def test_migration_repairs_legacy_duplicate_replay_links(self):
+        replay = self.database.upsert_external_vod(
+            vod_id="777007",
+            channel_id="duplicate-link-user",
+            streamer_name="중복 연결",
+            title="다시보기",
+            url="https://vod.sooplive.com/player/777007",
+            source_kind="manual_vod",
+        )
+        first = self.database.upsert_external_vod(
+            vod_id="live-duplicate-one",
+            channel_id="duplicate-link-user",
+            streamer_name="중복 연결",
+            title="첫 라이브",
+            url="https://play.sooplive.com/duplicate-link-user/31",
+            source_kind="live",
+        )
+        second = self.database.upsert_external_vod(
+            vod_id="live-duplicate-two",
+            channel_id="duplicate-link-user",
+            streamer_name="중복 연결",
+            title="두 번째 라이브",
+            url="https://play.sooplive.com/duplicate-link-user/32",
+            source_kind="live",
+        )
+        self.database.connection.execute("DROP INDEX idx_vods_unique_linked_replay")
+        self.database.connection.execute(
+            "UPDATE vods SET linked_vod_id = ? WHERE vod_id IN (?, ?)",
+            (replay.vod_id, first.vod_id, second.vod_id),
+        )
+        self.database.connection.commit()
+        database_path = self.database.path
+        self.database.close()
+        self.database = Database(database_path)
+
+        linked_rows = self.database.connection.execute(
+            "SELECT vod_id FROM vods WHERE linked_vod_id = ?",
+            (replay.vod_id,),
+        ).fetchall()
+        self.assertEqual(len(linked_rows), 1)
+        unlinked_vod_id = (
+            second.vod_id
+            if str(linked_rows[0]["vod_id"]) == first.vod_id
+            else first.vod_id
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.database.connection.execute(
+                "UPDATE vods SET linked_vod_id = ? WHERE vod_id = ?",
+                (replay.vod_id, unlinked_vod_id),
+            )
+        self.database.connection.rollback()
 
     def test_broadcast_number_links_replay_even_when_title_changed(self):
         streamer = self.database.add_streamer("title-change-user", "제목 변경")

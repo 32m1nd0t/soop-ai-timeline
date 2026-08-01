@@ -30,6 +30,13 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn("SOOP이 제작·승인·후원한 공식 앱이 아니며", readme)
         self.assertIn("SOOP과 제휴 관계가 없습니다", readme)
 
+    def test_build_script_rejects_native_failures_and_stale_outputs(self) -> None:
+        script = (self.root / "build_exe.ps1").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(script.count("$LASTEXITCODE -ne 0"), 5)
+        self.assertIn("Remove-Item -LiteralPath $exe -Force", script)
+        self.assertIn("Remove-Item -LiteralPath $manifestPath -Force", script)
+
 
 if __name__ == "__main__":
     unittest.main()

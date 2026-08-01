@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -143,6 +143,7 @@ def iter_live_audio_chunks(
     *,
     chunk_seconds: int = DEFAULT_LIVE_CHUNK_SECONDS,
     overlap_seconds: int = DEFAULT_LIVE_OVERLAP_SECONDS,
+    reconnect_gap: Callable[[float, float], None] | None = None,
 ) -> Iterator[AudioChunk]:
     """Decode a public live HLS stream into bounded, in-memory audio chunks.
 
@@ -272,9 +273,11 @@ def iter_live_audio_chunks(
                 )
                 stream_url = refreshed.stream_url
                 captured_seconds = local_start_samples / WHISPER_SAMPLE_RATE
-                timeline_base = max(
+                timeline_base = _reconcile_reconnected_timeline(
                     timeline_base,
-                    refreshed.runtime_seconds - captured_seconds,
+                    captured_seconds,
+                    refreshed.runtime_seconds,
+                    reconnect_gap,
                 )
             except Exception as refresh_error:
                 logger.warning("Live stream URL refresh failed: %s", refresh_error)
@@ -288,6 +291,35 @@ def iter_live_audio_chunks(
             ),
             pcm_s16=bytes(buffer),
         )
+
+
+def _reconcile_reconnected_timeline(
+    timeline_base: float,
+    captured_seconds: float,
+    resumed_runtime_seconds: float,
+    reconnect_gap: Callable[[float, float], None] | None = None,
+) -> float:
+    """Move the live time axis forward and report audio missed while offline.
+
+    ``local_start_samples`` only counts audio that FFmpeg actually delivered.
+    SOOP's refreshed runtime therefore exposes a real hole whenever it is ahead
+    of the last captured position.  Keeping that hole out of replay reuse is
+    essential: otherwise a later VOD analysis assumes Whisper already inspected
+    audio that was never received.
+    """
+
+    base = max(0.0, float(timeline_base))
+    captured = max(0.0, float(captured_seconds))
+    resumed = max(0.0, float(resumed_runtime_seconds))
+    captured_end = base + captured
+    if reconnect_gap is not None and resumed - captured_end > 1.0:
+        try:
+            reconnect_gap(captured_end, resumed)
+        except Exception as error:
+            # A cache/logging failure must not terminate otherwise recoverable
+            # live audio reception.
+            logger.warning("Could not record live reconnect gap: %s", error)
+    return max(base, resumed - captured)
 
 
 def _interruptible_wait(seconds: float, stop_requested: CancelCallback) -> None:

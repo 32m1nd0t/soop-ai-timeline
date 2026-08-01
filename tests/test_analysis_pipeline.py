@@ -11,6 +11,7 @@ from soop_timeline.services.analyzer import (
     LIVE_RECONNECT_LOG_FILENAME,
     LIVE_TRANSCRIPT_FILENAME,
     LIVE_TRANSCRIPT_JOURNAL_FILENAME,
+    LiveReplayTranscriptReuse,
     LocalWhisperGeminiAnalyzer,
     _LiveTranscriptJournal,
     _restore_live_timeline,
@@ -928,10 +929,66 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(stream_calls, [source])
 
+    def test_background_transcription_reuses_linked_live_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = VodAudioSource(
+                "123",
+                120,
+                (VodAudioPart(1, 120, "https://vod-a.sooplive.com/audio.m3u8"),),
+            )
+            reusable = Transcript(
+                model="large-v3-turbo",
+                language="ko",
+                duration_seconds=120,
+                segments=[TranscriptSegment("s0", 1, 2, "라이브 자막")],
+                covered_ranges=((0, 120),),
+            )
+            received = []
+
+            class FakeTranscriber:
+                def transcribe_stream(self, received_source, **kwargs):
+                    received.append((received_source, kwargs))
+                    return reusable
+
+            analyzer = LocalWhisperGeminiAnalyzer(
+                AnalyzerConfig(gemini_api_key="test"),
+                transcriber_factory=lambda model, device: FakeTranscriber(),
+            )
+            replay = sample_vod()
+            live = sample_vod()
+            live.vod_id = "live-123"
+            live.source_kind = "live"
+            with patch(
+                "soop_timeline.services.analyzer.analysis_data_dir",
+                return_value=root,
+            ), patch(
+                "soop_timeline.services.vod_stream.fetch_vod_audio_source",
+                return_value=source,
+            ), patch(
+                "soop_timeline.services.analyzer.build_live_replay_transcript_reuse",
+                return_value=LiveReplayTranscriptReuse(
+                    transcript=reusable,
+                    covered_ranges=((0, 120),),
+                    session_count=1,
+                ),
+            ):
+                analyzer.transcribe_vod(
+                    replay,
+                    lambda *args: None,
+                    lambda: False,
+                    reusable_live_vods=(live,),
+                )
+
+            self.assertEqual(received[0][0], source)
+            self.assertIs(received[0][1]["reusable"], reusable)
+            self.assertEqual(received[0][1]["reusable_ranges"], ((0, 120),))
+
     def test_live_analysis_emits_incremental_and_final_timeline(self):
         live_vod = sample_vod()
         live_vod.source_kind = "live"
         live_vod.url = "https://play.sooplive.com/sample/98765"
+        live_vod.live_broadcast_no = "98765"
         source = LiveAudioSource(
             kind="live",
             channel_id="sample",
@@ -954,7 +1011,8 @@ class AnalysisPipelineTests(unittest.TestCase):
 
         class FakeTranscriber:
             def transcribe_live(self, source, update, **kwargs):
-                del source, kwargs
+                del source
+                kwargs["reconnect_gap"](3_620, 3_650)
                 update(transcript)
                 return transcript
 
@@ -994,9 +1052,13 @@ class AnalysisPipelineTests(unittest.TestCase):
                 preview=lambda stage, text: previews.append((stage, text)),
             )
             recovered = load_cached_transcript(live_vod)
+            reconnect_records = (
+                Path(directory) / LIVE_RECONNECT_LOG_FILENAME
+            ).read_text(encoding="utf-8").splitlines()
 
         self.assertIn("01:00:00 방송 시작", result)
         self.assertEqual(len(recovered.segments), 2)
+        self.assertEqual(len(reconnect_records), 1)
         self.assertTrue(result.startswith(f"{DEFAULT_TIMELINE_NOTICE}\n\n"))
         self.assertEqual(result.splitlines()[3], "오늘의 콘텐츠: 최종 라이브")
         self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))

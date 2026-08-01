@@ -11,6 +11,7 @@ from soop_timeline.services.timeline_timestamp import (
     timeline_line_at_position,
 )
 from soop_timeline.services.transcription import (
+    AnalysisCancelled,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -152,6 +153,24 @@ class LineRewriteTests(unittest.TestCase):
             make_transcript(),
         )
         self.assertEqual(result, "0:20:00 어제 꾼 이상한 꿈 이야기")
+
+    def test_response_returned_after_cancel_is_not_applied(self):
+        state = {"cancelled": False}
+
+        class CancellingProvider(FakeProvider):
+            def request_json(self, prompt, schema, cancelled, purpose=""):
+                state["cancelled"] = True
+                return super().request_json(prompt, schema, cancelled, purpose)
+
+        rewriter = AITimelineLineRewriter(CancellingProvider("늦게 도착한 결과"))
+        with self.assertRaises(AnalysisCancelled):
+            rewriter.rewrite(
+                "summary",
+                "0:20:00 어제 꾼 이상한 꿈 이야기",
+                1_500,
+                make_transcript(),
+                cancelled=lambda: state["cancelled"],
+            )
 
 
 if __name__ == "__main__":

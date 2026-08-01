@@ -919,6 +919,8 @@ class AITimelineGenerator:
                 granularity=self.topic_granularity,
             )
             payload = self._request_json(prompt, cancelled)
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
             title = str(payload.get("content_title", "")).strip()
             if title:
                 titles.append(title)
@@ -983,6 +985,8 @@ class AITimelineGenerator:
                 schema=FINAL_TIMELINE_SCHEMA,
                 purpose="timeline_finalize",
             )
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
         except AnalysisCancelled:
             raise
         except Exception as error:
@@ -1073,6 +1077,8 @@ class AITimelineGenerator:
             ),
             cancelled,
         )
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         lookup = {segment.segment_id: segment for segment in segments}
         entries = deduplicate_entries(entries_from_payload(payload, lookup))
         title = resolve_overall_summary(
@@ -1113,6 +1119,8 @@ class AITimelineGenerator:
             schema=FINAL_TIMELINE_SCHEMA,
             purpose="timeline_finalize",
         )
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         lookup = {segment.segment_id: segment for segment in segments}
         final_entries = deduplicate_entries(entries_from_payload(payload, lookup))
         final_entries = preserve_broadcast_ending_quotes(
@@ -1148,6 +1156,8 @@ class AITimelineGenerator:
                 schema=OVERALL_SUMMARY_SCHEMA,
                 purpose="overall_summary",
             )
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
         except AnalysisCancelled:
             raise
         except Exception as error:

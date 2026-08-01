@@ -125,6 +125,59 @@ class AnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(received, [(live,)])
 
+    def test_pretranscribe_worker_can_pass_live_captures_to_stt_only_api(self):
+        vod = Vod(
+            vod_id="456",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="다시보기",
+            url="https://vod.sooplive.com/player/456",
+            duration_text="1:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="new",
+            discovered_at="",
+            updated_at="",
+        )
+        live = Vod(
+            vod_id="live-456",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="[LIVE] 방송",
+            url="https://play.sooplive.com/sample/987",
+            duration_text="시작 00:10:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="review",
+            discovered_at="",
+            updated_at="",
+            source_kind="live",
+            live_broadcast_no="987",
+        )
+        received: list[tuple[Vod, ...]] = []
+
+        class Analyzer:
+            @staticmethod
+            def transcribe_vod(
+                vod,
+                progress,
+                cancelled,
+                reusable_live_vods=(),
+            ):
+                del vod, progress, cancelled
+                received.append(tuple(reusable_live_vods))
+
+        worker = PreTranscribeWorker(
+            Analyzer(),
+            vod,
+            reusable_live_vods=(live,),
+        )
+        worker.run()
+
+        self.assertEqual(received, [(live,)])
+
     def test_custom_result_vod_id_routes_result_to_target_document(self):
         vod = Vod(
             vod_id="456",

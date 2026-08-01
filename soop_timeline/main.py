@@ -14,10 +14,21 @@ def option_value(arguments: list[str], name: str) -> str:
     return arguments[index + 1].strip()
 
 
+def acquire_single_instance_lock(path: str):
+    """Acquire the application lock and keep it held for this object's lifetime."""
+
+    from PySide6.QtCore import QLockFile
+
+    lock = QLockFile(path)
+    if not lock.tryLock(0):
+        return None
+    return lock
+
+
 def main() -> int:
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QFont
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QMessageBox
 
     from .database import Database
     from .paths import app_data_dir, database_path
@@ -53,6 +64,21 @@ def main() -> int:
             )
             return 0
 
+    instance_lock = None
+    if not gpu_smoke_test:
+        instance_lock = acquire_single_instance_lock(
+            str(app_data_dir() / "SOOPTimeline.lock")
+        )
+        if instance_lock is None:
+            if smoke_test:
+                return 3
+            QMessageBox.information(
+                None,
+                "SOOP AI 타임라인",
+                "프로그램이 이미 실행 중입니다.",
+            )
+            return 0
+
     database = Database(database_path())
     if smoke_test:
         from .services.preferences import PRIVACY_NOTICE_SETTING, PRIVACY_NOTICE_VERSION
@@ -66,7 +92,11 @@ def main() -> int:
         QTimer.singleShot(0, lambda: window.open_timeline(startup_vod_id))
     if smoke_test:
         QTimer.singleShot(800, app.quit)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        if instance_lock is not None:
+            instance_lock.unlock()
 
 
 def _verify_packaged_dependencies() -> None:

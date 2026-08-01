@@ -59,10 +59,15 @@ class AnalysisWorker(QObject):
             logger.exception("VOD analysis failed for %s", self.vod.vod_id)
             self.failed.emit(self.result_vod_id, str(error))
         else:
-            usage = str(getattr(self.analyzer, "last_usage_summary", "") or "")
-            if usage:
-                self.usage_changed.emit(usage)
-            self.succeeded.emit(self.result_vod_id, document)
+            # A request may finish just after the user presses cancel.  Do not
+            # publish that late response as a successful replacement document.
+            if thread.isInterruptionRequested():
+                self.cancelled.emit(self.result_vod_id)
+            else:
+                usage = str(getattr(self.analyzer, "last_usage_summary", "") or "")
+                if usage:
+                    self.usage_changed.emit(usage)
+                self.succeeded.emit(self.result_vod_id, document)
         finally:
             self.finished.emit()
 
@@ -76,10 +81,16 @@ class PreTranscribeWorker(QObject):
     cancelled = Signal(str)
     finished = Signal()
 
-    def __init__(self, analyzer: TimelineAnalyzer, vod: Vod):
+    def __init__(
+        self,
+        analyzer: TimelineAnalyzer,
+        vod: Vod,
+        reusable_live_vods: tuple[Vod, ...] = (),
+    ):
         super().__init__()
         self.analyzer = analyzer
         self.vod = vod
+        self.reusable_live_vods = reusable_live_vods
 
     @Slot()
     def run(self) -> None:
@@ -93,17 +104,22 @@ class PreTranscribeWorker(QObject):
             )
 
         try:
-            self.analyzer.transcribe_vod(
-                self.vod,
-                progress=progress,
-                cancelled=thread.isInterruptionRequested,
-            )
+            arguments = {
+                "progress": progress,
+                "cancelled": thread.isInterruptionRequested,
+            }
+            if self.reusable_live_vods:
+                arguments["reusable_live_vods"] = self.reusable_live_vods
+            self.analyzer.transcribe_vod(self.vod, **arguments)
         except AnalysisCancelled:
             self.cancelled.emit(self.vod.vod_id)
         except Exception as error:
             logger.exception("Pre-transcribe failed for %s", self.vod.vod_id)
             self.failed.emit(self.vod.vod_id, str(error))
         else:
-            self.succeeded.emit(self.vod.vod_id)
+            if thread.isInterruptionRequested():
+                self.cancelled.emit(self.vod.vod_id)
+            else:
+                self.succeeded.emit(self.vod.vod_id)
         finally:
             self.finished.emit()

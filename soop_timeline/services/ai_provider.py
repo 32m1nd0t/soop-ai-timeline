@@ -169,6 +169,8 @@ class StructuredAIProvider(ABC):
                     strict_json_schema(schema),
                     purpose=purpose,
                 )
+                if cancelled():
+                    raise AnalysisCancelled("AI 요청을 취소했습니다.")
                 if not isinstance(response.payload, dict):
                     raise RuntimeError("AI 응답이 JSON 객체가 아닙니다.")
                 self.usage.add(response.input_tokens, response.output_tokens)

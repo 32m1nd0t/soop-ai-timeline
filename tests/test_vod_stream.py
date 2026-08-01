@@ -9,16 +9,21 @@ import numpy as np
 
 from soop_timeline.models import Vod
 from soop_timeline.services.transcription import (
+    AnalysisCancelled,
     FasterWhisperTranscriber,
     Transcript,
     TranscriptSegment,
     WhisperRuntime,
     _WhisperBackend,
+    _MODEL_LOCK,
     load_vod_transcript_cache,
     missing_covered_ranges,
     save_vod_transcript_cache,
 )
-from soop_timeline.services.live_stream import LiveAudioSource
+from soop_timeline.services.live_stream import (
+    LiveAudioSource,
+    _reconcile_reconnected_timeline,
+)
 from soop_timeline.services.vod_stream import (
     AudioChunk,
     VOD_INFO_URL,
@@ -90,6 +95,28 @@ def public_payload() -> dict[str, object]:
 
 
 class VodStreamTests(unittest.TestCase):
+    def test_waiting_for_whisper_model_lock_honours_cancellation(self):
+        checks = 0
+
+        def cancelled():
+            nonlocal checks
+            checks += 1
+            return checks >= 2
+
+        transcriber = FasterWhisperTranscriber("large-v3-turbo", "cpu")
+        _MODEL_LOCK.acquire()
+        try:
+            with patch(
+                "soop_timeline.services.transcription.detect_whisper_runtime",
+                return_value=WhisperRuntime("cpu", "int8", "테스트 CPU"),
+            ), self.assertRaises(AnalysisCancelled):
+                transcriber._prepare_backend(
+                    lambda *args: None,
+                    cancelled,
+                )
+        finally:
+            _MODEL_LOCK.release()
+
     def test_public_metadata_returns_every_audio_part_in_order(self):
         messages: list[tuple[int, str]] = []
         with patch(
@@ -220,6 +247,100 @@ class VodStreamTests(unittest.TestCase):
                     "123",
                     "https://vod/changed",
                     "large-v3-turbo",
+                )
+            )
+
+    def test_completed_vod_cache_is_rejected_when_published_media_grows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "transcript.json"
+            initial_source = VodAudioSource(
+                "123",
+                10,
+                (VodAudioPart(1, 10, "https://vod-a.sooplive.com/old.m3u8"),),
+            )
+            grown_source = VodAudioSource(
+                "123",
+                20,
+                (VodAudioPart(1, 20, "https://vod-a.sooplive.com/new.m3u8"),),
+            )
+            transcript = Transcript(
+                model="large-v3-turbo",
+                language="ko",
+                duration_seconds=10,
+                segments=[TranscriptSegment("s0", 1, 2, "안녕하세요")],
+                covered_ranges=((0, 10),),
+            )
+            save_vod_transcript_cache(
+                cache_path,
+                "123",
+                "https://vod/123",
+                transcript,
+                vod_source=initial_source,
+            )
+
+            self.assertIsNotNone(
+                load_vod_transcript_cache(
+                    cache_path,
+                    "123",
+                    "https://vod/123",
+                    "large-v3-turbo",
+                    vod_source=initial_source,
+                    require_complete=True,
+                )
+            )
+            self.assertIsNone(
+                load_vod_transcript_cache(
+                    cache_path,
+                    "123",
+                    "https://vod/123",
+                    "large-v3-turbo",
+                    vod_source=grown_source,
+                    require_complete=True,
+                )
+            )
+
+    def test_legacy_vod_cache_uses_duration_for_completion_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "transcript.json"
+            transcript = Transcript(
+                model="large-v3-turbo",
+                language="ko",
+                duration_seconds=10,
+                segments=[TranscriptSegment("s0", 1, 2, "안녕하세요")],
+            )
+            save_vod_transcript_cache(
+                cache_path,
+                "123",
+                "https://vod/123",
+                transcript,
+            )
+
+            self.assertIsNotNone(
+                load_vod_transcript_cache(
+                    cache_path,
+                    "123",
+                    "https://vod/123",
+                    "large-v3-turbo",
+                    vod_source=VodAudioSource(
+                        "123",
+                        10,
+                        (VodAudioPart(1, 10, "https://vod-a.sooplive.com/a.m3u8"),),
+                    ),
+                    require_complete=True,
+                )
+            )
+            self.assertIsNone(
+                load_vod_transcript_cache(
+                    cache_path,
+                    "123",
+                    "https://vod/123",
+                    "large-v3-turbo",
+                    vod_source=VodAudioSource(
+                        "123",
+                        30,
+                        (VodAudioPart(1, 30, "https://vod-a.sooplive.com/a.m3u8"),),
+                    ),
+                    require_complete=True,
                 )
             )
 
@@ -470,6 +591,19 @@ class VodStreamTests(unittest.TestCase):
         self.assertEqual([item.text for item in result.segments], ["첫 발화", "다음 발화"])
         self.assertEqual([item.start for item in result.segments], [3_601, 3_615])
         self.assertGreaterEqual(len(updates), 2)
+
+    def test_internal_live_reconnect_reports_uncaptured_runtime_gap(self):
+        gaps: list[tuple[float, float]] = []
+
+        base = _reconcile_reconnected_timeline(
+            timeline_base=3_600,
+            captured_seconds=20,
+            resumed_runtime_seconds=3_650,
+            reconnect_gap=lambda start, end: gaps.append((start, end)),
+        )
+
+        self.assertEqual(base, 3_630)
+        self.assertEqual(gaps, [(3_620, 3_650)])
 
     def test_live_transcription_deduplicates_overlap_and_emits_only_new_text(self):
         chunks = [

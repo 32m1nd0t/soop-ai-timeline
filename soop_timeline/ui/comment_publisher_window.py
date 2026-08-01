@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QDesktopServices
@@ -75,6 +76,10 @@ class SoopCommentPublisher(QFrame):
         self._loaded = False
         self._logged_in = False
         self._busy = False
+        self._publish_generation = 0
+        self._publish_cancelled = False
+        self._closed = False
+        self._publication_id = ""
         self._replies: list[str] = []
         self._needle = ""
         self._posted_count = 0
@@ -187,6 +192,7 @@ class SoopCommentPublisher(QFrame):
         return web_view
 
     def open_window(self) -> None:
+        self._reopen_lifecycle()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -202,6 +208,7 @@ class SoopCommentPublisher(QFrame):
         rectangles. Keep the page rendered off screen so the trusted comment-tab
         click can be dispatched without stealing focus from the user.
         """
+        self._reopen_lifecycle()
         self._auto_confirmed = True
         self._background_rendering = True
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -226,6 +233,8 @@ class SoopCommentPublisher(QFrame):
         self.activateWindow()
 
     def _mute_media(self) -> None:
+        if self._closed:
+            return
         try:
             self.web_view.evaluate_js(build_mute_media_script())
         except Exception:
@@ -246,12 +255,16 @@ class SoopCommentPublisher(QFrame):
         self._start_login_poll()
 
     def _on_dom_loaded(self) -> None:
+        if self._closed:
+            return
         self._mute_media()
         if self._busy:
             return
         self.web_view.evaluate_js(build_login_probe_script(), self._on_login_probe)
 
     def _on_login_probe(self, result: dict) -> None:
+        if self._closed:
+            return
         payload = self._payload(result)
         if payload is None:
             self._set_status("페이지 상태를 읽지 못했습니다. 새로고침 후 다시 시도하세요.")
@@ -289,7 +302,7 @@ class SoopCommentPublisher(QFrame):
             else:
                 self._auto_posted = True
                 self._set_status(f"로그인 확인됨{who}. 등록을 시작합니다…")
-                QTimer.singleShot(400, self.start_publish)
+                self._schedule_lifecycle(400, self.start_publish)
             return
 
         if logged_in and not on_vod_page:
@@ -350,7 +363,7 @@ class SoopCommentPublisher(QFrame):
             self._login_poll_timer.stop()
 
     def _poll_login(self) -> None:
-        if self._busy:
+        if self._closed or self._busy:
             return
         self.web_view.evaluate_js(build_login_probe_script(), self._on_login_probe)
 
@@ -378,13 +391,15 @@ class SoopCommentPublisher(QFrame):
             )
             return False
         self._comment_click_in_flight = True
-        QTimer.singleShot(
+        self._schedule_lifecycle(
             _COMMENT_CLICK_RECHECK_MS,
             self._after_comment_tab_click,
         )
         return True
 
     def _after_comment_tab_click(self) -> None:
+        if self._closed:
+            return
         self._comment_click_in_flight = False
         if not self._busy:
             self._poll_login()
@@ -418,17 +433,41 @@ class SoopCommentPublisher(QFrame):
         )
 
     # -- Publishing ----------------------------------------------------------
-    def start_publish(self, confirmed: bool = False) -> None:
-        if self._busy:
-            return
+    @property
+    def is_busy(self) -> bool:
+        """Whether this window currently owns an active publication run."""
+        return self._busy
+
+    def cancel_publish(self, *, update_status: bool = True) -> bool:
+        """Stop all remaining callbacks/replies for the current publication.
+
+        A root comment or reply already submitted to SOOP cannot be recalled,
+        but the generation bump guarantees that delayed WebView2 callbacks and
+        ``singleShot`` timers from this run cannot submit anything else.
+        """
+        if not self._busy:
+            return False
+        self._publish_generation += 1
+        self._publish_cancelled = True
+        self._replies.clear()
+        self._finish_busy()
+        if update_status:
+            self._set_status(
+                "댓글 등록을 취소했습니다. 이미 전송된 항목은 SOOP에서 확인하세요."
+            )
+        return True
+
+    def start_publish(self, confirmed: bool = False) -> bool:
+        if self._closed or self._busy:
+            return False
         if not self._blocks:
             QMessageBox.information(self, "등록할 내용 없음", "등록할 타임라인이 비어 있습니다.")
-            return
+            return False
         try:
             plan = PublicationPlan.from_blocks(self._blocks)
         except ValueError as error:
             QMessageBox.information(self, "등록할 내용 없음", str(error))
-            return
+            return False
 
         if not confirmed and not self._auto_confirmed:
             reply_count = len(plan.replies)
@@ -443,8 +482,12 @@ class SoopCommentPublisher(QFrame):
                 QMessageBox.StandardButton.No,
             )
             if confirm != QMessageBox.StandardButton.Yes:
-                return
+                return False
 
+        self._publish_generation += 1
+        generation = self._publish_generation
+        self._publish_cancelled = False
+        self._publication_id = uuid4().hex
         self._busy = True
         self._stop_login_poll()
         self._replies = list(plan.replies)
@@ -455,36 +498,45 @@ class SoopCommentPublisher(QFrame):
         self.dump_button.setEnabled(False)
         self._set_status("댓글(1/1)을 등록하는 중…")
         self.web_view.evaluate_js(
-            build_post_root_script(plan.root_comment), self._on_root_result
+            build_post_root_script(plan.root_comment, self._publication_id),
+            lambda result, current=generation: self._on_root_result(result, current),
         )
+        return True
 
-    def _on_root_result(self, result: dict) -> None:
+    def _on_root_result(self, result: dict, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         payload = self._payload(result)
         if payload is None or not payload.get("ok"):
             self._publish_failed("댓글", payload)
             return
         self._set_status("댓글 등록 요청 완료. 반영을 확인하는 중…")
-        QTimer.singleShot(_SETTLE_MS, self._verify_root)
+        self._schedule_publish(_SETTLE_MS, self._verify_root, generation)
 
-    def _verify_root(self) -> None:
+    def _verify_root(self, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         self.web_view.evaluate_js(
-            build_verify_root_script(self._needle), self._on_verify_result
+            build_verify_root_script(self._needle, self._publication_id),
+            lambda result, current=generation: self._on_verify_result(result, current),
         )
 
-    def _on_verify_result(self, result: dict) -> None:
+    def _on_verify_result(self, result: dict, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         payload = self._payload(result)
         found = bool(payload and payload.get("found"))
         if found:
             self._posted_count = 1
             if self._replies:
                 self._set_status("댓글 등록 확인. 대댓글을 이어서 등록합니다…")
-                QTimer.singleShot(_SETTLE_MS, self._post_next_reply)
+                self._schedule_publish(_SETTLE_MS, self._post_next_reply, generation)
             else:
-                self._publish_done()
+                self._publish_done(generation)
             return
         self._verify_attempts += 1
         if self._verify_attempts < _MAX_VERIFY_ATTEMPTS:
-            QTimer.singleShot(_VERIFY_RETRY_MS, self._verify_root)
+            self._schedule_publish(_VERIFY_RETRY_MS, self._verify_root, generation)
             return
         # The comment may still have posted but rendered in a form we cannot match.
         proceed = QMessageBox.question(
@@ -496,9 +548,11 @@ class SoopCommentPublisher(QFrame):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
+        if not self._publish_is_current(generation):
+            return
         if self._replies and proceed == QMessageBox.StandardButton.Yes:
             self._posted_count = 1
-            QTimer.singleShot(0, self._post_next_reply)
+            self._schedule_publish(0, self._post_next_reply, generation)
         else:
             self._finish_busy()
             self._set_status(
@@ -506,29 +560,36 @@ class SoopCommentPublisher(QFrame):
                 "남은 대댓글은 편집 탭의 '이 블록 복사'로 직접 등록할 수 있습니다."
             )
 
-    def _post_next_reply(self) -> None:
+    def _post_next_reply(self, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         if not self._replies:
-            self._publish_done()
+            self._publish_done(generation)
             return
         index = self._posted_count  # 1-based reply order equals current posted count
         text = self._replies.pop(0)
         self._set_status(f"대댓글 {index}/{len(self._blocks) - 1}을 등록하는 중…")
         self.web_view.evaluate_js(
-            build_post_reply_script(text, self._needle), self._on_reply_result
+            build_post_reply_script(text, self._needle, self._publication_id),
+            lambda result, current=generation: self._on_reply_result(result, current),
         )
 
-    def _on_reply_result(self, result: dict) -> None:
+    def _on_reply_result(self, result: dict, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         payload = self._payload(result)
         if payload is None or not payload.get("ok"):
             self._publish_failed(f"대댓글 {self._posted_count}", payload)
             return
         self._posted_count += 1
         if self._replies:
-            QTimer.singleShot(_SETTLE_MS, self._post_next_reply)
+            self._schedule_publish(_SETTLE_MS, self._post_next_reply, generation)
         else:
-            self._publish_done()
+            self._publish_done(generation)
 
-    def _publish_done(self) -> None:
+    def _publish_done(self, generation: int) -> None:
+        if not self._publish_is_current(generation):
+            return
         self._finish_busy()
         replies_done = max(0, self._posted_count - 1)
         summary = (
@@ -567,10 +628,46 @@ class SoopCommentPublisher(QFrame):
 
     def _finish_busy(self) -> None:
         self._busy = False
-        self.publish_button.setEnabled(self._logged_in and bool(self._blocks))
-        self.dump_button.setEnabled(True)
+        self.publish_button.setEnabled(
+            not self._closed and self._logged_in and bool(self._blocks)
+        )
+        self.dump_button.setEnabled(not self._closed)
 
     # -- Helpers -------------------------------------------------------------
+    def _reopen_lifecycle(self) -> None:
+        if self._closed:
+            self._closed = False
+            self._publish_cancelled = False
+
+    def _schedule_lifecycle(self, delay_ms: int, callback) -> None:
+        generation = self._publish_generation
+        QTimer.singleShot(
+            delay_ms,
+            lambda: (
+                callback()
+                if not self._closed and generation == self._publish_generation
+                else None
+            ),
+        )
+
+    def _publish_is_current(self, generation: int) -> bool:
+        return (
+            not self._closed
+            and self._busy
+            and not self._publish_cancelled
+            and generation == self._publish_generation
+        )
+
+    def _schedule_publish(self, delay_ms: int, callback, generation: int) -> None:
+        QTimer.singleShot(
+            delay_ms,
+            lambda: (
+                callback(generation)
+                if self._publish_is_current(generation)
+                else None
+            ),
+        )
+
     def _update_block_summary(self) -> None:
         total = len(self._blocks)
         replies = max(0, total - 1)
@@ -590,6 +687,12 @@ class SoopCommentPublisher(QFrame):
         return payload if isinstance(payload, dict) else None
 
     def closeEvent(self, event) -> None:
+        self._closed = True
+        if not self.cancel_publish(update_status=False):
+            # Invalidate login/diagnostic callbacks and any timer scheduled just
+            # before the busy flag was cleared.
+            self._publish_generation += 1
+            self._publish_cancelled = True
         self._stop_login_poll()
         self._mute_timer.stop()
         try:

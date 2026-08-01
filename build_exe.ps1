@@ -16,14 +16,28 @@ else {
 
 Push-Location -LiteralPath $projectRoot
 try {
+    $exe = Join-Path $projectRoot "dist\SOOPTimeline.exe"
+    $manifestPath = Join-Path $projectRoot "dist\update.json"
+    if (Test-Path -LiteralPath $exe) {
+        Remove-Item -LiteralPath $exe -Force
+    }
+    if (Test-Path -LiteralPath $manifestPath) {
+        Remove-Item -LiteralPath $manifestPath -Force
+    }
+
     & $python -m pip install -e ".[build,gpu-windows]"
+    if ($LASTEXITCODE -ne 0) {
+        throw "빌드 의존성 설치에 실패했습니다. (exit code: $LASTEXITCODE)"
+    }
     & $python -m PyInstaller --noconfirm --clean "SOOPTimeline.spec"
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller 빌드에 실패했습니다. (exit code: $LASTEXITCODE)"
+    }
 }
 finally {
     Pop-Location
 }
 
-$exe = Join-Path $projectRoot "dist\SOOPTimeline.exe"
 if (-not (Test-Path -LiteralPath $exe)) {
     throw "EXE 빌드 결과를 찾을 수 없습니다: $exe"
 }
@@ -44,7 +58,14 @@ if (-not [string]::IsNullOrWhiteSpace($signThumbprint)) {
     }
 }
 
-$version = (& $python -c "from soop_timeline import __version__; print(__version__)" | Select-Object -Last 1).Trim()
+$versionOutput = & $python -c "from soop_timeline import __version__; print(__version__)"
+if ($LASTEXITCODE -ne 0) {
+    throw "앱 버전 조회에 실패했습니다. (exit code: $LASTEXITCODE)"
+}
+$version = ($versionOutput | Select-Object -Last 1).Trim()
+if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "앱 버전 조회 결과가 비어 있습니다."
+}
 $downloadUrl = [string]$env:SOOP_TIMELINE_DOWNLOAD_URL
 $releaseNotes = [string]$env:SOOP_TIMELINE_RELEASE_NOTES
 $manifest = [ordered]@{
@@ -53,7 +74,6 @@ $manifest = [ordered]@{
     release_notes = $releaseNotes
     sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
 }
-$manifestPath = Join-Path $projectRoot "dist\update.json"
 $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
 Write-Output $exe

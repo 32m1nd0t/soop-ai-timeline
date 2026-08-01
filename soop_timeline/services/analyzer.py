@@ -250,6 +250,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             return
         progress(1, f"{self.provider_name} API 연결과 모델 권한을 먼저 확인합니다…")
         message = str(test_connection(cancelled))
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         progress(2, message)
 
     def _capture_usage(self, generator: object) -> None:
@@ -280,6 +282,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         resume = load_timeline_generation_state(checkpoint_path, checkpoint_key)
         if resume is None:
             checkpoint_path.unlink(missing_ok=True)
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         timeline = generator.generate(
             vod,
             transcript,
@@ -293,6 +297,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 state,
             ),
         )
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         self.last_result_warning = str(getattr(generator, "last_warning", "") or "")
         if not self.last_result_warning:
             checkpoint_path.unlink(missing_ok=True)
@@ -332,6 +338,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 cancelled=cancelled,
                 preview=preview,
             )
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
             save_transcript_cache(cache_path, source_path, transcript)
         else:
             progress(68, f"저장된 자막 {len(transcript.segments):,}개 구간을 재사용합니다.")
@@ -413,6 +421,13 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         generator = self._new_generator()
         self._preflight(generator, progress, cancelled)
 
+        from .vod_stream import fetch_vod_audio_source
+
+        # A VOD can still be growing immediately after a live broadcast ends.
+        # Validate every completed cache against current SOOP media metadata
+        # before treating it as final.
+        source = fetch_vod_audio_source(vod, progress, cancelled)
+
         cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
         partial_path = analysis_data_dir(vod.vod_id) / "transcript.partial.json"
         transcript = load_vod_transcript_cache(
@@ -420,6 +435,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             vod.vod_id,
             vod.url,
             self.config.whisper_model,
+            vod_source=source,
+            require_complete=True,
         )
         if transcript is None:
             partial = load_vod_transcript_cache(
@@ -427,10 +444,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 vod.vod_id,
                 vod.url,
                 self.config.whisper_model,
+                vod_source=source,
             )
-            from .vod_stream import fetch_vod_audio_source
-
-            source = fetch_vod_audio_source(vod, progress, cancelled)
             live_reuse = build_live_replay_transcript_reuse(
                 vod,
                 reusable_live_vods,
@@ -476,13 +491,17 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     vod.vod_id,
                     vod.url,
                     snapshot,
+                    vod_source=source,
                 ),
             )
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
             save_vod_transcript_cache(
                 cache_path,
                 vod.vod_id,
                 vod.url,
                 transcript,
+                vod_source=source,
             )
             partial_path.unlink(missing_ok=True)
         else:
@@ -525,6 +544,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         vod: Vod,
         progress: ProgressCallback,
         cancelled: CancelCallback,
+        reusable_live_vods: Iterable[Vod] = (),
     ) -> None:
         """Run only faster-whisper and cache the transcript (no AI timeline).
 
@@ -539,11 +559,16 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
         cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
         partial_path = analysis_data_dir(vod.vod_id) / "transcript.partial.json"
+        from .vod_stream import fetch_vod_audio_source
+
+        source = fetch_vod_audio_source(vod, progress, cancelled)
         transcript = load_vod_transcript_cache(
             cache_path,
             vod.vod_id,
             vod.url,
             self.config.whisper_model,
+            vod_source=source,
+            require_complete=True,
         )
         if transcript is not None:
             progress(100, f"이미 저장된 자막 {len(transcript.segments):,}개가 있습니다.")
@@ -554,10 +579,14 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             vod.vod_id,
             vod.url,
             self.config.whisper_model,
+            vod_source=source,
         )
-        from .vod_stream import fetch_vod_audio_source
-
-        source = fetch_vod_audio_source(vod, progress, cancelled)
+        live_reuse = build_live_replay_transcript_reuse(
+            vod,
+            reusable_live_vods,
+            replay_duration=source.total_duration_seconds,
+            replay_partial=partial,
+        )
         transcriber = self._transcriber_factory(
             self.config.whisper_model,
             self.config.whisper_device,
@@ -574,18 +603,32 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             cancelled=cancelled,
             preview=None,
             resume=partial,
+            reusable=(
+                live_reuse.transcript
+                if live_reuse is not None
+                else None
+            ),
+            reusable_ranges=(
+                live_reuse.covered_ranges
+                if live_reuse is not None
+                else ()
+            ),
             checkpoint=lambda snapshot: save_vod_transcript_cache(
                 partial_path,
                 vod.vod_id,
                 vod.url,
                 snapshot,
+                vod_source=source,
             ),
         )
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         save_vod_transcript_cache(
             cache_path,
             vod.vod_id,
             vod.url,
             transcript,
+            vod_source=source,
         )
         partial_path.unlink(missing_ok=True)
         progress(100, f"자막 {len(transcript.segments):,}개 구간을 저장했습니다.")
@@ -727,6 +770,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     fast_stop_requested,
                     previous_entries=deduplicate_entries(candidates)[-8:],
                 )
+                if fast_stop_requested():
+                    return
             except AnalysisCancelled:
                 if fast_stop_requested():
                     return
@@ -792,6 +837,11 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     stop_requested=effective_stop_requested,
                     preview=preview,
                     update=on_update,
+                    reconnect_gap=lambda start, end: record_live_reconnect_gap(
+                        vod,
+                        start,
+                        end,
+                    ),
                 )
                 transcription_result.append(result)
             except BaseException as error:
@@ -911,6 +961,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             transcript.segments,
             fast_stop_requested,
         )
+        if fast_stop_requested():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         if preview is not None:
             preview("live_timeline", final.to_document())
         self._capture_usage(generator)
@@ -1555,12 +1607,15 @@ def load_cached_transcript(
         )
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        expected_source = {
-            "kind": "soop_vod",
-            "vod_id": vod.vod_id,
-            "url": vod.url,
-        }
-        if payload.get("source") != expected_source:
+        source = payload.get("source")
+        if not isinstance(source, dict) or any(
+            source.get(key) != expected
+            for key, expected in (
+                ("kind", "soop_vod"),
+                ("vod_id", vod.vod_id),
+                ("url", vod.url),
+            )
+        ):
             return None
         transcript = Transcript.from_dict(payload["transcript"])
         return transcript if transcript.segments else None

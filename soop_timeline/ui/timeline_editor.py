@@ -221,6 +221,7 @@ class TimelineDocumentEditor(QWidget):
         self._analysis_running = False
         self._live_running = False
         self._auxiliary_ai_running = False
+        self._document_editing_locked = False
         self._live_reconnect_pending = False
         self._final_pending = False
         self._line_rewrite_running = False
@@ -480,26 +481,30 @@ class TimelineDocumentEditor(QWidget):
         timestamp_tools = QHBoxLayout()
         timestamp_label = QLabel("타임스탬프 보정")
         timestamp_label.setObjectName("muted")
-        minus_button = QPushButton("현재 줄 -5초")
-        minus_button.clicked.connect(lambda: self.adjust_current_timestamp(-5))
-        plus_button = QPushButton("현재 줄 +5초")
-        plus_button.clicked.connect(lambda: self.adjust_current_timestamp(5))
-        merge_button = QPushButton("이전 주제와 합치기")
-        merge_button.clicked.connect(self.merge_current_with_previous)
+        self.minus_time_button = QPushButton("현재 줄 -5초")
+        self.minus_time_button.clicked.connect(
+            lambda: self.adjust_current_timestamp(-5)
+        )
+        self.plus_time_button = QPushButton("현재 줄 +5초")
+        self.plus_time_button.clicked.connect(
+            lambda: self.adjust_current_timestamp(5)
+        )
+        self.merge_previous_button = QPushButton("이전 주제와 합치기")
+        self.merge_previous_button.clicked.connect(self.merge_current_with_previous)
         self.global_offset_input = QSpinBox()
         self.global_offset_input.setRange(-3_600, 3_600)
         self.global_offset_input.setSuffix("초")
         self.global_offset_input.setToolTip("모든 타임라인 줄의 시각에 더할 값")
-        apply_offset_button = QPushButton("전체 시각 보정")
-        apply_offset_button.clicked.connect(self.apply_global_timestamp_offset)
+        self.apply_offset_button = QPushButton("전체 시각 보정")
+        self.apply_offset_button.clicked.connect(self.apply_global_timestamp_offset)
         timestamp_tools.addWidget(timestamp_label)
         timestamp_tools.addWidget(self.insert_time_button)
-        timestamp_tools.addWidget(minus_button)
-        timestamp_tools.addWidget(plus_button)
-        timestamp_tools.addWidget(merge_button)
+        timestamp_tools.addWidget(self.minus_time_button)
+        timestamp_tools.addWidget(self.plus_time_button)
+        timestamp_tools.addWidget(self.merge_previous_button)
         timestamp_tools.addStretch(1)
         timestamp_tools.addWidget(self.global_offset_input)
-        timestamp_tools.addWidget(apply_offset_button)
+        timestamp_tools.addWidget(self.apply_offset_button)
         root.addLayout(timestamp_tools)
 
         self.find_replace_bar = self._build_find_replace_bar()
@@ -813,6 +818,7 @@ class TimelineDocumentEditor(QWidget):
 
     def set_analysis_running(self, running: bool) -> None:
         self._analysis_running = running
+        self._update_document_editability()
         self._update_live_reconnect_button()
         self.analyze_button.setVisible(not running and not self._is_live)
         self.reanalyze_vod_button.setVisible(self._is_live and not running)
@@ -868,6 +874,7 @@ class TimelineDocumentEditor(QWidget):
 
     def set_live_running(self, running: bool) -> None:
         self._live_running = running
+        self._update_document_editability()
         if running:
             self._live_reconnect_pending = False
         self._update_live_reconnect_button()
@@ -965,6 +972,7 @@ class TimelineDocumentEditor(QWidget):
         cancel_text: str = "AI 작업 취소",
     ) -> None:
         self._auxiliary_ai_running = running
+        self._update_document_editability()
         self.analyze_button.setVisible(
             not self._is_live and not running and not self._analysis_running
         )
@@ -1063,6 +1071,31 @@ class TimelineDocumentEditor(QWidget):
 
     def set_text(self, text: str) -> None:
         self._replace_blocks(split_timeline(text))
+
+    def _update_document_editability(self) -> None:
+        """Prevent edits that would be overwritten by an in-flight AI result."""
+
+        locked = bool(
+            self._analysis_running
+            or self._live_running
+            or self._auxiliary_ai_running
+        )
+        self._document_editing_locked = locked
+        for block in self._blocks:
+            block.editor.setReadOnly(locked)
+        for widget in (
+            self.find_button,
+            self.find_replace_bar,
+            self.import_button,
+            self.insert_time_button,
+            self.minus_time_button,
+            self.plus_time_button,
+            self.merge_previous_button,
+            self.global_offset_input,
+            self.apply_offset_button,
+            self.history_button,
+        ):
+            widget.setEnabled(not locked)
 
     def reset_work_document(self, text: str) -> None:
         self._save_timer.stop()
@@ -1672,6 +1705,7 @@ class TimelineDocumentEditor(QWidget):
         total = len(parts)
         for index, part in enumerate(parts):
             block = TimelineBlockWidget(index, total, part)
+            block.editor.setReadOnly(self._document_editing_locked)
             block.text_changed.connect(self._on_block_changed)
             block.copy_requested.connect(self.copy_block)
             block.timestamp_activated.connect(self.seek_to_timestamp)

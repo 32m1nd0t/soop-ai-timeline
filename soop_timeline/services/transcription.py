@@ -24,6 +24,7 @@ CancelCallback = Callable[[], bool]
 PreviewCallback = Callable[[str, str], None]
 CheckpointCallback = Callable[["Transcript"], None]
 LiveUpdateCallback = Callable[["LiveTranscriptUpdate"], None]
+ReconnectGapCallback = Callable[[float, float], None]
 
 
 _NVIDIA_DLL_DIRECTORY_HANDLES: list[object] = []
@@ -381,7 +382,16 @@ class FasterWhisperTranscriber:
             f"처음 한 번은 모델 다운로드가 필요합니다…{runtime_note}",
         )
         cache_key = (self.model_name, f"{runtime.device}:{runtime.compute_type}")
-        with _MODEL_LOCK:
+        # Waiting behind another first-time model load used to be completely
+        # uninterruptible.  Polling the lock lets queued jobs honour cancellation
+        # immediately; the native model constructor itself cannot be interrupted,
+        # so we also check once more as soon as it returns.
+        while not _MODEL_LOCK.acquire(timeout=0.1):
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
+        try:
+            if cancelled():
+                raise AnalysisCancelled("분석을 취소했습니다.")
             backend = _MODEL_CACHE.get(cache_key)
             if backend is None:
                 model = WhisperModel(
@@ -395,6 +405,8 @@ class FasterWhisperTranscriber:
                     batched_pipeline=BatchedInferencePipeline(model=model),
                 )
                 _MODEL_CACHE[cache_key] = backend
+        finally:
+            _MODEL_LOCK.release()
 
         if cancelled():
             raise AnalysisCancelled("분석을 취소했습니다.")
@@ -466,6 +478,8 @@ class FasterWhisperTranscriber:
                     )
                     last_percent = percent
 
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         if not segments:
             raise RuntimeError("음성을 인식하지 못했습니다. 파일에 재생 가능한 음성이 있는지 확인하세요.")
 
@@ -900,6 +914,8 @@ class FasterWhisperTranscriber:
             stop_event.set()
             producer.join(timeout=2.0)
 
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         segments = materialized_segments()
         if not segments:
             raise RuntimeError("SOOP 오디오에서 음성을 인식하지 못했습니다.")
@@ -927,6 +943,7 @@ class FasterWhisperTranscriber:
         stop_requested: CancelCallback,
         preview: PreviewCallback | None = None,
         update: LiveUpdateCallback | None = None,
+        reconnect_gap: ReconnectGapCallback | None = None,
     ) -> Transcript:
         """Continuously transcribe bounded live audio chunks until stopped."""
         from .live_stream import (
@@ -962,7 +979,11 @@ class FasterWhisperTranscriber:
 
         def produce() -> None:
             try:
-                for chunk in iter_live_audio_chunks(source, should_stop):
+                for chunk in iter_live_audio_chunks(
+                    source,
+                    should_stop,
+                    reconnect_gap=reconnect_gap,
+                ):
                     if not put_item(chunk):
                         return
             except BaseException as error:
@@ -1137,6 +1158,8 @@ class FasterWhisperTranscriber:
                         _extract_words(raw),
                     )
                 )
+        if cancelled():
+            raise AnalysisCancelled("분석을 취소했습니다.")
         language = str(getattr(info, "language", "ko") or "ko")
         return segments, language
 
@@ -1149,6 +1172,48 @@ def source_fingerprint(path: str | Path) -> dict[str, object]:
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def vod_source_fingerprint(source: "VodAudioSource") -> dict[str, object]:
+    """Return stable metadata that changes when the published VOD grows/changes.
+
+    Signed HLS URLs may rotate even when the media is identical, so the
+    fingerprint deliberately uses SOOP's declared durations and part ordering
+    instead of the temporary playlist URLs.
+    """
+
+    return {
+        "total_duration_ms": round(max(0.0, source.total_duration_seconds) * 1_000),
+        "parts": [
+            {
+                "order": int(part.order),
+                "duration_ms": round(max(0.0, part.duration_seconds) * 1_000),
+            }
+            for part in source.parts
+        ],
+    }
+
+
+def _transcript_covers_vod_source(
+    transcript: Transcript,
+    source: "VodAudioSource",
+) -> bool:
+    total = max(0.0, float(source.total_duration_seconds))
+    if total <= 0:
+        return False
+    boundary = max(
+        float(transcript.duration_seconds),
+        max((segment.end for segment in transcript.segments), default=0.0),
+    )
+    coverage = transcript.covered_ranges or ((0.0, boundary),)
+    # SOOP metadata and decoded media can differ by a fraction of a second.
+    # Never allow that tolerance to hide a meaningful uninspected section.
+    tolerance = max(1.0, min(5.0, total * 0.0005))
+    return not missing_covered_ranges(
+        total,
+        coverage,
+        minimum_seconds=tolerance,
+    )
 
 
 def save_transcript_cache(path: str | Path, source_path: str | Path, transcript: Transcript) -> None:
@@ -1188,15 +1253,20 @@ def save_vod_transcript_cache(
     vod_id: str,
     source_url: str,
     transcript: Transcript,
+    *,
+    vod_source: "VodAudioSource | None" = None,
 ) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    source: dict[str, object] = {
+        "kind": "soop_vod",
+        "vod_id": vod_id,
+        "url": source_url,
+    }
+    if vod_source is not None:
+        source["media"] = vod_source_fingerprint(vod_source)
     payload = {
-        "source": {
-            "kind": "soop_vod",
-            "vod_id": vod_id,
-            "url": source_url,
-        },
+        "source": source,
         "transcript": transcript.to_dict(),
     }
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -1212,21 +1282,40 @@ def load_vod_transcript_cache(
     vod_id: str,
     source_url: str,
     expected_model: str,
+    *,
+    vod_source: "VodAudioSource | None" = None,
+    require_complete: bool = False,
 ) -> Transcript | None:
     cache_path = Path(path)
     if not cache_path.is_file():
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        expected_source = {
-            "kind": "soop_vod",
-            "vod_id": vod_id,
-            "url": source_url,
-        }
-        if payload.get("source") != expected_source:
+        cached_source = payload.get("source")
+        if not isinstance(cached_source, dict) or any(
+            cached_source.get(key) != expected
+            for key, expected in (
+                ("kind", "soop_vod"),
+                ("vod_id", vod_id),
+                ("url", source_url),
+            )
+        ):
             return None
+        if vod_source is not None:
+            cached_media = cached_source.get("media")
+            if (
+                cached_media is not None
+                and cached_media != vod_source_fingerprint(vod_source)
+            ):
+                return None
         transcript = Transcript.from_dict(payload["transcript"])
         if transcript.model != expected_model or not transcript.segments:
+            return None
+        if (
+            vod_source is not None
+            and require_complete
+            and not _transcript_covers_vod_source(transcript, vod_source)
+        ):
             return None
         return transcript
     except (OSError, ValueError, TypeError, KeyError):

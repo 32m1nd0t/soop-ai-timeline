@@ -10,7 +10,7 @@ from .models import Streamer, TimelineDocument, TimelineRevision, Vod, VodState
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class Database:
@@ -122,6 +122,14 @@ class Database:
             self.connection.execute(
                 "ALTER TABLE vods ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
             )
+        self._deduplicate_linked_replays()
+        self.connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_vods_unique_linked_replay
+            ON vods(linked_vod_id)
+            WHERE source_kind = 'live' AND linked_vod_id != ''
+            """
+        )
         streamer_columns = {
             str(row["name"])
             for row in self.connection.execute("PRAGMA table_info(streamers)").fetchall()
@@ -131,6 +139,48 @@ class Database:
                 "ALTER TABLE streamers ADD COLUMN glossary TEXT NOT NULL DEFAULT ''"
             )
         self.connection.commit()
+
+    def _deduplicate_linked_replays(self) -> None:
+        """Repair legacy duplicate links before enforcing one replay per live row."""
+
+        duplicate_targets = self.connection.execute(
+            """
+            SELECT linked_vod_id
+            FROM vods
+            WHERE source_kind = 'live' AND linked_vod_id != ''
+            GROUP BY linked_vod_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        now = utc_now()
+        for target in duplicate_targets:
+            replay_vod_id = str(target["linked_vod_id"])
+            rows = self.connection.execute(
+                """
+                SELECT live.vod_id
+                FROM vods live
+                LEFT JOIN live_replay_migrations migration
+                  ON migration.live_vod_id = live.vod_id
+                 AND migration.replay_vod_id = live.linked_vod_id
+                WHERE live.source_kind = 'live'
+                  AND live.linked_vod_id = ?
+                ORDER BY
+                    CASE WHEN migration.live_vod_id IS NULL THEN 1 ELSE 0 END,
+                    live.hidden DESC,
+                    live.discovered_at ASC,
+                    live.vod_id ASC
+                """,
+                (replay_vod_id,),
+            ).fetchall()
+            for duplicate in rows[1:]:
+                self.connection.execute(
+                    """
+                    UPDATE vods
+                    SET linked_vod_id = '', updated_at = ?
+                    WHERE vod_id = ?
+                    """,
+                    (now, str(duplicate["vod_id"])),
+                )
 
     def close(self) -> None:
         self.connection.close()
@@ -655,11 +705,39 @@ class Database:
         if duplicate is not None:
             raise ValueError("이 다시보기는 다른 라이브 분석 기록에 이미 연결되어 있습니다.")
 
-        self.connection.execute(
-            "UPDATE vods SET linked_vod_id = ?, updated_at = ? WHERE vod_id = ?",
-            (replay_vod_id, utc_now(), live_vod_id),
-        )
-        self.connection.commit()
+        try:
+            with self.connection:
+                updated = self.connection.execute(
+                    """
+                    UPDATE vods
+                    SET linked_vod_id = ?, updated_at = ?
+                    WHERE vod_id = ?
+                      AND source_kind = 'live'
+                      AND linked_vod_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM vods other
+                          WHERE other.source_kind = 'live'
+                            AND other.linked_vod_id = ?
+                            AND other.vod_id != ?
+                      )
+                    """,
+                    (
+                        replay_vod_id,
+                        utc_now(),
+                        live_vod_id,
+                        current,
+                        replay_vod_id,
+                        live_vod_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(
+                        "이 다시보기는 다른 라이브 분석 기록에 이미 연결되어 있습니다."
+                    )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(
+                "이 다시보기는 다른 라이브 분석 기록에 이미 연결되어 있습니다."
+            ) from error
 
     def list_recent_unlinked_live_sessions(self, *, days: int = 2) -> list[str]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat(
@@ -743,11 +821,18 @@ class Database:
             return False
 
         live_document = self.connection.execute(
-            "SELECT text, status FROM timeline_documents WHERE vod_id = ?",
+            "SELECT text, status, updated_at FROM timeline_documents WHERE vod_id = ?",
             (live_vod_id,),
         ).fetchone()
         replay_document = self.connection.execute(
-            "SELECT text, status FROM timeline_documents WHERE vod_id = ?",
+            "SELECT text, status, updated_at FROM timeline_documents WHERE vod_id = ?",
+            (replay_vod_id,),
+        ).fetchone()
+        replay_snapshot = self.connection.execute(
+            """
+            SELECT text, created_at FROM timeline_revisions
+            WHERE vod_id = ? ORDER BY id DESC LIMIT 1
+            """,
             (replay_vod_id,),
         ).fetchone()
         now = utc_now()
@@ -766,6 +851,46 @@ class Database:
             if str(live["state"]) in preserved_states
             else VodState.REVIEW.value
         )
+        replay_state = str(replay["state"])
+        replay_document_status = (
+            str(replay_document["status"]) if replay_document is not None else ""
+        )
+        replay_is_completed = (
+            replay_state in preserved_states
+            or replay_document_status in preserved_states
+        )
+        live_updated_at = (
+            str(live_document["updated_at"]) if live_document is not None else ""
+        )
+        replay_updated_at = (
+            str(replay_document["updated_at"])
+            if replay_document is not None
+            else ""
+        )
+        replay_is_newer = bool(
+            live_updated_at
+            and replay_updated_at
+            and replay_updated_at > live_updated_at
+        )
+        replay_changed_after_snapshot = bool(
+            replay_snapshot is not None
+            and replay_text != str(replay_snapshot["text"])
+            and replay_updated_at >= str(replay_snapshot["created_at"])
+        )
+        keep_replay_document = bool(
+            replay_text.strip()
+            and (
+                replay_is_completed
+                or replay_is_newer
+                or replay_changed_after_snapshot
+            )
+        )
+        if replay_state in preserved_states:
+            retained_replay_state = replay_state
+        elif replay_document_status in preserved_states:
+            retained_replay_state = replay_document_status
+        else:
+            retained_replay_state = VodState.REVIEW.value
 
         replay_memo = str(replay["memo"] or "").strip()
         live_memo = str(live["memo"] or "").strip()
@@ -817,17 +942,18 @@ class Database:
                             now,
                         ),
                     )
-                self.connection.execute(
-                    """
-                    INSERT INTO timeline_documents(vod_id, text, status, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(vod_id) DO UPDATE SET
-                        text = excluded.text,
-                        status = excluded.status,
-                        updated_at = excluded.updated_at
-                    """,
-                    (replay_vod_id, live_text, migrated_state, now),
-                )
+                if not keep_replay_document:
+                    self.connection.execute(
+                        """
+                        INSERT INTO timeline_documents(vod_id, text, status, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(vod_id) DO UPDATE SET
+                            text = excluded.text,
+                            status = excluded.status,
+                            updated_at = excluded.updated_at
+                        """,
+                        (replay_vod_id, live_text, migrated_state, now),
+                    )
                 self.connection.execute(
                     """
                     UPDATE vods
@@ -840,7 +966,11 @@ class Database:
                     WHERE vod_id = ?
                     """,
                     (
-                        migrated_state,
+                        (
+                            retained_replay_state
+                            if keep_replay_document
+                            else migrated_state
+                        ),
                         merged_memo,
                         str(live["live_broadcast_no"] or ""),
                         now,
@@ -953,6 +1083,8 @@ class Database:
                 text = excluded.text,
                 status = excluded.status,
                 updated_at = excluded.updated_at
+            WHERE timeline_documents.text != excluded.text
+               OR timeline_documents.status != excluded.status
             """,
             (vod_id, text, status, now),
         )
@@ -1105,7 +1237,13 @@ class Database:
         which moves the session to ``review``.
         """
         rows = self.connection.execute(
-            "SELECT vod_id FROM vods WHERE source_kind = 'live' AND state = ?",
+            """
+            SELECT vod_id FROM vods
+            WHERE source_kind = 'live'
+              AND state = ?
+              AND hidden = 0
+              AND linked_vod_id = ''
+            """,
             (VodState.ANALYZING.value,),
         ).fetchall()
         return [str(row["vod_id"]) for row in rows]

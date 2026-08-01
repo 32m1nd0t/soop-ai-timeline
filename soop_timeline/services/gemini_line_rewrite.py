@@ -193,6 +193,8 @@ class AITimelineLineRewriter:
                 is_cancelled,
                 purpose="timeline_line_quote",
             )
+            if is_cancelled():
+                raise AnalysisCancelled("줄 변환을 취소했습니다.")
             quote = " ".join(str(payload.get("text", "")).split()).strip()
             quote = quote.strip('"“”').strip()
             if not quote:
@@ -232,6 +234,8 @@ class AITimelineLineRewriter:
             is_cancelled,
             purpose="timeline_line_summary",
         )
+        if is_cancelled():
+            raise AnalysisCancelled("줄 변환을 취소했습니다.")
         summary = normalize_summary(str(payload.get("text", ""))).strip('"“”').strip()
         if not summary:
             raise RuntimeError("AI가 요약을 반환하지 않았습니다.")

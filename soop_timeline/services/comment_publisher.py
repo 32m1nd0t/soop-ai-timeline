@@ -82,10 +82,6 @@ REPLY_TOGGLE_HINTS: tuple[str, ...] = (
     "대댓글",
 )
 
-# Length of the distinctive prefix used to relocate the just-posted root comment.
-_NEEDLE_LENGTH = 60
-
-
 def vod_page_url(vod_id: str) -> str:
     """Return the comment-bearing VOD watch page for ``vod_id``."""
     cleaned = str(vod_id).strip()
@@ -97,12 +93,14 @@ def vod_page_url(vod_id: str) -> str:
 
 
 def root_needle(text: str) -> str:
-    """A short, distinctive prefix used to find a comment we just posted.
+    """Normalized root text used to find a comment we just posted.
 
     Whitespace is collapsed so it survives the DOM's own text normalization.
+    Keep the complete text: timeline root comments share a long boilerplate
+    prefix, so truncating this locator could make unrelated publications
+    indistinguishable.
     """
-    collapsed = " ".join(text.split())
-    return collapsed[:_NEEDLE_LENGTH]
+    return " ".join(text.split())
 
 
 def _js(value: object) -> str:
@@ -278,19 +276,52 @@ function __clickSubmit(info) {
     info.el.click();
     return true;
 }
-function __findCommentByText(needle) {
-    if (!needle) { return null; }
+function __commentNodesByText(needle) {
+    if (!needle) { return []; }
     const wanted = needle.replace(/\\s+/g, ' ').trim();
     const nodes = Array.from(document.querySelectorAll(
         'ul.cmmt-list > li, li, article, div[class*="comment"], div[class*="cmt"]'
     ));
-    // Smallest matching container wins so we land on one comment, not the list.
+    return nodes.filter((el) => {
+        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        return text.includes(wanted);
+    });
+}
+function __markExistingComments(needle, publicationId) {
+    if (!publicationId) { return; }
+    for (const el of __commentNodesByText(needle)) {
+        try { el.setAttribute('data-soop-timeline-before-id', publicationId); } catch (_) {}
+    }
+}
+function __findCommentByText(needle, publicationId) {
+    if (!needle) { return null; }
+    if (publicationId) {
+        const tagged = Array.from(document.querySelectorAll(
+            '[data-soop-timeline-publish-id]'
+        )).find((el) => el.getAttribute('data-soop-timeline-publish-id') === publicationId);
+        if (tagged) { return tagged; }
+    }
+    let nodes = __commentNodesByText(needle);
+    if (publicationId) {
+        const fresh = nodes.filter(
+            (el) => el.getAttribute('data-soop-timeline-before-id') !== publicationId
+        );
+        nodes = fresh;
+    }
+    // Prefer the top-level comment item so reply controls remain inside the
+    // returned element. Fall back to the smallest matching generic container.
+    const topLevel = nodes.filter((el) => {
+        try { return el.matches('ul.cmmt-list > li'); } catch (_) { return false; }
+    });
+    const candidates = topLevel.length ? topLevel : nodes;
     let best = null;
     let bestLen = Infinity;
-    for (const el of nodes) {
+    for (const el of candidates) {
         const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        if (!text.includes(wanted)) { continue; }
         if (text.length < bestLen) { best = el; bestLen = text.length; }
+    }
+    if (best && publicationId) {
+        try { best.setAttribute('data-soop-timeline-publish-id', publicationId); } catch (_) {}
     }
     return best;
 }
@@ -362,11 +393,13 @@ return {{
     ).strip()
 
 
-def build_post_root_script(text: str) -> str:
+def build_post_root_script(text: str, publication_id: str = "") -> str:
     """Fill the top-level comment box with ``text`` and submit it."""
     selectors = _js(list(COMMENT_INPUT_SELECTORS))
     hints = _js(list(SUBMIT_TEXT_HINTS))
     value = _js(text)
+    locator = _js(root_needle(text))
+    run_id = _js(publication_id)
     return (
         _HELPERS
         + f"""
@@ -376,6 +409,10 @@ await __sleep(300);
 let input = __findInput({selectors}, document);
 if (!input) {{ __ensureCommentArea(); await __sleep(450); input = __findInput({selectors}, document); }}
 if (!input) {{ return {{ ok: false, stage: 'find-input' }}; }}
+// Mark matching comments that existed before this submit. Verification can
+// select the newly inserted item even when identical text was posted earlier.
+// These private DOM attributes are never visible in the comment text.
+__markExistingComments({locator}, {run_id});
 __setValue(input, {value});
 await __sleep(200);
 const submit = __findSubmit(input, {hints}, null);
@@ -386,13 +423,14 @@ return {{ ok: true, stage: 'submitted', filled: true, wasDisabled: submit.disabl
     ).strip()
 
 
-def build_verify_root_script(needle: str) -> str:
+def build_verify_root_script(needle: str, publication_id: str = "") -> str:
     """Confirm a comment containing ``needle`` is now present on the page."""
     wanted = _js(needle)
+    run_id = _js(publication_id)
     return (
         _HELPERS
         + f"""
-const el = __findCommentByText({wanted});
+const el = __findCommentByText({wanted}, {run_id});
 return {{ ok: !!el, found: !!el, commentCount: document.querySelectorAll('ul.cmmt-list > li').length }};
 """
     ).strip()
@@ -413,9 +451,14 @@ return { ok: true };
 """.strip()
 
 
-def build_post_reply_script(text: str, needle: str) -> str:
+def build_post_reply_script(
+    text: str,
+    needle: str,
+    publication_id: str = "",
+) -> str:
     """Open the reply box under the comment matching ``needle`` and submit ``text``."""
     wanted = _js(needle)
+    run_id = _js(publication_id)
     reply_selectors = _js(list(REPLY_INPUT_SELECTORS))
     reply_hints = _js(list(REPLY_TOGGLE_HINTS))
     submit_hints = _js(list(SUBMIT_TEXT_HINTS))
@@ -424,7 +467,7 @@ def build_post_reply_script(text: str, needle: str) -> str:
         _HELPERS
         + f"""
 if (!__loggedIn()) {{ return {{ ok: false, stage: 'not-logged-in' }}; }}
-const parent = __findCommentByText({wanted});
+const parent = __findCommentByText({wanted}, {run_id});
 if (!parent) {{ return {{ ok: false, stage: 'find-parent' }}; }}
 parent.scrollIntoView({{ block: 'center' }});
 // Open the reply editor if it is behind a toggle.
