@@ -60,6 +60,8 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn("SOOPTimeline-GPU-Addon.exe", build)
         self.assertIn("installer_sha256", build)
         self.assertIn("gpu_addon_sha256", build)
+        self.assertIn('Split-Path -Leaf $pythonDirectory', build)
+        self.assertIn('$pythonRoot = $pythonDirectory', build)
         self.assertIn("Smoke-test silent installation", workflow)
         self.assertGreaterEqual(workflow.count("SOOPTimeline-Setup.exe"), 4)
         self.assertGreaterEqual(workflow.count("SOOPTimeline-GPU-Addon.exe"), 4)

@@ -56,7 +56,13 @@ try {
     }
     New-Item -ItemType Directory -Path $gpuStaging | Out-Null
 
-    $pythonRoot = Split-Path -Parent (Split-Path -Parent $python)
+    $pythonDirectory = Split-Path -Parent $python
+    if ((Split-Path -Leaf $pythonDirectory) -ieq "Scripts") {
+        $pythonRoot = Split-Path -Parent $pythonDirectory
+    }
+    else {
+        $pythonRoot = $pythonDirectory
+    }
     $sitePackages = Join-Path $pythonRoot "Lib\site-packages"
     $cublasBin = Join-Path $sitePackages "nvidia\cublas\bin"
     $cudnnBin = Join-Path $sitePackages "nvidia\cudnn\bin"
