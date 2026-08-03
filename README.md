@@ -25,7 +25,7 @@ SOOP의 신규 공개 다시보기를 소규모로 모아 보고, 선택한 영�
 17. 현재 재생시간 삽입, 현재 줄 ±5초·전체 시각 보정·이전 주제와 합치기, 타임스탬프 순서·중복·범위·긴 공백 검사
 18. 정확히 선택한 줄만 직접 인용·요약으로 변환, 자동 버전 기록·복원, 타임라인 TXT 입출력, 저장된 Whisper 자막 보기·TXT/SRT 내보내기, API 호출 예상치와 실제 호출·토큰 사용량 표시
 19. 회전 오류 로그와 API 키·자막 원문을 제외한 진단 정보 복사/ZIP 저장
-20. EXE 실행 시 설정된 업데이트 피드를 백그라운드에서 확인하고 새 버전이 있을 때만 다운로드 페이지 안내
+20. 실행 시 GitHub Release를 확인하고, SHA-256 검증을 통과한 설치 파일만 동의를 받아 자동 업데이트
 21. 스트리머별 탭·영상 정렬·과거 영상 30개씩 추가 불러오기, 종료된 라이브와 완성된 다시보기 자동 연결, 전체 재분석 완료 시 기존 라이브 탭을 실제 다시보기 탭으로 전환하고 라이브 분석본은 버전 기록에 보존, 위치를 자유롭게 옮길 수 있는 독립 검수 플레이어와 비모달 저장 자막 창
 22. 스트리머별 고유명사 단어 사전, 영상 목록을 유지하는 작업 기록 초기화, 캐시 보관 기간·영상별/전체 자막 삭제, 첫 실행 데이터 처리 안내
 23. 다시보기 목록 더블클릭으로 작업 탭 열기, 영상별 자동 저장 메모, 목록 숨김·복원과 완료 상태 보존
@@ -58,45 +58,45 @@ python -m venv .venv
 .\.venv\Scripts\python main.py
 ```
 
-## Windows EXE 빌드
+## Windows 설치 프로그램 빌드
 
 ```powershell
-.\build_exe.ps1
+.\build_installer.ps1
 ```
 
-빌드가 끝나면 별도의 Python 명령 없이 실행할 수 있는 단일 파일이 `dist\SOOPTimeline.exe`에 생성됩니다. Whisper 모델은 EXE에 포함하지 않으며 첫 분석 때 선택한 모델만 사용자 캐시에 내려받습니다. 검수 플레이어에는 Microsoft Edge WebView2 Runtime이 필요하며, Windows 11에는 기본 포함되고 일부 Windows 10 환경에서는 별도 설치가 필요할 수 있습니다.
+빌드에는 Inno Setup 6가 필요합니다. 완료되면 일반 배포용 `dist\SOOPTimeline-Setup.exe`와 비상용 휴대용 `dist\SOOPTimeline.exe`가 함께 생성됩니다. 설치본은 사용자별 `%LOCALAPPDATA%\Programs\SOOPTimeline`에 설치되므로 관리자 권한이 필요하지 않습니다. Whisper 모델은 설치 파일에 포함하지 않으며 첫 분석 때 선택한 모델만 사용자 캐시에 내려받습니다. 검수 플레이어에는 Microsoft Edge WebView2 Runtime이 필요하며, Windows 11에는 기본 포함되고 일부 Windows 10 환경에서는 별도 설치가 필요할 수 있습니다.
 
 배포 EXE에는 [데이터 처리 안내](PRIVACY.md), [제3자 소프트웨어 고지](THIRD_PARTY_NOTICES.md), 빌드 환경에서 확인된 런타임 의존성의 라이선스 파일을 함께 포함합니다.
 
-빌드할 때 `dist\update.json`도 함께 생성됩니다. 기본 앱은 [32m1nd0t/soop-ai-timeline](https://github.com/32m1nd0t/soop-ai-timeline)의 최신 GitHub Release를 확인합니다. 다른 배포 채널을 쓰려면 빌드 전에 다음 환경 변수를 지정합니다.
+빌드할 때 설치본·휴대용 EXE 각각의 SHA-256이 들어간 `dist\update.json`도 생성됩니다. 기본 앱은 [32m1nd0t/soop-ai-timeline](https://github.com/32m1nd0t/soop-ai-timeline)의 최신 GitHub Release를 확인합니다. 다른 배포 채널을 쓰려면 빌드 전에 다음 환경 변수를 지정합니다.
 
 ```powershell
 $env:SOOP_TIMELINE_UPDATE_MANIFEST_URL = "https://example.com/update.json"
-$env:SOOP_TIMELINE_DOWNLOAD_URL = "https://example.com/SOOPTimeline.exe"
+$env:SOOP_TIMELINE_INSTALLER_URL = "https://example.com/SOOPTimeline-Setup.exe"
+$env:SOOP_TIMELINE_PORTABLE_URL = "https://example.com/SOOPTimeline.exe"
 $env:SOOP_TIMELINE_RELEASE_NOTES = "변경 내용"
-.\build_exe.ps1
+.\build_installer.ps1
 ```
 
-생성된 `update.json`을 첫 번째 환경 변수로 지정한 고정 HTTPS 주소에 업로드하면 그 주소가 EXE 안에 포함됩니다. `AI 설정 > 앱 업데이트`의 주소 칸은 특정 PC에서 배포 주소를 재정의할 때만 사용합니다. 앱은 EXE를 임의로 내려받거나 설치하지 않습니다.
+생성된 `update.json`을 첫 번째 환경 변수로 지정한 고정 HTTPS 주소에 업로드하면 그 주소가 EXE 안에 포함됩니다. `AI 설정 > 앱 업데이트`의 주소 칸은 특정 PC에서 배포 주소를 재정의할 때만 사용합니다. 자동 업데이트는 HTTPS 설치 파일과 64자리 SHA-256이 모두 있을 때만 활성화됩니다. 파일은 `%LOCALAPPDATA%\SOOPTimeline\updates`에 임시 다운로드하고 해시 검증을 통과한 뒤에만 실행합니다. 다운로드·검증·설치 시작이 실패하면 현재 앱은 그대로 유지됩니다.
 
 ## GitHub Release 배포
 
-앱 버전을 `soop_timeline/__init__.py`와 `pyproject.toml`에서 함께 올리고 커밋한 뒤 EXE를 빌드합니다.
+앱 버전을 `soop_timeline/__init__.py`와 `pyproject.toml`에서 함께 올리고 커밋합니다.
 
 ```powershell
 $env:SOOP_TIMELINE_UPDATE_MANIFEST_URL = "https://api.github.com/repos/32m1nd0t/soop-ai-timeline/releases/latest"
-$env:SOOP_TIMELINE_DOWNLOAD_URL = "https://github.com/32m1nd0t/soop-ai-timeline/releases/latest"
-.\build_exe.ps1
+.\build_installer.ps1
 ```
 
-`.github/workflows/release.yml`이 같은 버전의 태그를 감지해 테스트·EXE 빌드·스모크 테스트·GitHub Release 첨부를 자동 수행합니다.
+`.github/workflows/release.yml`이 같은 버전의 태그를 감지해 테스트, EXE·설치 프로그램 빌드, 휴대용·설치본 스모크 테스트, GitHub Release 첨부를 자동 수행합니다.
 
 ```powershell
-git tag v0.4.4
-git push origin v0.4.4
+git tag v0.7.0
+git push origin v0.7.0
 ```
 
-기존 EXE는 다음 실행 시 GitHub의 `releases/latest` API에서 더 높은 버전을 발견하면 다운로드 페이지를 안내합니다. 공개 저장소이므로 앱에 GitHub 토큰을 포함할 필요가 없습니다.
+기존 휴대용 EXE도 다음 실행 시 더 높은 버전을 발견하면 설치 프로그램을 받아 설치형으로 전환할 수 있습니다. 이후에는 같은 설치 위치를 갱신하고 재실행합니다. 분석 DB·캐시는 설치 폴더가 아니라 `%LOCALAPPDATA%\SOOPTimeline`에 있으므로 앱 업데이트나 재설치로 삭제되지 않습니다. 공개 저장소이므로 앱에 GitHub 토큰을 포함할 필요가 없습니다.
 
 앱의 `AI 설정`에서 다음 값을 입력합니다.
 

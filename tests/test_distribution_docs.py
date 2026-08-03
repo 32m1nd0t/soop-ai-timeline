@@ -37,6 +37,22 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn("Remove-Item -LiteralPath $exe -Force", script)
         self.assertIn("Remove-Item -LiteralPath $manifestPath -Force", script)
 
+    def test_installer_and_release_workflow_include_verified_update_assets(self) -> None:
+        installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
+            encoding="utf-8"
+        )
+        build = (self.root / "build_installer.ps1").read_text(encoding="utf-8")
+        workflow = (self.root / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("PrivilegesRequired=lowest", installer)
+        self.assertIn("CloseApplications=yes", installer)
+        self.assertIn("SOOPTimeline-Setup.exe", build)
+        self.assertIn("installer_sha256", build)
+        self.assertIn("Smoke-test silent installation", workflow)
+        self.assertGreaterEqual(workflow.count("SOOPTimeline-Setup.exe"), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

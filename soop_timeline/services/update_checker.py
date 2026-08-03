@@ -25,10 +25,23 @@ class UpdateInfo:
     download_url: str
     release_notes: str = ""
     published_at: str = ""
+    installer_url: str = ""
+    installer_sha256: str = ""
+    portable_url: str = ""
+    portable_sha256: str = ""
 
     @property
     def update_available(self) -> bool:
         return is_newer_version(self.latest_version, self.current_version)
+
+    @property
+    def automatic_install_available(self) -> bool:
+        """Only a HTTPS installer with a complete digest may run automatically."""
+
+        return bool(
+            _safe_download_url(self.installer_url, https_only=True)
+            and _normalize_sha256(self.installer_sha256)
+        )
 
 
 def configured_manifest_url(database: object) -> str:
@@ -82,24 +95,37 @@ def parse_update_manifest(
     if not latest_version or _version_key(latest_version) is None:
         raise ValueError("업데이트 정보에 올바른 버전이 없습니다.")
 
-    download_url = str(raw.get("download_url") or raw.get("html_url") or "").strip()
-    if not download_url:
-        assets = raw.get("assets")
-        if isinstance(assets, list):
-            for asset in assets:
-                if not isinstance(asset, dict):
-                    continue
-                candidate = str(asset.get("browser_download_url") or "").strip()
-                name = str(asset.get("name") or "").lower()
-                if candidate and (name.endswith(".exe") or not download_url):
-                    download_url = candidate
-                    if name.endswith(".exe"):
-                        break
+    installer_url = _safe_download_url(str(raw.get("installer_url") or ""))
+    installer_sha256 = _normalize_sha256(raw.get("installer_sha256"))
+    portable_url = _safe_download_url(str(raw.get("portable_url") or ""))
+    portable_sha256 = _normalize_sha256(
+        raw.get("portable_sha256") or raw.get("sha256")
+    )
 
-    if download_url:
-        scheme = urlparse(download_url).scheme.lower()
-        if scheme not in {"https", "http"}:
-            download_url = ""
+    assets = raw.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            candidate = _safe_download_url(
+                str(asset.get("browser_download_url") or "")
+            )
+            if not candidate:
+                continue
+            name = str(asset.get("name") or "").strip().lower()
+            digest = _normalize_sha256(asset.get("digest"))
+            if name == "sooptimeline-setup.exe":
+                installer_url = installer_url or candidate
+                installer_sha256 = installer_sha256 or digest
+            elif name == "sooptimeline.exe":
+                portable_url = portable_url or candidate
+                portable_sha256 = portable_sha256 or digest
+
+    download_url = _safe_download_url(
+        str(raw.get("download_url") or "")
+    )
+    release_page_url = _safe_download_url(str(raw.get("html_url") or ""))
+    download_url = installer_url or download_url or release_page_url or portable_url
 
     release_notes = str(
         raw.get("release_notes") or raw.get("notes") or raw.get("body") or ""
@@ -111,7 +137,27 @@ def parse_update_manifest(
         download_url=download_url,
         release_notes=release_notes,
         published_at=published_at,
+        installer_url=installer_url,
+        installer_sha256=installer_sha256,
+        portable_url=portable_url,
+        portable_sha256=portable_sha256,
     )
+
+
+def _safe_download_url(value: str, *, https_only: bool = False) -> str:
+    candidate = value.strip()
+    if not candidate:
+        return ""
+    scheme = urlparse(candidate).scheme.lower()
+    allowed = {"https"} if https_only else {"https", "http"}
+    return candidate if scheme in allowed else ""
+
+
+def _normalize_sha256(value: object) -> str:
+    digest = str(value or "").strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest.removeprefix("sha256:").strip()
+    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
 
 
 def is_newer_version(candidate: str, current: str) -> bool:

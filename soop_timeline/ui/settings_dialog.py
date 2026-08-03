@@ -352,8 +352,8 @@ class AnalysisSettingsDialog(QDialog):
 
         update_hint = QLabel(
             "일반 사용자는 비워 두면 됩니다. 32m1nd0t/soop-ai-timeline의 최신 "
-            "GitHub Release를 자동 확인합니다. 파일을 자동 설치하지 않고 새 버전과 "
-            "다운로드 페이지만 알려줍니다."
+            "GitHub Release를 자동 확인합니다. 검증 가능한 설치 파일이 있으면 동의를 "
+            "받아 자동 업데이트하고, 그렇지 않으면 다운로드 페이지만 안내합니다."
         )
         update_hint.setWordWrap(True)
         update_hint.setObjectName("muted")

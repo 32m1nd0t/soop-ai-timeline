@@ -51,6 +51,57 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertTrue(github.update_available)
         self.assertEqual(github.release_notes, "새 버전")
 
+    def test_verified_installer_is_selected_for_automatic_update(self):
+        digest = "ab" * 32
+        info = parse_update_manifest(
+            {
+                "tag_name": "v0.7.0",
+                "html_url": "https://github.com/example/project/releases/tag/v0.7.0",
+                "assets": [
+                    {
+                        "name": "SOOPTimeline.exe",
+                        "browser_download_url": "https://example.test/SOOPTimeline.exe",
+                        "digest": f"sha256:{'cd' * 32}",
+                    },
+                    {
+                        "name": "SOOPTimeline-Setup.exe",
+                        "browser_download_url": "https://example.test/SOOPTimeline-Setup.exe",
+                        "digest": f"sha256:{digest}",
+                    },
+                ],
+            },
+            "0.6.0",
+        )
+
+        self.assertTrue(info.automatic_install_available)
+        self.assertEqual(
+            info.installer_url,
+            "https://example.test/SOOPTimeline-Setup.exe",
+        )
+        self.assertEqual(info.installer_sha256, digest)
+        self.assertEqual(info.download_url, info.installer_url)
+
+    def test_unverified_or_insecure_installer_is_never_automatic(self):
+        invalid_digest = parse_update_manifest(
+            {
+                "version": "0.7.0",
+                "installer_url": "https://example.test/setup.exe",
+                "installer_sha256": "not-a-digest",
+            },
+            "0.6.0",
+        )
+        insecure_url = parse_update_manifest(
+            {
+                "version": "0.7.0",
+                "installer_url": "http://example.test/setup.exe",
+                "installer_sha256": "ef" * 32,
+            },
+            "0.6.0",
+        )
+
+        self.assertFalse(invalid_digest.automatic_install_available)
+        self.assertFalse(insecure_url.automatic_install_available)
+
     def test_update_preferences_come_from_database_or_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "test.db")

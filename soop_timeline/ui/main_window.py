@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
@@ -87,10 +89,12 @@ from ..services.timeline_document import (
     set_timeline_notice,
 )
 from ..services.update_checker import (
+    UpdateInfo,
     automatic_update_check_enabled,
     configured_manifest_url,
     parse_update_manifest,
 )
+from ..services.update_installer import installer_download_path
 from .analysis_worker import AnalysisWorker, PreTranscribeWorker
 from .comment_publisher_window import SoopCommentPublisher
 from .line_rewrite_worker import TimelineLineRewriteWorker
@@ -101,6 +105,7 @@ from .settings_dialog import AnalysisSettingsDialog
 from .style_worker import TimelineStyleWorker
 from .timeline_editor import TimelineDocumentEditor
 from .transcript_viewer_dialog import TranscriptViewerDialog
+from .update_worker import UpdateInstallerDownloadWorker
 from .version_history_dialog import TimelineVersionHistoryDialog
 
 
@@ -182,6 +187,13 @@ class MainWindow(QMainWindow):
         self._replay_merge_scheduled: set[str] = set()
         self._update_reply: QNetworkReply | None = None
         self._update_check_silent = True
+        self._update_download_job: tuple[
+            QThread,
+            UpdateInstallerDownloadWorker,
+        ] | None = None
+        self._downloaded_update_path = ""
+        self._pending_update_installer_path = ""
+        self._quit_after_update_cancel = False
         self._stale_live_sessions = self.database.recover_stale_live_sessions()
         cleanup_expired_caches(
             normalized_cache_retention(
@@ -2022,6 +2034,17 @@ class MainWindow(QMainWindow):
             self.status_label.setText(self.analyzer.unavailable_reason)
 
     def check_for_updates(self, *, silent: bool = False) -> None:
+        pending_installer = Path(self._pending_update_installer_path)
+        if not silent and pending_installer.is_file():
+            self._launch_downloaded_update(pending_installer)
+            return
+        if self._pending_update_installer_path and not pending_installer.is_file():
+            self._pending_update_installer_path = ""
+            self.update_button.setText("업데이트 확인")
+        if self._update_download_job is not None:
+            if not silent:
+                self.status_label.setText("업데이트 설치 파일을 다운로드하고 있습니다…")
+            return
         if self._update_reply is not None:
             if not silent:
                 self.status_label.setText("업데이트를 확인하고 있습니다…")
@@ -2122,10 +2145,16 @@ class MainWindow(QMainWindow):
             if len(info.release_notes) > len(notes):
                 notes += "…"
             message.setInformativeText(notes)
+        install_button = None
+        if info.automatic_install_available:
+            install_button = message.addButton(
+                "다운로드 후 자동 업데이트",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
         if info.download_url:
             open_button = message.addButton(
                 "다운로드 페이지 열기",
-                QMessageBox.ButtonRole.AcceptRole,
+                QMessageBox.ButtonRole.ActionRole,
             )
         else:
             open_button = None
@@ -2135,8 +2164,156 @@ class MainWindow(QMainWindow):
             )
         message.addButton("나중에", QMessageBox.ButtonRole.RejectRole)
         message.exec()
-        if open_button is not None and message.clickedButton() is open_button:
+        clicked = message.clickedButton()
+        if install_button is not None and clicked is install_button:
+            self._start_update_download(info)
+        elif open_button is not None and clicked is open_button:
             QDesktopServices.openUrl(QUrl(info.download_url))
+
+    def _start_update_download(self, info: UpdateInfo) -> None:
+        if self._active_jobs():
+            QMessageBox.information(
+                self,
+                "진행 중인 작업 있음",
+                "분석·댓글 등록 등 진행 중인 작업을 먼저 끝낸 뒤 업데이트해 주세요.\n"
+                "업데이트 과정에서 앱이 자동으로 종료됩니다.",
+            )
+            return
+        if self._update_download_job is not None:
+            return
+
+        destination = installer_download_path(info.latest_version)
+        thread = QThread(self)
+        worker = UpdateInstallerDownloadWorker(
+            info.installer_url,
+            destination,
+            info.installer_sha256,
+            f"SOOPTimeline/{__version__}",
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_update_download_progress)
+        worker.succeeded.connect(self._on_update_download_succeeded)
+        worker.failed.connect(self._on_update_download_failed)
+        worker.cancelled.connect(self._on_update_download_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._finish_update_download)
+        thread.finished.connect(thread.deleteLater)
+        self._downloaded_update_path = ""
+        self._update_download_job = (thread, worker)
+        self.update_button.setEnabled(False)
+        self.status_label.setText(
+            f"v{info.latest_version} 업데이트 설치 파일을 다운로드합니다…"
+        )
+        thread.start()
+
+    @Slot(int, int)
+    def _on_update_download_progress(self, received: int, total: int) -> None:
+        received_mb = received / (1024 * 1024)
+        if total > 0:
+            percent = min(100, int(received * 100 / total))
+            self.status_label.setText(
+                f"업데이트 다운로드 {percent}% · "
+                f"{received_mb:,.1f}/{total / (1024 * 1024):,.1f} MB"
+            )
+        else:
+            self.status_label.setText(
+                f"업데이트 다운로드 중 · {received_mb:,.1f} MB"
+            )
+
+    @Slot(str)
+    def _on_update_download_succeeded(self, path: str) -> None:
+        self._downloaded_update_path = path
+        self.status_label.setText("업데이트 검증을 마쳤습니다. 설치를 시작합니다…")
+
+    @Slot(str)
+    def _on_update_download_failed(self, message: str) -> None:
+        self.status_label.setText("업데이트 다운로드 또는 검증에 실패했습니다.")
+        QMessageBox.warning(
+            self,
+            "자동 업데이트 실패",
+            f"업데이트를 안전하게 준비하지 못했습니다. 기존 앱은 변경되지 않았습니다.\n\n{message}",
+        )
+
+    @Slot()
+    def _on_update_download_cancelled(self) -> None:
+        self.status_label.setText("업데이트 다운로드를 취소했습니다.")
+
+    @Slot()
+    def _finish_update_download(self) -> None:
+        self._update_download_job = None
+        self.update_button.setEnabled(True)
+        downloaded_path = self._downloaded_update_path
+        self._downloaded_update_path = ""
+        if self._quit_after_update_cancel:
+            self._quit_after_update_cancel = False
+            self._force_quit = True
+            QTimer.singleShot(0, self.close)
+            return
+        if downloaded_path:
+            QTimer.singleShot(
+                0,
+                lambda path=downloaded_path: self._launch_downloaded_update(
+                    Path(path)
+                ),
+            )
+
+    def _launch_downloaded_update(self, path: Path) -> None:
+        if not path.is_file():
+            self._pending_update_installer_path = ""
+            self.update_button.setText("업데이트 확인")
+            QMessageBox.warning(
+                self,
+                "업데이트 파일 없음",
+                "다운로드한 업데이트 설치 파일을 찾지 못했습니다. 다시 확인해 주세요.",
+            )
+            return
+        if self._active_jobs():
+            self._pending_update_installer_path = str(path)
+            self.update_button.setText("다운로드 완료 · 설치")
+            self.status_label.setText(
+                "업데이트 다운로드 완료 · 진행 중인 작업이 끝나면 설치할 수 있습니다."
+            )
+            QMessageBox.information(
+                self,
+                "업데이트 준비 완료",
+                "설치 파일 검증을 마쳤습니다. 진행 중인 작업이 끝난 뒤 "
+                "‘다운로드 완료 · 설치’를 눌러 주세요.",
+            )
+            return
+
+        arguments = [
+            "/SP-",
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            "/CURRENTUSER",
+            "/RELAUNCH=1",
+            f"/LOG={path.parent / 'update-install.log'}",
+        ]
+        try:
+            subprocess.Popen(
+                [str(path), *arguments],
+                cwd=str(path.parent),
+                close_fds=True,
+            )
+        except OSError as error:
+            self._pending_update_installer_path = str(path)
+            self.update_button.setText("다운로드 완료 · 설치")
+            QMessageBox.warning(
+                self,
+                "업데이트 설치 시작 실패",
+                "설치 프로그램을 시작하지 못했습니다. 기존 앱은 변경되지 않았습니다.\n\n"
+                f"{error}",
+            )
+            return
+
+        self._pending_update_installer_path = ""
+        self._force_quit = True
+        self.status_label.setText("업데이트 설치를 위해 앱을 종료합니다…")
+        self.close()
 
     def _schedule_live_reconnect_retry(self, delay_ms: int) -> None:
         if (
@@ -4199,6 +4376,12 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             self._notify_tray_running()
+            return
+        if self._update_download_job is not None:
+            self._quit_after_update_cancel = True
+            self._update_download_job[0].requestInterruption()
+            self.status_label.setText("업데이트 다운로드를 정리한 뒤 종료합니다…")
+            event.ignore()
             return
         self._flush_editor_memos()
         if not self._active_jobs():
