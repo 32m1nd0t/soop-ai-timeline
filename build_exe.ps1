@@ -15,6 +15,7 @@ else {
 }
 
 Push-Location -LiteralPath $projectRoot
+$previousBuildMode = [string]$env:SOOP_TIMELINE_BUILD_MODE
 try {
     $exe = Join-Path $projectRoot "dist\SOOPTimeline.exe"
     $manifestPath = Join-Path $projectRoot "dist\update.json"
@@ -29,12 +30,19 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "빌드 의존성 설치에 실패했습니다. (exit code: $LASTEXITCODE)"
     }
+    $env:SOOP_TIMELINE_BUILD_MODE = "portable"
     & $python -m PyInstaller --noconfirm --clean "SOOPTimeline.spec"
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller 빌드에 실패했습니다. (exit code: $LASTEXITCODE)"
     }
 }
 finally {
+    if ([string]::IsNullOrEmpty($previousBuildMode)) {
+        Remove-Item Env:\SOOP_TIMELINE_BUILD_MODE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:SOOP_TIMELINE_BUILD_MODE = $previousBuildMode
+    }
     Pop-Location
 }
 

@@ -29,6 +29,8 @@ class UpdateInfo:
     installer_sha256: str = ""
     portable_url: str = ""
     portable_sha256: str = ""
+    gpu_addon_url: str = ""
+    gpu_addon_sha256: str = ""
 
     @property
     def update_available(self) -> bool:
@@ -101,6 +103,8 @@ def parse_update_manifest(
     portable_sha256 = _normalize_sha256(
         raw.get("portable_sha256") or raw.get("sha256")
     )
+    gpu_addon_url = _safe_download_url(str(raw.get("gpu_addon_url") or ""))
+    gpu_addon_sha256 = _normalize_sha256(raw.get("gpu_addon_sha256"))
 
     assets = raw.get("assets")
     if isinstance(assets, list):
@@ -120,6 +124,9 @@ def parse_update_manifest(
             elif name == "sooptimeline.exe":
                 portable_url = portable_url or candidate
                 portable_sha256 = portable_sha256 or digest
+            elif name == "sooptimeline-gpu-addon.exe":
+                gpu_addon_url = gpu_addon_url or candidate
+                gpu_addon_sha256 = gpu_addon_sha256 or digest
 
     download_url = _safe_download_url(
         str(raw.get("download_url") or "")
@@ -141,6 +148,8 @@ def parse_update_manifest(
         installer_sha256=installer_sha256,
         portable_url=portable_url,
         portable_sha256=portable_sha256,
+        gpu_addon_url=gpu_addon_url,
+        gpu_addon_sha256=gpu_addon_sha256,
     )
 
 

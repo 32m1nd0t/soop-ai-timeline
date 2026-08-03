@@ -64,15 +64,16 @@ python -m venv .venv
 .\build_installer.ps1
 ```
 
-빌드에는 Inno Setup 6가 필요합니다. 완료되면 일반 배포용 `dist\SOOPTimeline-Setup.exe`와 비상용 휴대용 `dist\SOOPTimeline.exe`가 함께 생성됩니다. 설치본은 사용자별 `%LOCALAPPDATA%\Programs\SOOPTimeline`에 설치되므로 관리자 권한이 필요하지 않습니다. Whisper 모델은 설치 파일에 포함하지 않으며 첫 분석 때 선택한 모델만 사용자 캐시에 내려받습니다. 검수 플레이어에는 Microsoft Edge WebView2 Runtime이 필요하며, Windows 11에는 기본 포함되고 일부 Windows 10 환경에서는 별도 설치가 필요할 수 있습니다.
+빌드에는 Inno Setup 6가 필요합니다. 완료되면 CPU 기본 설치본 `dist\SOOPTimeline-Setup.exe`, 선택 설치용 `dist\SOOPTimeline-GPU-Addon.exe`, 비상용 GPU 포함 휴대용 `dist\SOOPTimeline.exe`가 생성됩니다. 기본 앱은 사용자별 `%LOCALAPPDATA%\Programs\SOOPTimeline`에 폴더형으로 설치되므로 관리자 권한이 필요하지 않습니다. GPU 애드온은 CUDA DLL만 `{설치 폴더}\gpu-runtime`에 한 번 설치하며 일반 앱 업데이트가 이 폴더를 덮어쓰지 않습니다. Whisper 모델은 설치 파일에 포함하지 않으며 첫 분석 때 선택한 모델만 사용자 캐시에 내려받습니다. 검수 플레이어에는 Microsoft Edge WebView2 Runtime이 필요하며, Windows 11에는 기본 포함되고 일부 Windows 10 환경에서는 별도 설치가 필요할 수 있습니다.
 
 배포 EXE에는 [데이터 처리 안내](PRIVACY.md), [제3자 소프트웨어 고지](THIRD_PARTY_NOTICES.md), 빌드 환경에서 확인된 런타임 의존성의 라이선스 파일을 함께 포함합니다.
 
-빌드할 때 설치본·휴대용 EXE 각각의 SHA-256이 들어간 `dist\update.json`도 생성됩니다. 기본 앱은 [32m1nd0t/soop-ai-timeline](https://github.com/32m1nd0t/soop-ai-timeline)의 최신 GitHub Release를 확인합니다. 다른 배포 채널을 쓰려면 빌드 전에 다음 환경 변수를 지정합니다.
+빌드할 때 기본 설치본·GPU 애드온·휴대용 EXE 각각의 SHA-256이 들어간 `dist\update.json`도 생성됩니다. 기본 앱은 [32m1nd0t/soop-ai-timeline](https://github.com/32m1nd0t/soop-ai-timeline)의 최신 GitHub Release를 확인합니다. 다른 배포 채널을 쓰려면 빌드 전에 다음 환경 변수를 지정합니다.
 
 ```powershell
 $env:SOOP_TIMELINE_UPDATE_MANIFEST_URL = "https://example.com/update.json"
 $env:SOOP_TIMELINE_INSTALLER_URL = "https://example.com/SOOPTimeline-Setup.exe"
+$env:SOOP_TIMELINE_GPU_ADDON_URL = "https://example.com/SOOPTimeline-GPU-Addon.exe"
 $env:SOOP_TIMELINE_PORTABLE_URL = "https://example.com/SOOPTimeline.exe"
 $env:SOOP_TIMELINE_RELEASE_NOTES = "변경 내용"
 .\build_installer.ps1
@@ -89,11 +90,11 @@ $env:SOOP_TIMELINE_UPDATE_MANIFEST_URL = "https://api.github.com/repos/32m1nd0t/
 .\build_installer.ps1
 ```
 
-`.github/workflows/release.yml`이 같은 버전의 태그를 감지해 테스트, EXE·설치 프로그램 빌드, 휴대용·설치본 스모크 테스트, GitHub Release 첨부를 자동 수행합니다.
+`.github/workflows/release.yml`이 같은 버전의 태그를 감지해 테스트, CPU 폴더형 앱·GPU 애드온·휴대용 EXE 빌드, 휴대용·설치본 스모크 테스트, GitHub Release 첨부를 자동 수행합니다.
 
 ```powershell
-git tag v0.7.0
-git push origin v0.7.0
+git tag v0.8.0
+git push origin v0.8.0
 ```
 
 기존 휴대용 EXE도 다음 실행 시 더 높은 버전을 발견하면 설치 프로그램을 받아 설치형으로 전환할 수 있습니다. 이후에는 같은 설치 위치를 갱신하고 재실행합니다. 분석 DB·캐시는 설치 폴더가 아니라 `%LOCALAPPDATA%\SOOPTimeline`에 있으므로 앱 업데이트나 재설치로 삭제되지 않습니다. 공개 저장소이므로 앱에 GitHub 토큰을 포함할 필요가 없습니다.
@@ -108,12 +109,12 @@ git push origin v0.7.0
 - Whisper 모델: 기본 `large-v3-turbo`(속도 우선), 선택 가능 `large-v3`(정확도 우선)
 - 연산 장치: 기본 `자동`(CUDA 런타임이 준비되면 GPU, 아니면 CPU int8)
 
-Whisper 모델은 첫 분석 때 한 번 내려받고 이후 로컬 캐시를 사용합니다. GPU 실행에는 CUDA 12용 cuBLAS와 cuDNN 9 런타임이 추가로 필요합니다. 런타임이 없으면 `자동` 설정에서 CPU `int8`로 대체되므로 긴 영상은 느릴 수 있습니다. `NVIDIA GPU`를 명시적으로 선택하면 필요한 런타임이 없을 때 CPU로 몰래 전환하지 않고 오류를 표시합니다.
+Whisper 모델은 첫 분석 때 한 번 내려받고 이후 로컬 캐시를 사용합니다. 기본 설치본에는 대용량 CUDA 파일을 넣지 않습니다. NVIDIA GPU PC에서는 Release의 `SOOPTimeline-GPU-Addon.exe`를 한 번 설치하면 CUDA 12 cuBLAS와 cuDNN 9를 사용할 수 있습니다. 런타임이 없으면 `자동` 설정에서 CPU `int8`로 대체하며, AI 설정에 GPU 애드온 다운로드 버튼을 표시합니다. `NVIDIA GPU`를 명시적으로 선택하면 필요한 런타임이 없을 때 CPU로 몰래 전환하지 않고 오류를 표시합니다.
 
-Release EXE에는 CUDA 12 cuBLAS와 cuDNN 9 Python 런타임을 함께 수집합니다. NVIDIA GPU가 있는 실제 배포 PC에서는 다음 명령으로 패키징된 GPU 경로까지 확인할 수 있습니다. 성공하면 `%LOCALAPPDATA%\SOOPTimeline\gpu-smoke-ok.txt`가 생성됩니다.
+휴대용 Release EXE에는 CUDA 런타임을 계속 포함합니다. 설치본은 GPU 애드온 설치 후 다음 명령으로 외부 GPU 경로까지 확인할 수 있습니다. 성공하면 `%LOCALAPPDATA%\SOOPTimeline\gpu-smoke-ok.txt`가 생성됩니다.
 
 ```powershell
-.\dist\SOOPTimeline.exe --gpu-smoke-test
+.\dist\SOOPTimeline\SOOPTimeline.exe --gpu-smoke-test
 ```
 
 현재 Windows GPU 런타임 버전은 다음 명령으로 설치할 수 있습니다.

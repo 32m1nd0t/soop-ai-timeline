@@ -23,6 +23,9 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn('("PRIVACY.md", "THIRD_PARTY_NOTICES.md")', spec)
         self.assertIn("third_party_components.txt", spec)
         self.assertIn("third_party_licenses", spec)
+        self.assertIn('build_mode == "installed"', spec)
+        self.assertIn("bundle_gpu_runtime", spec)
+        self.assertIn("COLLECT(", spec)
 
     def test_readme_identifies_app_as_unofficial(self) -> None:
         readme = (self.root / "README.md").read_text(encoding="utf-8")
@@ -41,6 +44,9 @@ class DistributionDocumentTests(unittest.TestCase):
         installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
             encoding="utf-8"
         )
+        gpu_installer = (
+            self.root / "installer" / "SOOPTimeline-GPU-Addon.iss"
+        ).read_text(encoding="utf-8")
         build = (self.root / "build_installer.ps1").read_text(encoding="utf-8")
         workflow = (self.root / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
@@ -48,10 +54,15 @@ class DistributionDocumentTests(unittest.TestCase):
 
         self.assertIn("PrivilegesRequired=lowest", installer)
         self.assertIn("CloseApplications=yes", installer)
+        self.assertIn("dist\\SOOPTimeline\\*", installer)
+        self.assertIn("gpu-runtime", gpu_installer)
         self.assertIn("SOOPTimeline-Setup.exe", build)
+        self.assertIn("SOOPTimeline-GPU-Addon.exe", build)
         self.assertIn("installer_sha256", build)
+        self.assertIn("gpu_addon_sha256", build)
         self.assertIn("Smoke-test silent installation", workflow)
         self.assertGreaterEqual(workflow.count("SOOPTimeline-Setup.exe"), 4)
+        self.assertGreaterEqual(workflow.count("SOOPTimeline-GPU-Addon.exe"), 4)
 
 
 if __name__ == "__main__":

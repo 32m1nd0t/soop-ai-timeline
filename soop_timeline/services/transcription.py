@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -34,6 +35,28 @@ MAX_TRANSCRIPT_WORD_GAP_SECONDS = 3.0
 
 _NVIDIA_DLL_DIRECTORY_HANDLES: list[object] = []
 _NVIDIA_RUNTIME_PATHS_CONFIGURED = False
+GPU_ADDON_DIR_ENVIRONMENT = "SOOP_TIMELINE_GPU_RUNTIME_DIR"
+GPU_ADDON_DOWNLOAD_URL = (
+    "https://github.com/32m1nd0t/soop-ai-timeline/releases/latest/download/"
+    "SOOPTimeline-GPU-Addon.exe"
+)
+GPU_RUNTIME_DLLS = (
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "cudnn64_9.dll",
+)
+
+
+def gpu_addon_runtime_dir() -> Path:
+    override = os.environ.get(GPU_ADDON_DIR_ENVIRONMENT, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(sys.executable).resolve().parent / "gpu-runtime"
+
+
+def gpu_addon_installed() -> bool:
+    directory = gpu_addon_runtime_dir()
+    return all((directory / filename).is_file() for filename in GPU_RUNTIME_DLLS)
 
 
 def configure_nvidia_runtime_paths() -> tuple[Path, ...]:
@@ -48,6 +71,9 @@ def configure_nvidia_runtime_paths() -> tuple[Path, ...]:
         return tuple()
 
     discovered: list[Path] = []
+    external_runtime = gpu_addon_runtime_dir()
+    if external_runtime.is_dir():
+        discovered.append(external_runtime)
     for package_name in ("nvidia.cublas", "nvidia.cudnn"):
         try:
             spec = importlib.util.find_spec(package_name)
@@ -116,7 +142,7 @@ def detect_whisper_runtime(preference: str = "auto") -> WhisperRuntime:
         raise RuntimeError(
             "NVIDIA GPU는 감지됐지만 faster-whisper에 필요한 CUDA 12 cuBLAS와 "
             "cuDNN 9 런타임을 찾지 못했습니다. AI 설정을 '자동' 또는 'CPU'로 "
-            "바꾸거나 CUDA 런타임을 설치하세요."
+            "바꾸거나 SOOPTimeline NVIDIA GPU 추가 구성요소를 설치하세요."
         )
     if requested == "cuda" or (requested == "auto" and cuda_ready):
         return WhisperRuntime(
@@ -129,7 +155,7 @@ def detect_whisper_runtime(preference: str = "auto") -> WhisperRuntime:
     if requested == "auto" and cuda_device_count and not runtime_libraries_ready:
         warning = (
             "CUDA 12 cuBLAS·cuDNN 9 런타임이 없어 CPU로 대체합니다. "
-            "긴 영상은 large-v3-turbo를 권장합니다."
+            "NVIDIA GPU 추가 구성요소를 설치하면 GPU를 사용할 수 있습니다."
         )
     return WhisperRuntime(
         device="cpu",

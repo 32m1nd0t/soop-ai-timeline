@@ -68,6 +68,11 @@ class UpdateCheckerTests(unittest.TestCase):
                         "browser_download_url": "https://example.test/SOOPTimeline-Setup.exe",
                         "digest": f"sha256:{digest}",
                     },
+                    {
+                        "name": "SOOPTimeline-GPU-Addon.exe",
+                        "browser_download_url": "https://example.test/SOOPTimeline-GPU-Addon.exe",
+                        "digest": f"sha256:{'ef' * 32}",
+                    },
                 ],
             },
             "0.6.0",
@@ -79,6 +84,11 @@ class UpdateCheckerTests(unittest.TestCase):
             "https://example.test/SOOPTimeline-Setup.exe",
         )
         self.assertEqual(info.installer_sha256, digest)
+        self.assertEqual(
+            info.gpu_addon_url,
+            "https://example.test/SOOPTimeline-GPU-Addon.exe",
+        )
+        self.assertEqual(info.gpu_addon_sha256, "ef" * 32)
         self.assertEqual(info.download_url, info.installer_url)
 
     def test_unverified_or_insecure_installer_is_never_automatic(self):

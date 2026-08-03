@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -44,7 +45,11 @@ from ..services.preferences import (
     normalized_discovery_interval,
 )
 from ..services.review_feedback import REVIEW_FEEDBACK_ENABLED_SETTING
-from ..services.transcription import detect_whisper_runtime
+from ..services.transcription import (
+    GPU_ADDON_DOWNLOAD_URL,
+    detect_whisper_runtime,
+    gpu_addon_installed,
+)
 from ..services.update_checker import (
     AUTO_UPDATE_CHECK_SETTING,
     UPDATE_MANIFEST_SETTING,
@@ -227,17 +232,30 @@ class AnalysisSettingsDialog(QDialog):
         form.addRow("연산 장치", self.whisper_device_combo)
         root.addLayout(form)
 
+        show_gpu_addon_button = gpu_addon_installed()
         try:
             runtime = detect_whisper_runtime("auto")
             runtime_text = f"현재 감지: {runtime.description}"
             if runtime.warning:
                 runtime_text += f"\n{runtime.warning}"
+                show_gpu_addon_button = True
         except RuntimeError as error:
             runtime_text = str(error)
         runtime_label = QLabel(runtime_text)
         runtime_label.setWordWrap(True)
         runtime_label.setObjectName("muted")
         root.addWidget(runtime_label)
+
+        if show_gpu_addon_button:
+            gpu_addon_button = QPushButton(
+                "NVIDIA GPU 구성요소 다시 받기"
+                if gpu_addon_installed()
+                else "NVIDIA GPU 구성요소 받기"
+            )
+            gpu_addon_button.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl(GPU_ADDON_DOWNLOAD_URL))
+            )
+            root.addWidget(gpu_addon_button)
 
         hint = QLabel(
             "처음 분석할 때 Whisper 모델 파일을 한 번 내려받습니다. 이후에는 로컬에 "

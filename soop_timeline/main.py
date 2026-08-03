@@ -100,8 +100,6 @@ def main() -> int:
 
 
 def _verify_packaged_dependencies() -> None:
-    import importlib.util
-
     import av  # noqa: F401
     import keyring
     from faster_whisper import BatchedInferencePipeline, WhisperModel  # noqa: F401
@@ -109,9 +107,6 @@ def _verify_packaged_dependencies() -> None:
     from google.genai import types
     from .services.transcription import configure_nvidia_runtime_paths
 
-    for package in ("nvidia.cublas", "nvidia.cudnn"):
-        if importlib.util.find_spec(package) is None:
-            raise RuntimeError(f"패키지에 {package} CUDA 런타임이 포함되지 않았습니다.")
     configure_nvidia_runtime_paths()
     keyring.get_keyring()
     types.GenerateContentConfig(

@@ -50,6 +50,7 @@ jobs:
         shell: pwsh
         env:
           SOOP_TIMELINE_INSTALLER_URL: ${{ startsWith(github.ref, 'refs/tags/') && format('https://github.com/32m1nd0t/soop-ai-timeline/releases/download/{0}/SOOPTimeline-Setup.exe', github.ref_name) || '' }}
+          SOOP_TIMELINE_GPU_ADDON_URL: ${{ startsWith(github.ref, 'refs/tags/') && format('https://github.com/32m1nd0t/soop-ai-timeline/releases/download/{0}/SOOPTimeline-GPU-Addon.exe', github.ref_name) || '' }}
           SOOP_TIMELINE_PORTABLE_URL: ${{ startsWith(github.ref, 'refs/tags/') && format('https://github.com/32m1nd0t/soop-ai-timeline/releases/download/{0}/SOOPTimeline.exe', github.ref_name) || '' }}
           SOOP_TIMELINE_RELEASE_NOTES: ${{ startsWith(github.ref, 'refs/tags/') && format('SOOP AI 타임라인 {0}', github.ref_name) || '수동 빌드' }}
         run: .\build_installer.ps1
@@ -75,9 +76,40 @@ jobs:
           if ($installed.ExitCode -ne 0) {
             throw "설치된 앱 스모크 테스트가 실패했습니다. (exit code: $($installed.ExitCode))"
           }
+          $gpuArgs = @('/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', ("/DIR=`"{0}`"" -f $installDir))
+          $gpuSetup = Start-Process -FilePath ".\dist\SOOPTimeline-GPU-Addon.exe" -ArgumentList $gpuArgs -WindowStyle Hidden -Wait -PassThru
+          if ($gpuSetup.ExitCode -ne 0) {
+            throw "GPU 추가 구성요소 설치 테스트가 실패했습니다. (exit code: $($gpuSetup.ExitCode))"
+          }
+          foreach ($gpuDll in @('cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $installDir "gpu-runtime\$gpuDll"))) {
+              throw "GPU 추가 구성요소 파일이 없습니다: $gpuDll"
+            }
+          }
+          $gpuHashesBeforeUpdate = @{}
+          foreach ($gpuDll in @('cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll')) {
+            $gpuPath = Join-Path $installDir "gpu-runtime\$gpuDll"
+            $gpuHashesBeforeUpdate[$gpuDll] = (Get-FileHash -LiteralPath $gpuPath -Algorithm SHA256).Hash
+          }
+          $update = Start-Process -FilePath ".\dist\SOOPTimeline-Setup.exe" -ArgumentList $setupArgs -WindowStyle Hidden -Wait -PassThru
+          if ($update.ExitCode -ne 0) {
+            throw "Base installer update smoke test failed. (exit code: $($update.ExitCode))"
+          }
+          foreach ($gpuDll in @('cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll')) {
+            $gpuPath = Join-Path $installDir "gpu-runtime\$gpuDll"
+            if (-not (Test-Path -LiteralPath $gpuPath)) {
+              throw "Base update removed the GPU add-on file: $gpuDll"
+            }
+            if ((Get-FileHash -LiteralPath $gpuPath -Algorithm SHA256).Hash -ne $gpuHashesBeforeUpdate[$gpuDll]) {
+              throw "Base update changed the GPU add-on file: $gpuDll"
+            }
+          }
           $uninstall = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) {
             throw "설치 테스트 정리가 실패했습니다. (exit code: $($uninstall.ExitCode))"
+          }
+          if (Test-Path -LiteralPath (Join-Path $installDir "gpu-runtime")) {
+            throw "기본 앱 제거 후 GPU 추가 구성요소가 남아 있습니다."
           }
 
       - name: Upload build artifact
@@ -87,6 +119,7 @@ jobs:
           path: |
             dist/SOOPTimeline.exe
             dist/SOOPTimeline-Setup.exe
+            dist/SOOPTimeline-GPU-Addon.exe
             dist/update.json
           if-no-files-found: error
 
@@ -98,6 +131,7 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" `
             "dist/SOOPTimeline-Setup.exe" `
+            "dist/SOOPTimeline-GPU-Addon.exe" `
             "dist/SOOPTimeline.exe" `
             "dist/update.json" `
             --title "SOOP AI 타임라인 ${{ github.ref_name }}" `

@@ -17,6 +17,13 @@ datas = []
 binaries = []
 hiddenimports = []
 
+build_mode = os.environ.get("SOOP_TIMELINE_BUILD_MODE", "portable").strip().lower()
+if build_mode not in {"portable", "installed"}:
+    raise SystemExit(
+        "SOOPTimeline.spec: SOOP_TIMELINE_BUILD_MODE must be portable or installed"
+    )
+bundle_gpu_runtime = build_mode == "portable"
+
 project_root = Path.cwd()
 for document_name in ("PRIVACY.md", "THIRD_PARTY_NOTICES.md"):
     document_path = project_root / document_name
@@ -38,12 +45,9 @@ def _safe_distribution_name(value):
 
 def _collect_runtime_license_files():
     environment = default_environment()
-    queue = [
-        "soop-timeline",
-        "nvidia-cublas-cu12",
-        "nvidia-cudnn-cu12",
-        "pyinstaller",
-    ]
+    queue = ["soop-timeline", "pyinstaller"]
+    if bundle_gpu_runtime:
+        queue += ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
     seen = set()
     component_lines = [
         "SOOP AI Timeline bundled third-party components",
@@ -140,17 +144,19 @@ if update_manifest_url:
     )
     datas.append((str(update_channel_path), "."))
 
-for package in (
+runtime_packages = [
     "av",
     "ctranslate2",
     "faster_whisper",
     "google.genai",
-    "nvidia.cublas",
-    "nvidia.cudnn",
     "onnxruntime",
     "qtwebview2",
     "tokenizers",
-):
+]
+if bundle_gpu_runtime:
+    runtime_packages += ["nvidia.cublas", "nvidia.cudnn"]
+
+for package in runtime_packages:
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -220,28 +226,53 @@ def _strip_unused_cuda(toc):
     return [entry for entry in toc if os.path.basename(entry[0]).lower() not in UNUSED_CUDA_DLLS]
 
 
-a.binaries = _strip_unused_cuda(a.binaries)
-a.datas = _strip_unused_cuda(a.datas)
+if bundle_gpu_runtime:
+    a.binaries = _strip_unused_cuda(a.binaries)
+    a.datas = _strip_unused_cuda(a.datas)
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="SOOPTimeline",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+if build_mode == "installed":
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="SOOPTimeline",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=False,
+        disable_windowed_traceback=False,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="SOOPTimeline",
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="SOOPTimeline",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        runtime_tmpdir=None,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )

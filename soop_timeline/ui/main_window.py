@@ -81,7 +81,11 @@ from ..services.review_feedback import (
     REVIEW_FEEDBACK_ENABLED_SETTING,
     learn_review_feedback,
 )
-from ..services.transcription import format_timestamp
+from ..services.transcription import (
+    GPU_ADDON_DOWNLOAD_URL,
+    detect_whisper_runtime,
+    format_timestamp,
+)
 from ..services.timeline_validation import parse_duration_text
 from ..services.timeline_document import (
     DEFAULT_TIMELINE_NOTICE,
@@ -110,6 +114,7 @@ from .version_history_dialog import TimelineVersionHistoryDialog
 
 
 logger = logging.getLogger(__name__)
+GPU_ADDON_PROMPT_SETTING = "gpu_addon_prompt_version"
 
 
 class MainWindow(QMainWindow):
@@ -268,6 +273,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1_800, self._resume_persisted_analysis)
         if automatic_update_check_enabled(self.database):
             QTimer.singleShot(2_500, lambda: self.check_for_updates(silent=True))
+        QTimer.singleShot(6_000, self._offer_gpu_addon_if_needed)
         if self._stale_live_sessions:
             self.status_label.setText(
                 f"중단된 라이브 세션 {len(self._stale_live_sessions):,}개에 "
@@ -2314,6 +2320,39 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         self.status_label.setText("업데이트 설치를 위해 앱을 종료합니다…")
         self.close()
+
+    def _offer_gpu_addon_if_needed(self) -> None:
+        prompt_state = self.database.get_setting(GPU_ADDON_PROMPT_SETTING, "")
+        if prompt_state in {__version__, "never"}:
+            return
+        try:
+            runtime = detect_whisper_runtime("auto")
+        except RuntimeError:
+            return
+        if not runtime.warning:
+            return
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setWindowTitle("NVIDIA GPU 구성요소")
+        message.setText(
+            "NVIDIA GPU는 감지됐지만 대용량 CUDA 파일은 기본 앱에서 분리되어 있습니다."
+        )
+        message.setInformativeText(
+            "GPU 구성요소를 한 번 설치하면 이후 일반 앱 업데이트에서는 다시 받을 "
+            "필요가 없습니다. 설치하지 않으면 CPU로 계속 사용할 수 있습니다."
+        )
+        download_button = message.addButton(
+            "GPU 구성요소 받기",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        message.addButton("CPU로 사용", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() is download_button:
+            self.database.set_setting(GPU_ADDON_PROMPT_SETTING, __version__)
+            QDesktopServices.openUrl(QUrl(GPU_ADDON_DOWNLOAD_URL))
+        else:
+            self.database.set_setting(GPU_ADDON_PROMPT_SETTING, "never")
 
     def _schedule_live_reconnect_retry(self, delay_ms: int) -> None:
         if (
