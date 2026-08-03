@@ -11,14 +11,17 @@ from soop_timeline.models import Vod
 from soop_timeline.services.transcription import (
     AnalysisCancelled,
     FasterWhisperTranscriber,
+    TRANSCRIPT_PIPELINE_VERSION,
     Transcript,
     TranscriptSegment,
+    TranscriptWord,
     WhisperRuntime,
     _WhisperBackend,
     _MODEL_LOCK,
     load_vod_transcript_cache,
     missing_covered_ranges,
     save_vod_transcript_cache,
+    split_transcript_segment_by_word_gaps,
 )
 from soop_timeline.services.live_stream import (
     LiveAudioSource,
@@ -174,6 +177,37 @@ class VodStreamTests(unittest.TestCase):
         self.assertAlmostEqual(float(audio[1]), 0.0)
         self.assertGreater(float(audio[2]), 0.99)
 
+    def test_whisper_segment_is_split_at_long_word_timing_gap(self):
+        words = [
+            TranscriptWord(78.527, 79.647, "안녕하세요."),
+            TranscriptWord(230.257, 230.717, "아우"),
+            TranscriptWord(231.277, 231.497, "나"),
+            TranscriptWord(231.557, 232.157, "방송"),
+        ]
+
+        result = split_transcript_segment_by_word_gaps(
+            78.527,
+            260.157,
+            "안녕하세요. 아우 나 방송",
+            words,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([item[2] for item in result], ["안녕하세요.", "아우 나 방송"])
+        self.assertAlmostEqual(result[0][0], 78.527)
+        self.assertAlmostEqual(result[1][0], 230.257)
+
+    def test_broken_repetitive_replacement_output_is_discarded(self):
+        self.assertEqual(
+            split_transcript_segment_by_word_gaps(
+                4.1,
+                8.6,
+                "ㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷㄷ�",
+                (),
+            ),
+            [],
+        )
+
     def test_batched_stream_transcription_splits_overlap_once(self):
         chunks = [
             AudioChunk(1, 0, bytes(20 * 16_000 * 2)),
@@ -265,6 +299,37 @@ class VodStreamTests(unittest.TestCase):
                     cache_path,
                     "123",
                     "https://vod/changed",
+                    "large-v3-turbo",
+                )
+            )
+
+    def test_old_transcript_pipeline_cache_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "transcript.json"
+            transcript = Transcript(
+                model="large-v3-turbo",
+                language="ko",
+                duration_seconds=10,
+                segments=[TranscriptSegment("s0", 1, 2, "안녕하세요")],
+            )
+            save_vod_transcript_cache(
+                cache_path,
+                "123",
+                "https://vod/123",
+                transcript,
+            )
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            payload["pipeline_version"] = TRANSCRIPT_PIPELINE_VERSION - 1
+            cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                load_vod_transcript_cache(
+                    cache_path,
+                    "123",
+                    "https://vod/123",
                     "large-v3-turbo",
                 )
             )

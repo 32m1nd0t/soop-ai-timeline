@@ -543,8 +543,9 @@ def validate_and_snap_quotes(
     """Keep only transcript-backed direct quotes and align their start locally.
 
     This is deterministic post-processing and performs no AI request. Word
-    timings are preferred; older caches fall back to segment text and segment
-    start times. An unverified quote becomes a plain, transcript-backed summary.
+    timings are authoritative when present; older caches without them fall back
+    to segment text and segment start times. An unverified quote becomes a plain,
+    transcript-backed summary.
     """
     if not entries:
         return []
@@ -564,13 +565,33 @@ def validate_and_snap_quotes(
         if not quote:
             verified.append(entry)
             continue
-        low = bisect.bisect_left(segment_starts, entry.start - before_seconds)
-        high = bisect.bisect_right(segment_starts, entry.start + after_seconds)
-        matched = find_phrase_start_time(
-            quote,
-            segment_evidence[low:high],
-            reference_time=entry.start,
-        )
+        if word_evidence:
+            evidence_start = entry.start - before_seconds
+            evidence_end = entry.start + after_seconds
+            selected_segment = segment_lookup.get(entry.segment_id)
+            if selected_segment is not None:
+                # Gemini identifies a transcript segment, but its suggested
+                # start can still point at the segment's first speech island.
+                # Search the whole selected segment and let the word-gap guard
+                # reject quotes stitched across separate islands.
+                evidence_start = min(evidence_start, selected_segment.start - 0.5)
+                evidence_end = max(evidence_end, selected_segment.end + 0.5)
+            word_low = bisect.bisect_left(word_starts, evidence_start)
+            word_high = bisect.bisect_right(word_starts, evidence_end)
+            matched = find_phrase_start_time(
+                quote,
+                word_evidence[word_low:word_high],
+                reference_time=entry.start,
+                allow_verified_prefix=True,
+            )
+        else:
+            low = bisect.bisect_left(segment_starts, entry.start - before_seconds)
+            high = bisect.bisect_right(segment_starts, entry.start + after_seconds)
+            matched = find_phrase_start_time(
+                quote,
+                segment_evidence[low:high],
+                reference_time=entry.start,
+            )
         if matched is None:
             fallback_summary = _fallback_summary_for_unverified_quote(
                 entry,
@@ -595,23 +616,6 @@ def validate_and_snap_quotes(
                 )
             )
             continue
-        if word_evidence:
-            word_low = bisect.bisect_left(
-                word_starts,
-                entry.start - before_seconds,
-            )
-            word_high = bisect.bisect_right(
-                word_starts,
-                entry.start + after_seconds,
-            )
-            word_match = find_phrase_start_time(
-                quote,
-                word_evidence[word_low:word_high],
-                reference_time=entry.start,
-                allow_verified_prefix=True,
-            )
-            if word_match is not None:
-                matched = word_match
         verified.append(replace(entry, start=matched, quote=quote))
     verified.sort(key=lambda item: (item.start, item.segment_id))
     return verified

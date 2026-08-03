@@ -48,6 +48,7 @@ from soop_timeline.services.timeline_document import DEFAULT_TIMELINE_NOTICE
 from soop_timeline.services.transcription import (
     AnalysisCancelled,
     LiveTranscriptUpdate,
+    TRANSCRIPT_PIPELINE_VERSION,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -137,6 +138,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             (live_root / LIVE_TRANSCRIPT_FILENAME).write_text(
                 json.dumps(
                     {
+                        "pipeline_version": TRANSCRIPT_PIPELINE_VERSION,
                         "source": {
                             "kind": "soop_live",
                             "url": live.url,
@@ -297,6 +299,69 @@ class AnalysisPipelineTests(unittest.TestCase):
         result = validate_and_snap_quotes([entry], segments)[0]
         self.assertEqual(result.quote, "")
         self.assertEqual(result.summary, "사과 게임 이야기")
+
+    def test_quote_cannot_join_words_separated_inside_one_whisper_segment(self):
+        segments = [
+            TranscriptSegment(
+                "s1",
+                10.0,
+                72.0,
+                "오늘은 사과 게임을 합니다",
+            )
+        ]
+        words = (
+            TranscriptWord(10.0, 12.0, "오늘은 사과"),
+            TranscriptWord(70.0, 72.0, "게임을 합니다"),
+        )
+        entry = TimelineEntry(
+            "s1",
+            10.0,
+            "사과 게임 이야기",
+            quote="오늘은 사과 게임을 합니다",
+        )
+
+        result = validate_and_snap_quotes([entry], segments, words)[0]
+
+        self.assertEqual(result.quote, "")
+        self.assertEqual(result.summary, "사과 게임 이야기")
+
+    def test_quote_uses_later_word_island_in_selected_segment(self):
+        segments = [
+            TranscriptSegment(
+                "s1",
+                78.527,
+                260.157,
+                "안녕하세요 방송 안 켜지길래 식겁했다",
+            )
+        ]
+        words = (
+            TranscriptWord(78.527, 79.647, "안녕하세요"),
+            TranscriptWord(230.257, 231.0, "방송"),
+            TranscriptWord(231.1, 231.4, "안"),
+            TranscriptWord(231.5, 232.4, "켜지길래"),
+            TranscriptWord(232.5, 233.4, "식겁했다"),
+        )
+        entry = TimelineEntry(
+            "s1",
+            78.527,
+            "",
+            quote="방송 안 켜지길래 식겁했다",
+        )
+
+        result = validate_and_snap_quotes([entry], segments, words)[0]
+
+        self.assertEqual(result.quote, "방송 안 켜지길래 식겁했다")
+        self.assertAlmostEqual(result.start, 230.257)
+
+    def test_segment_text_cannot_override_missing_word_evidence(self):
+        segments = [TranscriptSegment("s1", 10.0, 20.0, "실제로 말했다")]
+        words = (TranscriptWord(10.0, 11.0, "전혀 다른 말"),)
+        entry = TimelineEntry("s1", 10.0, "확인 요약", quote="실제로 말했다")
+
+        result = validate_and_snap_quotes([entry], segments, words)[0]
+
+        self.assertEqual(result.quote, "")
+        self.assertEqual(result.summary, "확인 요약")
 
     def test_snap_moves_quoted_entry_to_the_spoken_word(self):
         words = (

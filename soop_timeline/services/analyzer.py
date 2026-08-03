@@ -41,6 +41,7 @@ from .transcription import (
     FasterWhisperTranscriber,
     LiveTranscriptUpdate,
     merge_covered_ranges,
+    TRANSCRIPT_PIPELINE_VERSION,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -1212,6 +1213,7 @@ def _save_live_transcript_snapshot(
 ) -> None:
     destination = analysis_data_dir(vod.vod_id) / LIVE_TRANSCRIPT_FILENAME
     payload = {
+        "pipeline_version": TRANSCRIPT_PIPELINE_VERSION,
         "source": {
             "kind": "soop_live",
             "url": vod.url,
@@ -1295,6 +1297,7 @@ class _LiveTranscriptJournal:
         header = {
             "type": "header",
             "version": 1,
+            "pipeline_version": TRANSCRIPT_PIPELINE_VERSION,
             "source": self.source_payload,
         }
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -1521,7 +1524,8 @@ def _load_live_transcript_snapshot(
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
             source = payload.get("source", {})
             if (
-                isinstance(source, dict)
+                payload.get("pipeline_version") == TRANSCRIPT_PIPELINE_VERSION
+                and isinstance(source, dict)
                 and source.get("kind") == "soop_live"
                 and str(source.get("url", "")) == vod.url
             ):
@@ -1560,6 +1564,7 @@ def _load_live_transcript_journal(
     source = header.get("source", {}) if isinstance(header, dict) else {}
     if (
         not isinstance(source, dict)
+        or header.get("pipeline_version") != TRANSCRIPT_PIPELINE_VERSION
         or source.get("kind") != "soop_live"
         or str(source.get("url", "")) != vod.url
     ):
@@ -1629,6 +1634,8 @@ def load_cached_transcript(
         )
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if payload.get("pipeline_version") != TRANSCRIPT_PIPELINE_VERSION:
+            return None
         source = payload.get("source")
         if not isinstance(source, dict) or any(
             source.get(key) != expected

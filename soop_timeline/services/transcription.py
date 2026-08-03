@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ctypes
+import importlib.util
 import json
 import os
 import queue
+import re
 import threading
-import ctypes
-import importlib.util
 import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
@@ -25,6 +26,10 @@ PreviewCallback = Callable[[str, str], None]
 CheckpointCallback = Callable[["Transcript"], None]
 LiveUpdateCallback = Callable[["LiveTranscriptUpdate"], None]
 ReconnectGapCallback = Callable[[float, float], None]
+
+
+TRANSCRIPT_PIPELINE_VERSION = 2
+MAX_TRANSCRIPT_WORD_GAP_SECONDS = 3.0
 
 
 _NVIDIA_DLL_DIRECTORY_HANDLES: list[object] = []
@@ -329,6 +334,93 @@ def _extract_words(raw_segment: object) -> list[TranscriptWord]:
     return result
 
 
+def _join_transcript_words(words: Iterable[TranscriptWord]) -> str:
+    text = " ".join(word.text.strip() for word in words if word.text.strip())
+    text = re.sub(r"\s+([,.!?;:%…~\)\]\}〉》」』】”’])", r"\1", text)
+    text = re.sub(r"([\(\[\{〈《「『【“‘])\s+", r"\1", text)
+    return " ".join(text.split())
+
+
+def _is_probable_broken_transcript_noise(text: str) -> bool:
+    """Drop only obviously corrupted repetitive output, not ordinary reactions."""
+
+    compact = "".join(text.split())
+    if "\ufffd" not in compact:
+        return False
+    spoken = [character.casefold() for character in compact if character.isalnum()]
+    if len(spoken) < 12:
+        return False
+    dominant = max(spoken.count(character) for character in set(spoken))
+    return dominant / len(spoken) >= 0.7
+
+
+def split_transcript_segment_by_word_gaps(
+    start: float,
+    end: float,
+    text: str,
+    words: Iterable[TranscriptWord],
+    *,
+    max_gap_seconds: float = MAX_TRANSCRIPT_WORD_GAP_SECONDS,
+) -> list[tuple[float, float, str, list[TranscriptWord]]]:
+    """Split one Whisper segment when VAD joined distant speech islands.
+
+    Batched faster-whisper can return one segment whose words are separated by
+    minutes after VAD restores original timestamps. Segment-level consumers then
+    assign every sentence to the first island. Per-word timings are the reliable
+    boundary evidence, so split only when they expose a real gap.
+    """
+
+    clean_text = " ".join(str(text).split())
+    if not clean_text or _is_probable_broken_transcript_noise(clean_text):
+        return []
+    ordered_words = sorted(
+        (word for word in words if word.text.strip()),
+        key=lambda word: (word.start, word.end, word.text),
+    )
+    if not ordered_words:
+        normalized_start = max(0.0, start)
+        return [
+            (
+                normalized_start,
+                max(normalized_start, end),
+                clean_text,
+                [],
+            )
+        ]
+
+    groups: list[list[TranscriptWord]] = []
+    current: list[TranscriptWord] = []
+    maximum_gap = max(0.0, float(max_gap_seconds))
+    for word in ordered_words:
+        if current and word.start - current[-1].end > maximum_gap:
+            groups.append(current)
+            current = []
+        current.append(word)
+    if current:
+        groups.append(current)
+
+    if len(groups) == 1:
+        normalized_start = max(0.0, start)
+        return [
+            (
+                normalized_start,
+                max(normalized_start, end),
+                clean_text,
+                ordered_words,
+            )
+        ]
+
+    split_segments: list[tuple[float, float, str, list[TranscriptWord]]] = []
+    for group in groups:
+        group_text = _join_transcript_words(group)
+        if not group_text or _is_probable_broken_transcript_noise(group_text):
+            continue
+        group_start = max(0.0, group[0].start)
+        group_end = max(group_start, group[-1].end)
+        split_segments.append((group_start, group_end, group_text, group))
+    return split_segments
+
+
 @dataclass(slots=True)
 class _WhisperBackend:
     runtime: WhisperRuntime
@@ -448,17 +540,29 @@ class FasterWhisperTranscriber:
                 raise AnalysisCancelled("분석을 취소했습니다.")
             text = str(raw.text).strip()
             if text:
-                segments.append(
-                    TranscriptSegment(
-                        segment_id=f"s{len(segments):06d}",
-                        start=max(0.0, float(raw.start)),
-                        end=max(0.0, float(raw.end)),
-                        text=text,
-                    )
+                split_segments = split_transcript_segment_by_word_gaps(
+                    float(raw.start),
+                    float(raw.end),
+                    text,
+                    _extract_words(raw),
                 )
-                words.extend(_extract_words(raw))
+                for (
+                    split_start,
+                    split_end,
+                    split_text,
+                    split_words,
+                ) in split_segments:
+                    segments.append(
+                        TranscriptSegment(
+                            segment_id=f"s{len(segments):06d}",
+                            start=split_start,
+                            end=split_end,
+                            text=split_text,
+                        )
+                    )
+                    words.extend(split_words)
                 now = time.monotonic()
-                if preview is not None and (
+                if split_segments and preview is not None and (
                     len(segments) == 1
                     or len(segments) % 25 == 0
                     or now - last_preview_at >= 2.0
@@ -1150,10 +1254,10 @@ class FasterWhisperTranscriber:
                 raise AnalysisCancelled("분석을 취소했습니다.")
             text = str(raw.text).strip()
             if text:
-                segments.append(
-                    (
-                        max(0.0, float(raw.start)),
-                        max(0.0, float(raw.end)),
+                segments.extend(
+                    split_transcript_segment_by_word_gaps(
+                        float(raw.start),
+                        float(raw.end),
                         text,
                         _extract_words(raw),
                     )
@@ -1220,6 +1324,7 @@ def save_transcript_cache(path: str | Path, source_path: str | Path, transcript:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "pipeline_version": TRANSCRIPT_PIPELINE_VERSION,
         "source": source_fingerprint(source_path),
         "transcript": transcript.to_dict(),
     }
@@ -1238,6 +1343,8 @@ def load_transcript_cache(
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if payload.get("pipeline_version") != TRANSCRIPT_PIPELINE_VERSION:
+            return None
         if payload.get("source") != source_fingerprint(source_path):
             return None
         transcript = Transcript.from_dict(payload["transcript"])
@@ -1266,6 +1373,7 @@ def save_vod_transcript_cache(
     if vod_source is not None:
         source["media"] = vod_source_fingerprint(vod_source)
     payload = {
+        "pipeline_version": TRANSCRIPT_PIPELINE_VERSION,
         "source": source,
         "transcript": transcript.to_dict(),
     }
@@ -1291,6 +1399,8 @@ def load_vod_transcript_cache(
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if payload.get("pipeline_version") != TRANSCRIPT_PIPELINE_VERSION:
+            return None
         cached_source = payload.get("source")
         if not isinstance(cached_source, dict) or any(
             cached_source.get(key) != expected
