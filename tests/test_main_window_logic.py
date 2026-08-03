@@ -30,6 +30,70 @@ class _TimelineDatabase:
 
 
 class MainWindowStateLogicTests(unittest.TestCase):
+    def test_review_complete_learns_from_saved_ai_draft(self):
+        saved: list[tuple[str, str, str]] = []
+        states: list[tuple[str, str]] = []
+        window_messages: list[str] = []
+        editor_messages: list[str] = []
+
+        class Database:
+            @staticmethod
+            def save_timeline(vod_id: str, text: str, state: str):
+                saved.append((vod_id, text, state))
+
+            @staticmethod
+            def set_vod_state(vod_id: str, state: str):
+                states.append((vod_id, state))
+
+            @staticmethod
+            def get_setting(key: str, default: str):
+                del key, default
+                return "1"
+
+            @staticmethod
+            def get_vod(vod_id: str):
+                return SimpleNamespace(vod_id=vod_id)
+
+        editor = SimpleNamespace(
+            text=lambda: "검수 완료본",
+            status_label=SimpleNamespace(setText=editor_messages.append),
+        )
+        window = SimpleNamespace(
+            database=Database(),
+            _editor_tabs={"vod-1": editor},
+            status_label=SimpleNamespace(setText=window_messages.append),
+            load_vods=lambda: None,
+        )
+        learning_result = SimpleNamespace(
+            summary=lambda: "검수 피드백 2개를 저장했습니다."
+        )
+
+        with (
+            patch(
+                "soop_timeline.ui.main_window.learn_review_feedback",
+                return_value=learning_result,
+            ) as learn,
+            patch(
+                "soop_timeline.ui.main_window.QTimer.singleShot",
+                side_effect=lambda delay, callback: callback(),
+            ),
+        ):
+            MainWindow._mark_review_complete(window, "vod-1")
+
+        self.assertEqual(
+            saved,
+            [("vod-1", "검수 완료본", VodState.READY.value)],
+        )
+        self.assertEqual(states, [("vod-1", VodState.READY.value)])
+        learn.assert_called_once_with(
+            window.database,
+            window.database.get_vod("vod-1"),
+            "검수 완료본",
+        )
+        expected = "검수 완료 · 검수 피드백 2개를 저장했습니다."
+        self.assertEqual(window_messages, [expected])
+        self.assertEqual(editor_messages, [expected])
+
     def test_opening_existing_completed_timeline_does_not_change_state(self):
         existing = "완료된 내용"
         database = _TimelineDatabase(state=VodState.READY.value, text=existing)
@@ -804,6 +868,7 @@ class MainWindowStateLogicTests(unittest.TestCase):
         states: list[tuple[str, str]] = []
         revisions: list[tuple[str, str, str]] = []
         replacements: list[tuple[str, str, str]] = []
+        feedback_drafts: list[tuple[str, str]] = []
 
         class Database:
             @staticmethod
@@ -844,6 +909,9 @@ class MainWindowStateLogicTests(unittest.TestCase):
                 or replay_editor
             ),
             _refresh_editor_cache_state=lambda vod_id: None,
+            _save_review_feedback_draft=lambda vod_id, document: (
+                feedback_drafts.append((vod_id, document))
+            ),
             status_label=SimpleNamespace(setText=lambda text: None),
             load_vods=lambda: None,
         )
@@ -885,6 +953,10 @@ class MainWindowStateLogicTests(unittest.TestCase):
         self.assertEqual(
             replacements,
             [("live-900", "777", "전체 다시보기 분석 결과")],
+        )
+        self.assertEqual(
+            feedback_drafts,
+            [("777", "전체 다시보기 분석 결과")],
         )
 
 

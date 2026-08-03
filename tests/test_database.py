@@ -123,6 +123,57 @@ class DatabaseTests(unittest.TestCase):
             "2026-07-30T00:00:00.000001+00:00",
         )
 
+    def test_review_feedback_draft_and_examples_round_trip(self):
+        streamer = self.database.add_streamer("feedback-user", "피드백")
+        self.database.upsert_discovered_vods(
+            streamer.id,
+            [
+                {
+                    "vod_id": "feedback-1",
+                    "title": "피드백 방송",
+                    "url": "https://vod.sooplive.com/player/feedback-1",
+                }
+            ],
+        )
+        self.database.save_review_feedback_draft(
+            "feedback-1",
+            "오늘의 콘텐츠: 초안\n\n00:10:00 긴 문장",
+        )
+
+        count = self.database.replace_review_feedback_examples(
+            "feedback-1",
+            streamer.id,
+            [
+                ("rewrite", "00:10:00 긴 문장", "00:10:00 짧은 문장"),
+                ("delete", "00:20:00 단순 잡담", ""),
+            ],
+        )
+
+        self.assertEqual(count, 2)
+        self.assertIn("초안", self.database.get_review_feedback_draft("feedback-1"))
+        self.assertEqual(self.database.review_feedback_draft_count(), 1)
+        examples = self.database.list_review_feedback_examples(
+            streamer_id=streamer.id
+        )
+        self.assertEqual({item.action for item in examples}, {"rewrite", "delete"})
+        self.assertEqual(self.database.review_feedback_example_count(), 2)
+
+        replaced = self.database.replace_review_feedback_examples(
+            "feedback-1",
+            streamer.id,
+            [("title", "기존 제목", "수정 제목")],
+        )
+
+        self.assertEqual(replaced, 1)
+        self.assertEqual(
+            [item.action for item in self.database.list_review_feedback_examples()],
+            ["title"],
+        )
+        self.assertEqual(self.database.clear_review_feedback(), 1)
+        self.assertEqual(self.database.review_feedback_example_count(), 0)
+        self.assertEqual(self.database.review_feedback_draft_count(), 0)
+        self.assertEqual(self.database.get_review_feedback_draft("feedback-1"), "")
+
     def test_lists_all_live_captures_for_exact_broadcast(self):
         first = self.database.upsert_external_vod(
             vod_id="live-one",

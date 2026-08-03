@@ -12,7 +12,7 @@ import queue
 import threading
 from typing import Callable, Iterable
 
-from ..models import Vod
+from ..models import ReviewFeedbackExample, Vod
 from ..paths import analysis_data_dir
 from .ai_provider import GEMINI_PROVIDER, create_ai_provider
 from .credentials import get_gemini_api_key
@@ -27,6 +27,10 @@ from .gemini_timeline import (
     deduplicate_entries,
 )
 from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
+from .review_feedback import (
+    REVIEW_FEEDBACK_ENABLED_SETTING,
+    REVIEW_FEEDBACK_MAX_LOADED,
+)
 from .gemini_style import parse_timeline_document
 from .timeline_timestamp import parse_timestamp
 from .timeline_document import initial_timeline_document
@@ -162,8 +166,10 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         config: AnalyzerConfig,
         transcriber_factory: Callable[..., FasterWhisperTranscriber] | None = None,
         generator_factory: Callable[[str, str], AITimelineGenerator] | None = None,
+        review_feedback_examples: Iterable[ReviewFeedbackExample] = (),
     ):
         self.config = config
+        self.review_feedback_examples = tuple(review_feedback_examples)
         self._transcriber_factory = transcriber_factory or (
             lambda model, device: FasterWhisperTranscriber(
                 model_name=model,
@@ -175,6 +181,7 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                 key,
                 model,
                 topic_granularity=config.topic_granularity,
+                review_feedback_examples=self.review_feedback_examples,
             )
         )
         self.last_usage_summary = ""
@@ -182,6 +189,15 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
 
     @classmethod
     def from_database(cls, database: object) -> "LocalWhisperGeminiAnalyzer":
+        feedback_examples: tuple[ReviewFeedbackExample, ...] = ()
+        feedback_enabled = (
+            database.get_setting(REVIEW_FEEDBACK_ENABLED_SETTING, "1") != "0"
+        )
+        feedback_loader = getattr(database, "list_review_feedback_examples", None)
+        if feedback_enabled and callable(feedback_loader):
+            feedback_examples = tuple(
+                feedback_loader(limit=REVIEW_FEEDBACK_MAX_LOADED)
+            )
         return cls(
             AnalyzerConfig(
                 gemini_model=database.get_setting(
@@ -196,7 +212,8 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     DEFAULT_TOPIC_GRANULARITY,
                 ),
                 live_ai_mode=database.get_setting(LIVE_AI_MODE_SETTING, "saving"),
-            )
+            ),
+            review_feedback_examples=feedback_examples,
         )
 
     @property
@@ -273,11 +290,14 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         granularity: str,
     ) -> GeneratedTimeline:
         checkpoint_path = analysis_data_dir(vod.vod_id) / TIMELINE_CHECKPOINT_FILENAME
+        fingerprint = getattr(generator, "feedback_fingerprint", None)
+        feedback_key = str(fingerprint(vod) or "") if callable(fingerprint) else ""
         checkpoint_key = timeline_checkpoint_key(
             vod,
             transcript,
             self.config.gemini_model,
             granularity,
+            feedback_key,
         )
         resume = load_timeline_generation_state(checkpoint_path, checkpoint_key)
         if resume is None:
@@ -1398,6 +1418,7 @@ def timeline_checkpoint_key(
     transcript: Transcript,
     model_name: str,
     granularity: str,
+    feedback_key: str = "",
 ) -> str:
     digest = hashlib.sha256()
     metadata = {
@@ -1408,6 +1429,7 @@ def timeline_checkpoint_key(
         "granularity": granularity,
         "duration": transcript.duration_seconds,
         "glossary": vod.streamer_glossary,
+        "review_feedback": feedback_key,
     }
     digest.update(json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     for segment in transcript.segments:

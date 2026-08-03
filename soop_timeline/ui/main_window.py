@@ -75,6 +75,10 @@ from ..services.preferences import (
     normalized_discovery_interval,
     setting_enabled,
 )
+from ..services.review_feedback import (
+    REVIEW_FEEDBACK_ENABLED_SETTING,
+    learn_review_feedback,
+)
 from ..services.transcription import format_timestamp
 from ..services.timeline_validation import parse_duration_text
 from ..services.timeline_document import (
@@ -1958,10 +1962,36 @@ class MainWindow(QMainWindow):
 
     def _mark_review_complete(self, vod_id: str) -> None:
         editor = self._editor_tabs.get(vod_id)
+        reviewed_text = editor.text() if editor is not None else ""
         if editor is not None:
-            self.database.save_timeline(vod_id, editor.text(), VodState.READY.value)
+            self.database.save_timeline(vod_id, reviewed_text, VodState.READY.value)
         self.database.set_vod_state(vod_id, VodState.READY.value)
+        feedback_message = "검수 피드백 학습이 꺼져 있습니다."
+        if self.database.get_setting(REVIEW_FEEDBACK_ENABLED_SETTING, "1") != "0":
+            vod = self.database.get_vod(vod_id)
+            if vod is not None and reviewed_text.strip():
+                try:
+                    feedback_message = learn_review_feedback(
+                        self.database,
+                        vod,
+                        reviewed_text,
+                    ).summary()
+                except Exception:
+                    logger.exception("Review feedback learning failed for %s", vod_id)
+                    feedback_message = "검수는 저장했지만 피드백 사례 저장에 실패했습니다."
+        message = f"검수 완료 · {feedback_message}"
+        self.status_label.setText(message)
+        if editor is not None:
+            QTimer.singleShot(
+                0,
+                lambda target=editor, text=message: target.status_label.setText(text),
+            )
         self.load_vods()
+
+    def _save_review_feedback_draft(self, vod_id: str, document: str) -> None:
+        if self.database.get_setting(REVIEW_FEEDBACK_ENABLED_SETTING, "1") == "0":
+            return
+        self.database.save_review_feedback_draft(vod_id, document)
 
     def open_analysis_settings(self) -> None:
         dialog = AnalysisSettingsDialog(
@@ -2999,16 +3029,7 @@ class MainWindow(QMainWindow):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress_changed.connect(
-            lambda percent, message, target=target_vod_id, target_editor=editor: (
-                self._analysis_progress_changed(
-                    target,
-                    target_editor,
-                    percent,
-                    message,
-                )
-            )
-        )
+        worker.progress_changed.connect(self._analysis_progress_changed)
         worker.preview_changed.connect(editor.set_analysis_preview)
         worker.usage_changed.connect(editor.set_ai_usage)
         worker.succeeded.connect(self._analysis_succeeded)
@@ -3060,14 +3081,16 @@ class MainWindow(QMainWindow):
         if self._analysis_queue or self._pretranscribe_queue:
             QTimer.singleShot(0, self._resume_analysis_queue_if_idle)
 
+    @Slot(str, int, str)
     def _analysis_progress_changed(
         self,
         target_vod_id: str,
-        editor: TimelineDocumentEditor,
         percent: int,
         message: str,
     ) -> None:
-        editor.set_analysis_progress(percent, message)
+        editor = self._editor_tabs.get(target_vod_id)
+        if editor is not None:
+            editor.set_analysis_progress(percent, message)
         # The analyzer maps local transcription below 80%; from 80% onward it
         # is waiting on Gemini, so the single Whisper backend is available for
         # one background preparation job.
@@ -3194,6 +3217,7 @@ class MainWindow(QMainWindow):
             editor.apply_live_result(document)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self._save_review_feedback_draft(vod_id, document)
         self.status_label.setText(
             "라이브 수신과 AI 최종 타임라인 정리가 완료되었습니다."
         )
@@ -3368,6 +3392,7 @@ class MainWindow(QMainWindow):
             editor.set_style_running(False)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self._save_review_feedback_draft(vod_id, document)
         self.status_label.setText("AI 문체 교정이 완료되었습니다.")
         self.load_vods()
 
@@ -3489,6 +3514,7 @@ class MainWindow(QMainWindow):
             return
         editor.set_line_rewrite_running(False)
         editor.apply_line_rewrite(original_line, new_line, line_start)
+        self._save_review_feedback_draft(vod_id, editor.text())
 
     @Slot(str, str)
     def _line_rewrite_failed(self, vod_id: str, message: str) -> None:
@@ -3600,6 +3626,7 @@ class MainWindow(QMainWindow):
             editor.analysis_progress.setVisible(False)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self._save_review_feedback_draft(vod_id, document)
         self._refresh_editor_cache_state(vod_id)
         vod = self.database.get_vod(vod_id)
         cache_vod_id = (
@@ -3731,6 +3758,7 @@ class MainWindow(QMainWindow):
                 VodState.REVIEW.value,
             )
             self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        self._save_review_feedback_draft(source_vod_id, document)
         self.database.remove_analysis_queue(source_vod_id)
         if targeted:
             self.database.remove_analysis_queue(vod_id)

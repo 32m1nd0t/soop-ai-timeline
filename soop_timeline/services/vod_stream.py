@@ -41,6 +41,24 @@ class VodAudioSource:
 
 
 @dataclass(slots=True, frozen=True)
+class VodSeekPart:
+    order: int
+    offset_seconds: float
+    duration_seconds: float
+
+    @property
+    def end_seconds(self) -> float:
+        return self.offset_seconds + self.duration_seconds
+
+
+@dataclass(slots=True, frozen=True)
+class VodSeekTarget:
+    part: VodSeekPart
+    global_seconds: float
+    local_seconds: float
+
+
+@dataclass(slots=True, frozen=True)
 class AudioChunk:
     part_order: int
     start_seconds: float
@@ -58,6 +76,32 @@ class AudioChunk:
     def as_float32(self) -> np.ndarray:
         samples = np.frombuffer(self.pcm_s16, dtype="<i2")
         return samples.astype(np.float32) / 32768.0
+
+
+def build_vod_seek_parts(parts: tuple[VodAudioPart, ...]) -> tuple[VodSeekPart, ...]:
+    offset = 0.0
+    result: list[VodSeekPart] = []
+    for part in sorted(parts, key=lambda item: item.order):
+        duration = max(0.0, float(part.duration_seconds))
+        if duration <= 0:
+            continue
+        result.append(VodSeekPart(part.order, offset, duration))
+        offset += duration
+    return tuple(result)
+
+
+def resolve_vod_seek_target(
+    parts: tuple[VodSeekPart, ...],
+    global_seconds: float,
+) -> VodSeekTarget | None:
+    if not parts:
+        return None
+    target = max(0.0, float(global_seconds))
+    for index, part in enumerate(parts):
+        if target < part.end_seconds or index == len(parts) - 1:
+            local = max(0.0, min(part.duration_seconds, target - part.offset_seconds))
+            return VodSeekTarget(part, target, local)
+    return None
 
 
 def fetch_vod_audio_source(

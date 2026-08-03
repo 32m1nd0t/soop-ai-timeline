@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 import re
 from typing import Callable, Iterable
 
-from ..models import Vod
+from ..models import ReviewFeedbackExample, Vod
 from .ai_provider import (
     GEMINI_PROVIDER,
     StructuredAIProvider,
@@ -14,6 +14,10 @@ from .ai_provider import (
 )
 from .eta import EtaEstimator, format_eta
 from .gemini_style import DRY_TIMELINE_STYLE_GUIDE
+from .review_feedback import (
+    build_review_feedback_prompt,
+    review_feedback_fingerprint,
+)
 from .timeline_document import timeline_notice
 from .transcription import (
     AnalysisCancelled,
@@ -842,10 +846,18 @@ class AITimelineGenerator:
         self,
         provider: StructuredAIProvider,
         topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
+        review_feedback_examples: Iterable[ReviewFeedbackExample] = (),
     ):
         self.provider = provider
         self.topic_granularity = normalize_topic_granularity(topic_granularity)
+        self.review_feedback_examples = tuple(review_feedback_examples)
         self.last_warning = ""
+
+    def feedback_fingerprint(self, vod: Vod) -> str:
+        return review_feedback_fingerprint(
+            self.review_feedback_examples,
+            vod.streamer_id,
+        )
 
     @property
     def api_key(self) -> str:
@@ -917,6 +929,12 @@ class AITimelineGenerator:
                 window,
                 previous_entries=deduplicate_entries(candidates)[-8:],
                 granularity=self.topic_granularity,
+                review_feedback=build_review_feedback_prompt(
+                    self.review_feedback_examples,
+                    vod,
+                    "chunk",
+                    "\n".join(segment.text for segment in window),
+                ),
             )
             payload = self._request_json(prompt, cancelled)
             if cancelled():
@@ -977,6 +995,12 @@ class AITimelineGenerator:
             candidates,
             transcript.segments,
             granularity=self.topic_granularity,
+            review_feedback=build_review_feedback_prompt(
+                self.review_feedback_examples,
+                vod,
+                "final",
+                "\n".join(format_entry_text(entry) for entry in candidates),
+            ),
         )
         try:
             final_payload = self._request_json(
@@ -1074,6 +1098,12 @@ class AITimelineGenerator:
                 segments,
                 previous_entries=previous_entries,
                 granularity=self.topic_granularity,
+                review_feedback=build_review_feedback_prompt(
+                    self.review_feedback_examples,
+                    vod,
+                    "chunk",
+                    "\n".join(segment.text for segment in segments),
+                ),
             ),
             cancelled,
         )
@@ -1114,6 +1144,12 @@ class AITimelineGenerator:
                 candidates,
                 segments,
                 granularity=self.topic_granularity,
+                review_feedback=build_review_feedback_prompt(
+                    self.review_feedback_examples,
+                    vod,
+                    "final",
+                    "\n".join(format_entry_text(entry) for entry in candidates),
+                ),
             ),
             cancelled,
             schema=FINAL_TIMELINE_SCHEMA,
@@ -1151,7 +1187,15 @@ class AITimelineGenerator:
         fallback = build_overall_summary(vod, titles, entries)
         try:
             payload = self._request_json(
-                build_overall_summary_prompt(vod, entries),
+                build_overall_summary_prompt(
+                    vod,
+                    entries,
+                    review_feedback=build_review_feedback_prompt(
+                        self.review_feedback_examples,
+                        vod,
+                        "title",
+                    ),
+                ),
                 cancelled,
                 schema=OVERALL_SUMMARY_SCHEMA,
                 purpose="overall_summary",
@@ -1201,10 +1245,12 @@ class GeminiTimelineGenerator(AITimelineGenerator):
         api_key: str,
         model_name: str = "gemini-flash-lite-latest",
         topic_granularity: str = DEFAULT_TOPIC_GRANULARITY,
+        review_feedback_examples: Iterable[ReviewFeedbackExample] = (),
     ):
         super().__init__(
             create_ai_provider(GEMINI_PROVIDER, api_key, model_name),
             topic_granularity,
+            review_feedback_examples,
         )
 
 
@@ -1238,6 +1284,7 @@ def build_chunk_prompt(
     segments: Iterable[TranscriptSegment],
     previous_entries: list[TimelineEntry] | None = None,
     granularity: str = DEFAULT_TOPIC_GRANULARITY,
+    review_feedback: str = "",
 ) -> str:
     segment_list = list(segments)
     transcript_text = "\n".join(
@@ -1272,6 +1319,8 @@ def build_chunk_prompt(
 
 직전까지 확인된 주제:
 {previous_topic_text}
+
+{review_feedback}
 
 경계 판정 규칙:
 - 자막 첫 부분이 직전 주제의 계속이라면 새 항목을 만들지 않습니다.
@@ -1333,6 +1382,7 @@ def build_final_prompt(
     entries: list[TimelineEntry],
     segments: list[TranscriptSegment] | None = None,
     granularity: str = DEFAULT_TOPIC_GRANULARITY,
+    review_feedback: str = "",
 ) -> str:
     candidate_text = "\n".join(
         f"{entry.segment_id} | {format_timestamp(entry.start)} | "
@@ -1354,6 +1404,8 @@ def build_final_prompt(
 <glossary>
 {glossary}
 </glossary>
+
+{review_feedback}
 
 후보를 한 줄씩 단순히 고쳐 쓰지 말고, 전체 방송의 주제 흐름을 다시 판정해 최종 타임라인을 만드세요.
 이 요청에서는 타임라인 entries만 정리합니다. 방송 전체 제목이나 전체 요약은 만들지 마세요.
@@ -1404,6 +1456,7 @@ def build_final_prompt(
 def build_overall_summary_prompt(
     vod: Vod,
     entries: list[TimelineEntry],
+    review_feedback: str = "",
 ) -> str:
     timeline_text = "\n".join(
         f"{format_timestamp(entry.start)} | {format_entry_text(entry)}"
@@ -1430,6 +1483,8 @@ def build_overall_summary_prompt(
 <final_timeline>
 {timeline_text or '- 타임라인 항목 없음'}
 </final_timeline>
+
+{review_feedback}
 """.strip()
 
 

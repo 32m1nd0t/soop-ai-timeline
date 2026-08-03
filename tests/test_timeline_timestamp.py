@@ -10,6 +10,7 @@ from soop_timeline.services.timeline_timestamp import (
     shift_all_timestamps,
     timestamp_at_position,
 )
+from soop_timeline.services.vod_stream import VodSeekPart
 from soop_timeline.ui.review_player import (
     ResilientQtWebView2Widget,
     SoopReviewPlayer,
@@ -106,6 +107,30 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("firstPartIsActive && target < availableEnd - 1", script)
         self.assertIn("issued: true", script)
 
+    def test_seek_script_converts_global_time_to_active_part_local_time(self):
+        parts = (
+            VodSeekPart(1, 0.0, 12.317),
+            VodSeekPart(2, 12.317, 17_999.8),
+            VodSeekPart(3, 18_012.117, 9_240.167),
+        )
+
+        script = build_seek_script(464, 27_252, parts)
+
+        self.assertIn('"offset":12.317', script)
+        self.assertIn("const localTarget = target - Number(targetPart.offset)", script)
+        self.assertIn("video.currentTime = localTarget", script)
+        self.assertIn("strategy: 'active-mapped-part-current-time'", script)
+        self.assertIn("strategy: 'soop-part-switch-local-time'", script)
+
+        verification = build_seek_verification_script(
+            464,
+            allow_correction=True,
+            seek_parts=parts,
+        )
+        self.assertIn("strategy: 'mapped-part-fine-correction'", verification)
+        self.assertIn("strategy: 'mapped-part-verification'", verification)
+        self.assertIn("if (!mappedPartIsActive", verification)
+
     def test_seek_verification_only_reads_clock(self):
         script = build_seek_verification_script(12_282)
         self.assertIn("const clocks = __readSoopClocks()", script)
@@ -115,7 +140,7 @@ class TimelineTimestampTests(unittest.TestCase):
             "const dispatched = __dispatchSoopSeek(target, globalTotal)",
             script,
         )
-        self.assertNotIn("video.currentTime", script)
+        self.assertNotIn("video.currentTime =", script)
 
     def test_seek_verification_can_issue_only_a_local_fine_correction(self):
         script = build_seek_verification_script(
@@ -150,13 +175,14 @@ class TimelineTimestampTests(unittest.TestCase):
             _seek_generation=1,
             _seek_command_sent=True,
             _fine_correction_sent=True,
+            _seek_parts=(),
             _duration_seconds=24_357,
             web_view=web_view,
         )
         SoopReviewPlayer._attempt_seek(player)
         self.assertTrue(player._seek_in_flight)
         self.assertIn("strategy: 'clock-verification'", web_view.script)
-        self.assertNotIn("video.currentTime", web_view.script)
+        self.assertNotIn("video.currentTime =", web_view.script)
 
     def test_pending_seek_allows_one_local_fine_correction(self):
         class StubWebView:
@@ -177,6 +203,7 @@ class TimelineTimestampTests(unittest.TestCase):
             _seek_generation=1,
             _seek_command_sent=True,
             _fine_correction_sent=False,
+            _seek_parts=(),
             _duration_seconds=24_357,
             web_view=web_view,
         )
@@ -268,6 +295,49 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertTrue(player._seek_command_sent)
         self.assertEqual(player._seek_attempts, 0)
         self.assertTrue(any("한 번" in value for value in status.values))
+
+    def test_completed_seek_reports_verified_actual_time(self):
+        class Recorder:
+            def __init__(self):
+                self.values = []
+
+            def setText(self, value):
+                self.values.append(value)
+
+            def emit(self, value):
+                self.values.append(value)
+
+        label = Recorder()
+        status = Recorder()
+        completed = Recorder()
+        player = SimpleNamespace(
+            _seek_in_flight=True,
+            _seek_generation=2,
+            _pending_seconds=464,
+            _seek_command_sent=True,
+            _fine_correction_sent=True,
+            _retry_timer=SimpleNamespace(stop=lambda: None),
+            time_label=label,
+            status_changed=status,
+            seek_completed=completed,
+        )
+
+        SoopReviewPlayer._handle_seek_result(
+            player,
+            2,
+            464,
+            {
+                "success": True,
+                "result": {"ok": True, "currentTime": 465.2},
+            },
+        )
+
+        self.assertEqual(label.values[-1], "이동 완료 위치 · 00:07:45")
+        self.assertEqual(
+            status.values[-1],
+            "요청 00:07:44 · 실제 00:07:45 지점으로 이동했습니다.",
+        )
+        self.assertEqual(completed.values, [465])
 
     def test_review_player_uses_official_embed_page(self):
         url = build_player_url("200312857").toString()

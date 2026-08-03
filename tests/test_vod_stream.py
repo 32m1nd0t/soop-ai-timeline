@@ -29,7 +29,9 @@ from soop_timeline.services.vod_stream import (
     VOD_INFO_URL,
     VodAudioPart,
     VodAudioSource,
+    build_vod_seek_parts,
     fetch_vod_audio_source,
+    resolve_vod_seek_target,
 )
 
 
@@ -95,6 +97,23 @@ def public_payload() -> dict[str, object]:
 
 
 class VodStreamTests(unittest.TestCase):
+    def test_resolves_global_time_to_local_time_after_short_leading_part(self):
+        parts = build_vod_seek_parts(
+            (
+                VodAudioPart(1, 12.317, "https://vod.sooplive.com/intro.m3u8"),
+                VodAudioPart(2, 17_999.8, "https://vod.sooplive.com/main.m3u8"),
+                VodAudioPart(3, 9_240.167, "https://vod.sooplive.com/end.m3u8"),
+            )
+        )
+
+        target = resolve_vod_seek_target(parts, 7 * 60 + 44)
+
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.part.order, 2)
+        self.assertAlmostEqual(target.part.offset_seconds, 12.317)
+        self.assertAlmostEqual(target.local_seconds, 451.683)
+
     def test_waiting_for_whisper_model_lock_honours_cancellation(self):
         checks = 0
 

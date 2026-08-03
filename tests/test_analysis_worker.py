@@ -18,6 +18,13 @@ class _Receiver(QObject):
         super().__init__()
         self.result = None
         self.received_thread = None
+        self.progress_update = None
+        self.progress_thread = None
+
+    @Slot(str, int, str)
+    def progress(self, vod_id: str, percent: int, message: str) -> None:
+        self.progress_update = (vod_id, percent, message)
+        self.progress_thread = QThread.currentThread()
 
     @Slot(str, str)
     def succeeded(self, vod_id: str, document: str) -> None:
@@ -228,6 +235,7 @@ class AnalysisWorkerTests(unittest.TestCase):
         receiver = _Receiver()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.progress_changed.connect(receiver.progress)
         worker.succeeded.connect(receiver.succeeded)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -238,6 +246,8 @@ class AnalysisWorkerTests(unittest.TestCase):
         thread.wait(3_000)
 
         self.assertEqual(receiver.result, ("123", "오늘의 콘텐츠: 테스트\n\n00:00:01 완료\n"))
+        self.assertEqual(receiver.progress_update, ("123", 50, "처리 중"))
+        self.assertIs(receiver.progress_thread, app.thread())
         self.assertIs(receiver.received_thread, app.thread())
         self.assertFalse(thread.isRunning())
 

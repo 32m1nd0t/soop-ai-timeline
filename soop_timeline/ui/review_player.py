@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 
 from PySide6.QtCore import QTimer, Qt, QUrl, QUrlQuery, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QShortcut
@@ -22,9 +23,17 @@ from ..models import Vod
 from ..paths import app_data_dir
 from ..services.timeline_timestamp import format_timestamp_seconds
 from ..services.timeline_validation import parse_duration_text
+from ..services.vod_stream import (
+    VodSeekPart,
+    build_vod_seek_parts,
+    fetch_vod_audio_source,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+_VOD_SEEK_PART_CACHE: dict[str, tuple[VodSeekPart, ...]] = {}
 
 
 def build_player_url(vod_id: str) -> QUrl:
@@ -175,12 +184,80 @@ function __dispatchSoopSeek(target, total) {
 """
 
 
-def build_seek_script(seconds: int, expected_duration: int | None = None) -> str:
+_SOOP_PART_TIME_FN = """
+function __targetVodPart(partMap, target) {
+    if (!Array.isArray(partMap) || !partMap.length) { return null; }
+    for (let index = 0; index < partMap.length; index += 1) {
+        const part = partMap[index];
+        const end = Number(part.offset) + Number(part.duration);
+        if (target < end || index === partMap.length - 1) { return part; }
+    }
+    return null;
+}
+
+function __activeVodPart(partMap, video, clocks) {
+    if (!video || !Array.isArray(partMap) || !partMap.length) { return null; }
+    const localDuration = Number(video.duration);
+    const localCurrent = Number(video.currentTime);
+    if (!Number.isFinite(localDuration) || localDuration <= 0) { return null; }
+    let best = null;
+    let bestScore = Infinity;
+    for (const part of partMap) {
+        const partDuration = Number(part.duration);
+        const partOffset = Number(part.offset);
+        if (!Number.isFinite(partDuration) || partDuration <= 0
+            || !Number.isFinite(partOffset)) {
+            continue;
+        }
+        const durationDelta = Math.abs(localDuration - partDuration);
+        const durationTolerance = Math.max(
+            1.5,
+            Math.min(15, partDuration * 0.001)
+        );
+        if (durationDelta > durationTolerance) { continue; }
+        let score = durationDelta;
+        if (Number.isFinite(localCurrent)
+            && clocks && Number.isFinite(clocks.current)) {
+            score += Math.abs(
+                partOffset + localCurrent - Number(clocks.current)
+            ) * 4;
+        }
+        if (score < bestScore) {
+            bestScore = score;
+            best = part;
+        }
+    }
+    return best;
+}
+"""
+
+
+def _seek_part_payload(parts: tuple[VodSeekPart, ...] | None) -> str:
+    return json.dumps(
+        [
+            {
+                "order": part.order,
+                "offset": round(part.offset_seconds, 3),
+                "duration": round(part.duration_seconds, 3),
+            }
+            for part in (parts or ())
+        ],
+        separators=(",", ":"),
+    )
+
+
+def build_seek_script(
+    seconds: int,
+    expected_duration: int | None = None,
+    seek_parts: tuple[VodSeekPart, ...] | None = None,
+) -> str:
     target = max(0, int(seconds))
     expected_total = max(0, int(expected_duration or 0))
-    return (_PICK_VIDEO_FN + _SOOP_GLOBAL_TIME_FN + f"""
+    part_payload = _seek_part_payload(seek_parts)
+    return (_PICK_VIDEO_FN + _SOOP_GLOBAL_TIME_FN + _SOOP_PART_TIME_FN + f"""
 const target = {target};
 const expectedTotal = {expected_total};
+const partMap = {part_payload};
 const seekTolerance = 1.5;
 const video = __pickVod();
 if (!video) {{
@@ -220,12 +297,60 @@ const availableEnd = Number.isFinite(duration) && duration > 0
     ? duration
     : seekableEnd;
 
+// SOOP's global clock includes every short intro and five-hour media part,
+// while video.currentTime is local to the currently active part. Resolve the
+// active part by its media duration and convert the requested global time to
+// that part's local clock before seeking.
+const targetPart = __targetVodPart(partMap, target);
+const activePartBefore = __activeVodPart(partMap, video, clocksBefore);
+if (targetPart && activePartBefore
+    && Number(activePartBefore.order) === Number(targetPart.order)) {{
+    const localTarget = target - Number(targetPart.offset);
+    if (localTarget >= 0 && localTarget <= Number(targetPart.duration)) {{
+        try {{
+            video.currentTime = localTarget;
+            video.muted = false;
+            try {{ await video.play(); }} catch (_) {{}}
+            await new Promise((resolve) => setTimeout(resolve, 350));
+            const landedLocal = Number(video.currentTime);
+            const landedGlobal = Number(targetPart.offset) + landedLocal;
+            if (Number.isFinite(landedGlobal)
+                && Math.abs(landedGlobal - target) <= seekTolerance) {{
+                return {{
+                    ok: true,
+                    strategy: 'active-mapped-part-current-time',
+                    currentTime: landedGlobal,
+                    localTime: landedLocal,
+                    partOrder: Number(targetPart.order),
+                    duration: globalTotal || availableEnd,
+                    paused: Boolean(video.paused),
+                    muted: Boolean(video.muted)
+                }};
+            }}
+            return {{
+                ok: false,
+                reason: 'target-not-ready',
+                issued: true,
+                landed: landedGlobal,
+                duration: availableEnd,
+                strategy: 'active-mapped-part-current-time'
+            }};
+        }} catch (error) {{
+            return {{
+                ok: false,
+                reason: 'seek-failed',
+                message: String(error)
+            }};
+        }}
+    }}
+}}
+
 // When the first media part is already active, seek it directly. Using the
 // full six-hour progress bar here is too coarse (roughly 20 seconds per pixel)
 // and repeated verification attempts can make a short section loop forever.
 const firstPartIsActive = !Number.isFinite(clocksBefore.current)
     || clocksBefore.current < availableEnd + 5;
-if (firstPartIsActive && target < availableEnd - 1) {{
+if (!targetPart && firstPartIsActive && target < availableEnd - 1) {{
     try {{
         video.currentTime = target;
         video.muted = false;
@@ -272,11 +397,47 @@ if (globalTotal > 0) {{
         let clocksAfter = __readSoopClocks();
         let landedGlobal = clocksAfter.current;
         let correctionIssued = false;
+        const activePartAfter = __activeVodPart(
+            partMap,
+            activeVideo,
+            clocksAfter
+        );
+        if (targetPart && activePartAfter
+            && Number(activePartAfter.order) === Number(targetPart.order)) {{
+            const localTarget = target - Number(targetPart.offset);
+            const localDuration = Number(activeVideo.duration);
+            if (localTarget >= 0
+                && Number.isFinite(localDuration)
+                && localTarget <= localDuration) {{
+                try {{
+                    activeVideo.currentTime = localTarget;
+                    correctionIssued = true;
+                    await new Promise((resolve) => setTimeout(resolve, 350));
+                    const landedLocal = Number(activeVideo.currentTime);
+                    landedGlobal = Number(targetPart.offset) + landedLocal;
+                    if (Number.isFinite(landedGlobal)
+                        && Math.abs(landedGlobal - target) <= seekTolerance) {{
+                        return {{
+                            ok: true,
+                            strategy: 'soop-part-switch-local-time',
+                            correctionIssued,
+                            currentTime: landedGlobal,
+                            localTime: landedLocal,
+                            partOrder: Number(targetPart.order),
+                            duration: globalTotal,
+                            paused: Boolean(activeVideo.paused),
+                            muted: Boolean(activeVideo.muted)
+                        }};
+                    }}
+                }} catch (_) {{}}
+            }}
+        }}
         // The full progress bar is only about one pixel per 20 seconds on a
         // six-hour replay. Once SOOP has switched to the correct part, correct
         // that pixel rounding against the active part's local currentTime.
         const correctionWindow = __soopFineCorrectionWindow(globalTotal);
-        if (Number.isFinite(landedGlobal)
+        if ((!targetPart || !activePartAfter)
+            && Number.isFinite(landedGlobal)
             && Math.abs(landedGlobal - target) <= correctionWindow) {{
             const localCurrent = Number(activeVideo.currentTime);
             const localDuration = Number(activeVideo.duration);
@@ -371,17 +532,53 @@ def build_seek_verification_script(
     seconds: int,
     *,
     allow_correction: bool = False,
+    seek_parts: tuple[VodSeekPart, ...] | None = None,
 ) -> str:
     """Verify the SOOP clock and optionally issue one local fine correction."""
     target = max(0, int(seconds))
+    part_payload = _seek_part_payload(seek_parts)
     correction_script = ""
-    prefix = _SOOP_GLOBAL_TIME_FN
     if allow_correction:
-        prefix = _PICK_VIDEO_FN + prefix
         correction_script = """
+if (targetPart && activePart
+    && Number(activePart.order) === Number(targetPart.order)
+    && video) {
+    const localTarget = target - Number(targetPart.offset);
+    const localDuration = Number(video.duration);
+    if (localTarget >= 0
+        && Number.isFinite(localDuration)
+        && localTarget <= localDuration) {
+        try {
+            video.currentTime = localTarget;
+            await new Promise((resolve) => setTimeout(resolve, 350));
+            const correctedLocal = Number(video.currentTime);
+            const correctedGlobal = Number(targetPart.offset) + correctedLocal;
+            if (Number.isFinite(correctedGlobal)
+                && Math.abs(correctedGlobal - target) <= seekTolerance) {
+                return {
+                    ok: true,
+                    strategy: 'mapped-part-fine-correction',
+                    correctionIssued: true,
+                    currentTime: correctedGlobal,
+                    localTime: correctedLocal,
+                    partOrder: Number(targetPart.order),
+                    duration: clocks.total
+                };
+            }
+            return {
+                ok: false,
+                reason: 'seek-still-pending',
+                correctionIssued: true,
+                currentTime: correctedGlobal,
+                duration: clocks.total
+            };
+        } catch (_) {}
+    }
+}
 const correctionWindow = __soopFineCorrectionWindow(clocks.total);
-if (Math.abs(clocks.current - target) <= correctionWindow) {
-    const video = __pickVod();
+if ((!targetPart || !activePart)
+    && Number.isFinite(clocks.current)
+    && Math.abs(clocks.current - target) <= correctionWindow) {
     const localCurrent = Number(video && video.currentTime);
     const localDuration = Number(video && video.duration);
     const correction = target - clocks.current;
@@ -416,14 +613,42 @@ if (Math.abs(clocks.current - target) <= correctionWindow) {
     }
 }
 """
-    return (prefix + f"""
+    return (
+        _PICK_VIDEO_FN
+        + _SOOP_GLOBAL_TIME_FN
+        + _SOOP_PART_TIME_FN
+        + f"""
 const target = {target};
+const partMap = {part_payload};
 const seekTolerance = 1.5;
 const clocks = __readSoopClocks();
+const video = __pickVod();
+const targetPart = __targetVodPart(partMap, target);
+const activePart = __activeVodPart(partMap, video, clocks);
+const mappedPartIsActive = Boolean(
+    targetPart && activePart && video
+    && Number(activePart.order) === Number(targetPart.order)
+);
+if (mappedPartIsActive) {{
+    const localCurrent = Number(video.currentTime);
+    const mappedGlobal = Number(targetPart.offset) + localCurrent;
+    if (Number.isFinite(mappedGlobal)
+        && Math.abs(mappedGlobal - target) <= seekTolerance) {{
+        return {{
+            ok: true,
+            strategy: 'mapped-part-verification',
+            currentTime: mappedGlobal,
+            localTime: localCurrent,
+            partOrder: Number(targetPart.order),
+            duration: clocks.total
+        }};
+    }}
+}}
 if (!Number.isFinite(clocks.current)) {{
     return {{ ok: false, reason: 'seek-still-pending' }};
 }}
-if (Math.abs(clocks.current - target) <= seekTolerance) {{
+if (!mappedPartIsActive
+    && Math.abs(clocks.current - target) <= seekTolerance) {{
     return {{
         ok: true,
         strategy: 'clock-verification',
@@ -438,7 +663,8 @@ return {{
     currentTime: clocks.current,
     duration: clocks.total
 }};
-""").strip()
+"""
+    ).strip()
 
 
 def build_activate_script() -> str:
@@ -755,6 +981,8 @@ class SoopReviewPlayer(QFrame):
     seek_completed = Signal(int)
     status_changed = Signal(str)
     current_time_ready = Signal(int)
+    _seek_parts_loaded = Signal(str, object)
+    _seek_parts_failed = Signal(str, str)
 
     def __init__(self, vod: Vod, parent: QWidget | None = None):
         super().__init__(parent)
@@ -778,6 +1006,11 @@ class SoopReviewPlayer(QFrame):
         self._suppress_activate = False
         self._seek_command_sent = False
         self._fine_correction_sent = False
+        self._seek_parts: tuple[VodSeekPart, ...] | None = _VOD_SEEK_PART_CACHE.get(
+            vod.vod_id
+        )
+        self._seek_parts_loading = False
+        self._seek_parts_load_failed = False
         self._fullscreen_active = False
         self._normal_geometry = None
         self._was_maximized = False
@@ -787,6 +1020,8 @@ class SoopReviewPlayer(QFrame):
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
         self._retry_timer.timeout.connect(self._attempt_seek)
+        self._seek_parts_loaded.connect(self._on_seek_parts_loaded)
+        self._seek_parts_failed.connect(self._on_seek_parts_failed)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1026,11 +1261,73 @@ class SoopReviewPlayer(QFrame):
         self._stop_playback()
         self.vod = vod
         self._duration_seconds = parse_duration_text(vod.duration_text) or 0
+        self._seek_parts = _VOD_SEEK_PART_CACHE.get(vod.vod_id)
+        self._seek_parts_loading = False
+        self._seek_parts_load_failed = False
         self.setWindowTitle(f"SOOP 검수 플레이어 · {vod.title}")
         self._loaded = False
         self._dom_loaded = False
         if was_visible:
             self.open_player()
+
+    def _ensure_seek_parts(self) -> None:
+        if self._seek_parts is not None or self._seek_parts_loading:
+            return
+        if self._seek_parts_load_failed or not self.vod.vod_id.isdigit():
+            self._seek_parts = ()
+            return
+        vod = self.vod
+        vod_id = vod.vod_id
+        self._seek_parts_loading = True
+
+        def load() -> None:
+            try:
+                source = fetch_vod_audio_source(
+                    vod,
+                    lambda _percent, _message: None,
+                    lambda: False,
+                )
+                parts = build_vod_seek_parts(source.parts)
+            except Exception as error:
+                self._seek_parts_failed.emit(vod_id, str(error))
+            else:
+                self._seek_parts_loaded.emit(vod_id, parts)
+
+        threading.Thread(
+            target=load,
+            name=f"vod-seek-parts-{vod_id}",
+            daemon=True,
+        ).start()
+
+    def _on_seek_parts_loaded(self, vod_id: str, parts: object) -> None:
+        if vod_id != self.vod.vod_id:
+            return
+        values = (
+            tuple(part for part in parts if isinstance(part, VodSeekPart))
+            if isinstance(parts, (list, tuple))
+            else ()
+        )
+        self._seek_parts = values
+        self._seek_parts_loading = False
+        self._seek_parts_load_failed = False
+        _VOD_SEEK_PART_CACHE[vod_id] = values
+        if self._pending_seconds is not None:
+            label = format_timestamp_seconds(self._pending_seconds)
+            self.time_label.setText(f"파트 확인 완료 · {label} 이동 중")
+            self._attempt_seek()
+
+    def _on_seek_parts_failed(self, vod_id: str, message: str) -> None:
+        if vod_id != self.vod.vod_id:
+            return
+        logger.warning("VOD seek part metadata failed for %s: %s", vod_id, message)
+        self._seek_parts = ()
+        self._seek_parts_loading = False
+        self._seek_parts_load_failed = True
+        if self._pending_seconds is not None:
+            self.status_changed.emit(
+                "파트 정보를 확인하지 못해 SOOP 재생 시각을 기준으로 이동합니다…"
+            )
+            self._attempt_seek()
 
     def _activate_playback(self) -> None:
         """Nudge the replay to load and play so the player is not left black."""
@@ -1068,8 +1365,15 @@ class SoopReviewPlayer(QFrame):
         self._seek_command_sent = False
         self._fine_correction_sent = False
         label = format_timestamp_seconds(value)
-        self.time_label.setText(f"이동 중 · {label}")
-        self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동합니다…")
+        self._ensure_seek_parts()
+        if self._seek_parts is None:
+            self.time_label.setText(f"파트 정보 확인 중 · {label}")
+            self.status_changed.emit(
+                f"정확한 이동을 위해 {label}의 VOD 파트 정보를 확인합니다…"
+            )
+        else:
+            self.time_label.setText(f"이동 중 · {label}")
+            self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동합니다…")
         if self._dom_loaded:
             self._attempt_seek()
         if not self._retry_timer.isActive():
@@ -1186,6 +1490,9 @@ class SoopReviewPlayer(QFrame):
             or self._seek_in_flight
         ):
             return
+        if self._seek_parts is None:
+            self._ensure_seek_parts()
+            return
         if self._seek_attempts >= 180:
             self._retry_timer.stop()
             label = format_timestamp_seconds(self._pending_seconds)
@@ -1213,9 +1520,14 @@ class SoopReviewPlayer(QFrame):
             build_seek_verification_script(
                 seconds,
                 allow_correction=not self._fine_correction_sent,
+                seek_parts=self._seek_parts,
             )
             if self._seek_command_sent
-            else build_seek_script(seconds, self._duration_seconds)
+            else build_seek_script(
+                seconds,
+                self._duration_seconds,
+                self._seek_parts,
+            )
         )
         self.web_view.evaluate_js(
             script,
@@ -1277,10 +1589,25 @@ class SoopReviewPlayer(QFrame):
         self._retry_timer.stop()
         self._seek_command_sent = False
         self._fine_correction_sent = False
-        label = format_timestamp_seconds(seconds)
-        self.time_label.setText(f"재생 위치 · {label}")
-        self.status_changed.emit(f"SOOP 영상을 {label} 지점으로 이동했습니다.")
-        self.seek_completed.emit(seconds)
+        try:
+            actual_value = float(payload.get("currentTime", seconds) or seconds)
+        except (TypeError, ValueError):
+            actual_value = float(seconds)
+        if not math.isfinite(actual_value):
+            actual_value = float(seconds)
+        actual_seconds = max(0, int(actual_value))
+        requested_label = format_timestamp_seconds(seconds)
+        actual_label = format_timestamp_seconds(actual_seconds)
+        self.time_label.setText(f"이동 완료 위치 · {actual_label}")
+        if actual_seconds == seconds:
+            self.status_changed.emit(
+                f"SOOP 영상을 {actual_label} 지점으로 이동했습니다."
+            )
+        else:
+            self.status_changed.emit(
+                f"요청 {requested_label} · 실제 {actual_label} 지점으로 이동했습니다."
+            )
+        self.seek_completed.emit(actual_seconds)
 
     def _handle_player_action(self, action: str, result: object) -> None:
         if not isinstance(result, dict) or not bool(result.get("success")):

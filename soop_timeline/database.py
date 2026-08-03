@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .models import Streamer, TimelineDocument, TimelineRevision, Vod, VodState
+from .models import (
+    ReviewFeedbackExample,
+    Streamer,
+    TimelineDocument,
+    TimelineRevision,
+    Vod,
+    VodState,
+)
 
 
 def utc_now() -> str:
@@ -79,6 +86,26 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_timeline_revisions_vod
             ON timeline_revisions(vod_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS review_feedback_drafts (
+                vod_id TEXT PRIMARY KEY REFERENCES vods(vod_id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS review_feedback_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vod_id TEXT NOT NULL REFERENCES vods(vod_id) ON DELETE CASCADE,
+                streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                before_text TEXT NOT NULL DEFAULT '',
+                after_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(vod_id, action, before_text, after_text)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_review_feedback_streamer
+            ON review_feedback_examples(streamer_id, action, id DESC);
 
             CREATE TABLE IF NOT EXISTS analysis_queue (
                 vod_id TEXT PRIMARY KEY REFERENCES vods(vod_id) ON DELETE CASCADE,
@@ -1156,6 +1183,121 @@ class Database:
             )
             for row in rows
         ]
+
+    def save_review_feedback_draft(self, vod_id: str, text: str) -> None:
+        if not text.strip():
+            return
+        self.connection.execute(
+            """
+            INSERT INTO review_feedback_drafts(vod_id, text, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(vod_id) DO UPDATE SET
+                text = excluded.text,
+                created_at = excluded.created_at
+            """,
+            (vod_id, text, utc_now()),
+        )
+        self.connection.commit()
+
+    def get_review_feedback_draft(self, vod_id: str) -> str:
+        row = self.connection.execute(
+            "SELECT text FROM review_feedback_drafts WHERE vod_id = ?",
+            (vod_id,),
+        ).fetchone()
+        return str(row["text"]) if row is not None else ""
+
+    def replace_review_feedback_examples(
+        self,
+        vod_id: str,
+        streamer_id: int,
+        examples: Iterable[tuple[str, str, str]],
+    ) -> int:
+        rows = [
+            (
+                vod_id,
+                int(streamer_id),
+                str(action).strip(),
+                str(before_text).strip(),
+                str(after_text).strip(),
+            )
+            for action, before_text, after_text in examples
+            if str(action).strip()
+            and (str(before_text).strip() or str(after_text).strip())
+        ]
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM review_feedback_examples WHERE vod_id = ?",
+                (vod_id,),
+            )
+            self.connection.executemany(
+                """
+                INSERT OR IGNORE INTO review_feedback_examples(
+                    vod_id, streamer_id, action, before_text, after_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [(*row, now) for row in rows],
+            )
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) AS count FROM review_feedback_examples WHERE vod_id = ?",
+                (vod_id,),
+            ).fetchone()["count"]
+        )
+
+    def list_review_feedback_examples(
+        self,
+        *,
+        streamer_id: int | None = None,
+        limit: int = 500,
+    ) -> list[ReviewFeedbackExample]:
+        parameters: list[object] = []
+        condition = ""
+        if streamer_id is not None:
+            condition = "WHERE streamer_id = ?"
+            parameters.append(int(streamer_id))
+        parameters.append(max(1, int(limit)))
+        rows = self.connection.execute(
+            f"""
+            SELECT id, vod_id, streamer_id, action, before_text, after_text, created_at
+            FROM review_feedback_examples
+            {condition}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return [
+            ReviewFeedbackExample(
+                id=int(row["id"]),
+                vod_id=str(row["vod_id"]),
+                streamer_id=int(row["streamer_id"]),
+                action=str(row["action"]),
+                before_text=str(row["before_text"]),
+                after_text=str(row["after_text"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def review_feedback_example_count(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM review_feedback_examples"
+        ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def review_feedback_draft_count(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM review_feedback_drafts"
+        ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def clear_review_feedback(self) -> int:
+        count = self.review_feedback_example_count()
+        with self.connection:
+            self.connection.execute("DELETE FROM review_feedback_examples")
+            self.connection.execute("DELETE FROM review_feedback_drafts")
+        return count
 
     def get_timeline_revision(self, revision_id: int) -> TimelineRevision | None:
         row = self.connection.execute(

@@ -78,3 +78,14 @@ class TimelineRevision:
     text: str
     reason: str
     created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class ReviewFeedbackExample:
+    id: int
+    vod_id: str
+    streamer_id: int
+    action: str
+    before_text: str
+    after_text: str
+    created_at: str

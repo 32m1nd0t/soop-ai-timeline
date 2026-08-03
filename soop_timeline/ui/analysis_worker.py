@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class AnalysisWorker(QObject):
-    progress_changed = Signal(int, str)
+    progress_changed = Signal(str, int, str)
     preview_changed = Signal(str, str)
     usage_changed = Signal(str)
     succeeded = Signal(str, str)
@@ -39,7 +39,11 @@ class AnalysisWorker(QObject):
         thread = QThread.currentThread()
 
         def progress(percent: int, message: str) -> None:
-            self.progress_changed.emit(max(0, min(100, percent)), message)
+            self.progress_changed.emit(
+                self.result_vod_id,
+                max(0, min(100, percent)),
+                message,
+            )
 
         def preview(stage: str, text: str) -> None:
             self.preview_changed.emit(stage, text)

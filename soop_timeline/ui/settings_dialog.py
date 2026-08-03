@@ -43,6 +43,7 @@ from ..services.preferences import (
     normalized_cache_retention,
     normalized_discovery_interval,
 )
+from ..services.review_feedback import REVIEW_FEEDBACK_ENABLED_SETTING
 from ..services.transcription import detect_whisper_runtime
 from ..services.update_checker import (
     AUTO_UPDATE_CHECK_SETTING,
@@ -136,6 +137,42 @@ class AnalysisSettingsDialog(QDialog):
         )
         self.topic_granularity_combo.setCurrentIndex(max(0, granularity_index))
         form.addRow("기본 타임라인 밀도", self.topic_granularity_combo)
+
+        self.review_feedback_check = QCheckBox(
+            "검수 완료본의 수정 사례를 다음 Gemini 분석에 반영"
+        )
+        self.review_feedback_check.setChecked(
+            database.get_setting(REVIEW_FEEDBACK_ENABLED_SETTING, "1") != "0"
+        )
+        example_count = database.review_feedback_example_count()
+        draft_count = database.review_feedback_draft_count()
+        self.review_feedback_count_label = QLabel(
+            f"저장된 수정 사례 {example_count:,}개 · 비교용 초안 {draft_count:,}개"
+        )
+        self.review_feedback_count_label.setObjectName("muted")
+        self.clear_review_feedback_button = QPushButton("학습 사례 초기화")
+        self.clear_review_feedback_button.clicked.connect(
+            self._clear_review_feedback
+        )
+        feedback_meta = QHBoxLayout()
+        feedback_meta.addWidget(self.review_feedback_count_label, 1)
+        feedback_meta.addWidget(self.clear_review_feedback_button)
+        feedback_box = QVBoxLayout()
+        feedback_box.setContentsMargins(0, 0, 0, 0)
+        feedback_box.setSpacing(4)
+        feedback_box.addWidget(self.review_feedback_check)
+        feedback_hint = QLabel(
+            "AI 초안과 검수 완료본의 차이를 로컬에 저장하고, 같은 스트리머의 "
+            "관련 사례만 Gemini 호출당 최대 5개 보냅니다. 모델 자체를 재학습하는 "
+            "기능은 아닙니다."
+        )
+        feedback_hint.setWordWrap(True)
+        feedback_hint.setObjectName("muted")
+        feedback_box.addWidget(feedback_hint)
+        feedback_box.addLayout(feedback_meta)
+        feedback_widget = QWidget()
+        feedback_widget.setLayout(feedback_box)
+        form.addRow("검수 피드백 학습", feedback_widget)
 
         self.timeline_notice_input = QPlainTextEdit(
             database.get_setting(TIMELINE_NOTICE_SETTING, DEFAULT_TIMELINE_NOTICE)
@@ -435,6 +472,37 @@ class AnalysisSettingsDialog(QDialog):
             f"캐시 항목 {removed:,}개를 삭제했습니다.",
         )
 
+    def _clear_review_feedback(self) -> None:
+        example_count = self.database.review_feedback_example_count()
+        draft_count = self.database.review_feedback_draft_count()
+        if not example_count and not draft_count:
+            QMessageBox.information(
+                self,
+                "학습 사례 없음",
+                "삭제할 검수 피드백 사례나 비교용 초안이 없습니다.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "검수 피드백 초기화",
+            f"검수 수정 사례 {example_count:,}개와 비교용 AI 초안 "
+            f"{draft_count:,}개를 모두 삭제할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.database.clear_review_feedback()
+        self.review_feedback_count_label.setText(
+            "저장된 수정 사례 0개 · 비교용 초안 0개"
+        )
+        QMessageBox.information(
+            self,
+            "검수 피드백 초기화 완료",
+            f"검수 수정 사례 {example_count:,}개와 비교용 AI 초안 "
+            f"{draft_count:,}개를 삭제했습니다.",
+        )
+
     def _connection_test_succeeded(self, message: str) -> None:
         self.connection_status.setText(f"✓ {message}")
 
@@ -474,6 +542,10 @@ class AnalysisSettingsDialog(QDialog):
         self.database.set_setting(
             "topic_granularity",
             str(self.topic_granularity_combo.currentData()),
+        )
+        self.database.set_setting(
+            REVIEW_FEEDBACK_ENABLED_SETTING,
+            "1" if self.review_feedback_check.isChecked() else "0",
         )
         self.database.set_setting(
             LIVE_AI_MODE_SETTING,
