@@ -1248,7 +1248,7 @@ class FasterWhisperTranscriber:
         )
         progress(
             0,
-            f"라이브 수신 종료 · 자막 {len(segments):,}개 · 최종 타임라인 정리 중…",
+            f"라이브 수신 종료 · 자막 {len(segments):,}개 · 누적 자막 저장 중…",
         )
         return transcript
 

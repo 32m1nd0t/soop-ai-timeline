@@ -8,8 +8,6 @@ from difflib import SequenceMatcher
 import hashlib
 import json
 from pathlib import Path
-import queue
-import threading
 from typing import Callable, Iterable
 
 from ..models import ReviewFeedbackExample, Vod
@@ -26,7 +24,6 @@ from .gemini_timeline import (
     build_overall_summary,
     deduplicate_entries,
 )
-from .preferences import LIVE_AI_MODE_SETTING, live_ai_mode
 from .review_feedback import (
     REVIEW_FEEDBACK_ENABLED_SETTING,
     REVIEW_FEEDBACK_MAX_LOADED,
@@ -58,8 +55,6 @@ from .transcription import (
 
 DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
-LIVE_SUMMARY_OVERLAP_SECONDS = 30
-LIVE_TOPIC_CONFIRMATION_SECONDS = 30
 TIMELINE_CHECKPOINT_FILENAME = "timeline.partial.json"
 LIVE_TRANSCRIPT_FILENAME = "live-transcript.json"
 LIVE_TRANSCRIPT_JOURNAL_FILENAME = "live-transcript.jsonl"
@@ -74,7 +69,6 @@ class AnalyzerConfig:
     whisper_device: str = "auto"
     gemini_api_key: str = ""
     topic_granularity: str = DEFAULT_TOPIC_GRANULARITY
-    live_ai_mode: str = "saving"
 
 
 @dataclass(slots=True, frozen=True)
@@ -212,10 +206,47 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
                     "topic_granularity",
                     DEFAULT_TOPIC_GRANULARITY,
                 ),
-                live_ai_mode=database.get_setting(LIVE_AI_MODE_SETTING, "saving"),
             ),
             review_feedback_examples=feedback_examples,
         )
+
+    @classmethod
+    def for_transcription(
+        cls,
+        database: object,
+    ) -> "LocalWhisperGeminiAnalyzer":
+        """Build a local transcription-only pipeline without AI credentials."""
+
+        return cls(
+            AnalyzerConfig(
+                whisper_model=database.get_setting(
+                    "whisper_model",
+                    DEFAULT_WHISPER_MODEL,
+                ),
+                whisper_device=database.get_setting("whisper_device", "auto"),
+            )
+        )
+
+    @classmethod
+    def for_live_transcription(
+        cls,
+        database: object,
+    ) -> "LocalWhisperGeminiAnalyzer":
+        """Build the live-only local transcription pipeline without AI credentials."""
+
+        return cls.for_transcription(database)
+
+    @property
+    def transcription_available(self) -> bool:
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @property
+    def transcription_unavailable_reason(self) -> str:
+        return "" if self.transcription_available else "faster-whisper가 설치되지 않았습니다."
 
     @property
     def available(self) -> bool:
@@ -664,30 +695,23 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         finalize_requested: CancelCallback | None = None,
         resume_document: str = "",
     ) -> str:
-        if not self.available:
-            raise RuntimeError(self.unavailable_reason)
+        if not self.transcription_available:
+            raise RuntimeError(self.transcription_unavailable_reason)
         from .live_stream import LiveAudioSource
 
         if not isinstance(source, LiveAudioSource):
             raise RuntimeError("라이브 오디오 소스 형식이 올바르지 않습니다.")
+        del resume_document
+        self.last_usage_summary = ""
         transcriber = self._transcriber_factory(
             self.config.whisper_model,
             self.config.whisper_device,
         )
-        generator = self._new_generator()
-        self._preflight(generator, progress, stop_requested)
         prompt = build_whisper_prompt(vod, live=True)
-        live_mode = live_ai_mode(self.config.live_ai_mode)
         should_finalize = finalize_requested or (lambda: True)
-
-        def fast_stop_requested() -> bool:
-            return stop_requested() and not should_finalize()
-
         progress(
             0,
-            f"라이브 Gemini 모드: {live_mode.label} · "
-            f"예상 시간당 약 {live_mode.estimated_calls_per_hour}회 + "
-            "종료 시 타임라인 정리·전체 제목 각 1회",
+            "라이브는 Gemini를 사용하지 않고 로컬 Whisper 자막만 저장합니다.",
         )
         # Live timestamps remain compatible if the user changes Whisper models
         # between launches, so never discard an earlier live capture here.
@@ -695,247 +719,37 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         prior_segments = (
             list(prior_transcript.segments) if prior_transcript is not None else []
         )
-        candidates, titles = _restore_live_timeline(
-            resume_document,
-            prior_segments,
-        )
-        summary_floor = source.runtime_seconds
-        last_summary_end = source.runtime_seconds
-        next_summary_at = source.runtime_seconds + live_mode.first_summary_seconds
-        if prior_segments and prior_transcript is not None:
-            summary_floor = prior_segments[0].start
-            prior_end = max(
-                float(prior_transcript.duration_seconds),
-                prior_segments[-1].end,
-            )
-            saved_summary_end = _load_live_summary_watermark(vod)
-            if saved_summary_end is not None:
-                last_summary_end = max(
-                    summary_floor,
-                    min(saved_summary_end, prior_end),
-                )
-            elif candidates:
-                # Older releases did not persist a summary watermark. Live
-                # requests normally run once per configured interval, so
-                # replay only a bounded tail instead of an entire long topic.
-                inferred_tail = max(
-                    300.0,
-                    float(live_mode.interval_seconds)
-                    + LIVE_TOPIC_CONFIRMATION_SECONDS
-                    + LIVE_SUMMARY_OVERLAP_SECONDS,
-                )
-                last_summary_end = max(summary_floor, prior_end - inferred_tail)
-            else:
-                last_summary_end = summary_floor
-            if prior_end > last_summary_end + 10:
-                # The first post-reconnect Whisper update also summarizes any
-                # durable text that had not reached Gemini before shutdown.
-                next_summary_at = source.runtime_seconds
         transcript_journal = _LiveTranscriptJournal(
             vod,
             source,
             resume=prior_transcript,
         )
-
-        def emit_timeline() -> None:
-            if preview is None or not candidates:
-                return
-            preview(
-                "live_timeline",
-                GeneratedTimeline(
-                    content_title=build_overall_summary(
-                        vod,
-                        titles,
-                        candidates,
-                    ),
-                    entries=deduplicate_entries(candidates),
-                ).to_document(),
-            )
-
-        def summarize_snapshot(snapshot: Transcript, *, force: bool = False) -> None:
-            nonlocal candidates, last_summary_end, next_summary_at
-            if fast_stop_requested() or not snapshot.segments:
-                return
-            latest_end = snapshot.segments[-1].end
-            if not force and latest_end < next_summary_at:
-                return
-            stable_end = (
-                latest_end
-                if force
-                else latest_end - LIVE_TOPIC_CONFIRMATION_SECONDS
-            )
-            if stable_end <= last_summary_end and candidates:
-                next_summary_at = latest_end + live_mode.interval_seconds
-                return
-            window_start = max(
-                summary_floor,
-                last_summary_end - LIVE_SUMMARY_OVERLAP_SECONDS,
-            )
-            window = [
-                segment
-                for segment in snapshot.segments
-                if segment.end >= window_start and segment.start <= stable_end
-            ]
-            if not window:
-                return
-            progress(
-                0,
-                f"라이브 수신을 계속하며 {self.provider_name}이(가) "
-                f"{format_timestamp(window[0].start)}~"
-                f"{format_timestamp(window[-1].end)} 구간을 정리합니다…",
-            )
-            try:
-                partial = generator.summarize_live_window(
-                    vod,
-                    window,
-                    fast_stop_requested,
-                    previous_entries=deduplicate_entries(candidates)[-8:],
-                )
-                if fast_stop_requested():
-                    return
-            except AnalysisCancelled:
-                if fast_stop_requested():
-                    return
-                raise
-            except Exception as error:
-                next_summary_at = latest_end + min(
-                    live_mode.first_summary_seconds,
-                    live_mode.interval_seconds,
-                )
-                progress(
-                    0,
-                    f"실시간 자막은 계속 작성 중 · {self.provider_name} 임시 정리 재시도 예정: {error}",
-                )
-                return
-            if partial.content_title:
-                titles.append(partial.content_title)
-            candidates = deduplicate_entries(candidates + partial.entries)
-            last_summary_end = stable_end
-            next_summary_at = latest_end + live_mode.interval_seconds
-            emit_timeline()
-            _save_live_summary_watermark(vod, last_summary_end)
-
-        # Whisper stays in its own consumer thread. Gemini can therefore wait,
-        # retry, or time out without stopping the live HLS decoder and losing
-        # audio after the small three-chunk capture buffer fills.
-        updates: queue.Queue[object] = queue.Queue()
-        transcription_done = object()
-        transcription_result: list[Transcript] = []
-        transcription_failure: list[BaseException] = []
-        internal_stop = threading.Event()
         segment_offset = len(prior_segments)
-        live_segments: list[TranscriptSegment] = list(prior_segments)
-        live_language = (
-            prior_transcript.language if prior_transcript is not None else "ko"
-        )
-        live_duration = (
-            float(prior_transcript.duration_seconds)
-            if prior_transcript is not None
-            else 0.0
-        )
-
-        def effective_stop_requested() -> bool:
-            return internal_stop.is_set() or stop_requested()
 
         def on_update(update: LiveTranscriptUpdate | Transcript) -> None:
             if isinstance(update, LiveTranscriptUpdate):
-                normalized: LiveTranscriptUpdate | Transcript = (
-                    _offset_live_update(update, segment_offset)
-                )
+                normalized = _offset_live_update(update, segment_offset)
                 transcript_journal.append_update(normalized)
             else:
                 current = _offset_live_transcript(update, segment_offset)
                 normalized = _merge_live_transcripts(prior_transcript, current)
                 transcript_journal.append(normalized)
-            updates.put(normalized)
 
-        def run_transcription() -> None:
-            try:
-                result = transcriber.transcribe_live(
-                    source,
-                    initial_prompt=prompt,
-                    progress=progress,
-                    stop_requested=effective_stop_requested,
-                    preview=preview,
-                    update=on_update,
-                    reconnect_gap=lambda start, end: record_live_reconnect_gap(
-                        vod,
-                        start,
-                        end,
-                    ),
-                )
-                transcription_result.append(result)
-            except BaseException as error:
-                transcription_failure.append(error)
-            finally:
-                updates.put(transcription_done)
-
-        transcription_thread = threading.Thread(
-            target=run_transcription,
-            name=f"soop-live-whisper-{source.broadcast_no}",
-            daemon=True,
+        current_result = transcriber.transcribe_live(
+            source,
+            initial_prompt=prompt,
+            progress=progress,
+            stop_requested=stop_requested,
+            preview=preview,
+            update=on_update,
+            reconnect_gap=lambda start, end: record_live_reconnect_gap(
+                vod,
+                start,
+                end,
+            ),
         )
-        transcription_thread.start()
-
-        reached_end = False
-
-        def apply_update(update: object) -> None:
-            nonlocal live_language, live_duration
-            if isinstance(update, LiveTranscriptUpdate):
-                live_segments.extend(update.segments)
-                live_language = update.language or live_language
-                live_duration = max(live_duration, update.duration_seconds)
-            elif isinstance(update, Transcript):
-                # Compatibility for third-party/fake transcribers that still
-                # provide cumulative snapshots.
-                live_segments[:] = update.segments
-                live_language = update.language or live_language
-                live_duration = max(live_duration, update.duration_seconds)
-
-        try:
-            while not reached_end:
-                message = updates.get()
-                if message is transcription_done:
-                    reached_end = True
-                else:
-                    apply_update(message)
-
-                # Coalesce updates accumulated while a Gemini request was in
-                # flight, so only the newest due snapshot is summarized.
-                while not reached_end:
-                    try:
-                        message = updates.get_nowait()
-                    except queue.Empty:
-                        break
-                    if message is transcription_done:
-                        reached_end = True
-                    else:
-                        apply_update(message)
-
-                if (
-                    not reached_end
-                    and not fast_stop_requested()
-                    and live_segments
-                    and live_segments[-1].end >= next_summary_at
-                ):
-                    summarize_snapshot(
-                        Transcript(
-                            model=self.config.whisper_model,
-                            language=live_language,
-                            duration_seconds=live_duration,
-                            segments=list(live_segments),
-                        )
-                    )
-        finally:
-            internal_stop.set()
-            transcription_thread.join(timeout=12.0)
-
-        if transcription_failure:
-            raise transcription_failure[0]
-        if not transcription_result:
-            raise RuntimeError("라이브 음성 인식 작업이 결과 없이 종료되었습니다.")
         current_transcript = _offset_live_transcript(
-            transcription_result[0],
+            current_result,
             segment_offset,
         )
         transcript = _merge_live_transcripts(prior_transcript, current_transcript)
@@ -947,50 +761,15 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
             raise RuntimeError("라이브 방송에서 인식 가능한 음성을 찾지 못했습니다.")
         if not should_finalize():
             raise AnalysisCancelled(
-                "프로그램 종료를 위해 새 Gemini 최종 요청 없이 라이브 자막만 저장했습니다."
+                "프로그램 종료를 위해 라이브 자막을 저장했습니다."
             )
         transcript_journal.finalize(transcript)
-
-        latest_end = transcript.segments[-1].end
-        if not candidates or latest_end > last_summary_end + 10:
-            summarize_snapshot(transcript, force=True)
-        if not candidates:
-            progress(
-                0,
-                f"누적 자막 전체를 {self.provider_name}이(가) 최종 타임라인으로 정리합니다…",
-            )
-            fallback = self._generate_with_checkpoint(
-                generator,
-                vod,
-                transcript,
-                progress,
-                fast_stop_requested,
-                None,
-                granularity=self.config.topic_granularity,
-            )
-            if preview is not None:
-                preview("live_timeline", fallback.to_document())
-            self._capture_usage(generator)
-            _clear_live_summary_watermark(vod)
-            return fallback.to_document()
-
-        progress(0, "라이브 타임라인의 중복과 전체 제목을 최종 정리합니다…")
-        final = generator.finalize_live_entries(
-            vod,
-            titles,
-            candidates,
-            transcript.segments,
-            fast_stop_requested,
-        )
-        if fast_stop_requested():
-            raise AnalysisCancelled("분석을 취소했습니다.")
+        document = transcript_preview_document(transcript.segments)
         if preview is not None:
-            preview("live_timeline", final.to_document())
-        self._capture_usage(generator)
-        suffix = f" · {self.last_usage_summary}" if self.last_usage_summary else ""
-        progress(100, f"라이브 타임라인 생성이 완료되었습니다{suffix}.")
+            preview("live_transcript", document)
+        progress(100, f"라이브 자막 {len(transcript.segments):,}개 구간을 저장했습니다.")
         _clear_live_summary_watermark(vod)
-        return final.to_document()
+        return document
 
 
 LocalWhisperAIAnalyzer = LocalWhisperGeminiAnalyzer

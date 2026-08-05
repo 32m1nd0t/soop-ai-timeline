@@ -958,34 +958,29 @@ class MainWindow(QMainWindow):
             return
 
         if parsed.kind == "live":
-            if (
-                self._analysis_jobs
-                or self._analysis_queue
-                or self._style_jobs
-                or self._line_rewrite_jobs
-                or self._live_jobs
-                or self._regroup_jobs
-                or self._pretranscribe_jobs
-                or self._pretranscribe_queue
-            ):
+            if self._live_transcription_jobs_active():
                 QMessageBox.information(
                     self,
-                    "AI 작업 진행 중",
+                    "음성 인식 작업 진행 중",
                     self._ai_busy_message(
-                        "이 작업이 끝난 뒤 라이브 실시간 분석을 시작하세요."
+                        "이 작업이 끝난 뒤 라이브 자막 추출을 시작하세요."
                     ),
                 )
                 return
-            self.analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
-            if not self.analyzer.available:
+            live_analyzer = LocalWhisperGeminiAnalyzer.for_live_transcription(
+                self.database
+            )
+            if not live_analyzer.transcription_available:
                 QMessageBox.information(
                     self,
-                    "AI 설정 필요",
-                    self.analyzer.unavailable_reason,
+                    "음성 인식 설정 필요",
+                    live_analyzer.transcription_unavailable_reason,
                 )
                 self.open_analysis_settings()
-                self.analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
-                if not self.analyzer.available:
+                live_analyzer = LocalWhisperGeminiAnalyzer.for_live_transcription(
+                    self.database
+                )
+                if not live_analyzer.transcription_available:
                     return
 
         thread = QThread(self)
@@ -1073,19 +1068,10 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(result, LiveAudioSource):
-            if (
-                self._analysis_jobs
-                or self._analysis_queue
-                or self._style_jobs
-                or self._line_rewrite_jobs
-                or self._live_jobs
-                or self._regroup_jobs
-                or self._pretranscribe_jobs
-                or self._pretranscribe_queue
-            ):
+            if self._live_transcription_jobs_active():
                 QMessageBox.information(
                     self,
-                    "AI 작업 진행 중",
+                    "음성 인식 작업 진행 중",
                     self._ai_busy_message(
                         "작업 상태가 바뀌어 라이브 항목을 만들지 않았습니다. "
                         "현재 작업이 끝난 뒤 다시 연결하세요."
@@ -1312,10 +1298,14 @@ class MainWindow(QMainWindow):
         editor = TimelineDocumentEditor(
             vod,
             text,
-            self.analyzer.available,
-            self.analyzer.unavailable_reason,
-            self.styler.available,
-            self.styler.unavailable_reason,
+            analyzer_available=self.analyzer.available,
+            analyzer_unavailable_reason=self.analyzer.unavailable_reason,
+            transcription_available=self.analyzer.transcription_available,
+            transcription_unavailable_reason=(
+                self.analyzer.transcription_unavailable_reason
+            ),
+            style_available=self.styler.available,
+            style_unavailable_reason=self.styler.unavailable_reason,
         )
         if vod.linked_vod_id:
             replay = self.database.get_vod(vod.linked_vod_id)
@@ -1325,6 +1315,7 @@ class MainWindow(QMainWindow):
         editor.memo_changed.connect(self._save_vod_memo)
         editor.review_completed.connect(self._mark_review_complete)
         editor.analysis_requested.connect(self.start_analysis)
+        editor.transcription_requested.connect(self.start_transcription)
         editor.analysis_cancel_requested.connect(self._cancel_or_dequeue)
         editor.live_reconnect_requested.connect(self.reconnect_live_session)
         editor.reanalyze_as_vod_requested.connect(self.reanalyze_live_as_vod)
@@ -1346,7 +1337,7 @@ class MainWindow(QMainWindow):
         document: str,
         *,
         status_message: str = (
-            "전체 다시보기 분석 완료 · 라이브 분석본은 버전 기록에 보존했습니다."
+            "전체 다시보기 분석 완료 · 라이브 자막 기록은 버전 기록에 보존했습니다."
         ),
     ) -> TimelineDocumentEditor | None:
         live_editor = self._editor_tabs.get(live_vod_id)
@@ -1631,7 +1622,7 @@ class MainWindow(QMainWindow):
             return
 
         if vod_id in self._analysis_queue:
-            if vod_id in self._pretranscribe_jobs:
+            if vod_id in getattr(self, "_pretranscribe_jobs", {}):
                 message = "FW 자막추출 중 · 완료 후 Gemini 분석을 시작합니다."
             else:
                 queue_position = self._analysis_queue.index(vod_id) + 1
@@ -1640,6 +1631,23 @@ class MainWindow(QMainWindow):
                     "앞선 작업이 끝나면 자동으로 시작합니다."
                 )
             editor.set_analysis_queued(message)
+            return
+
+        pretranscribe_jobs = getattr(self, "_pretranscribe_jobs", {})
+        pretranscribe_queue = getattr(self, "_pretranscribe_queue", [])
+        if vod_id in pretranscribe_jobs:
+            editor.set_transcription_running(
+                True,
+                percent=0,
+                message="FW 텍스트 추출 중 · Gemini는 사용하지 않습니다.",
+            )
+            return
+        if vod_id in pretranscribe_queue:
+            editor.set_transcription_running(
+                True,
+                queued=True,
+                message="FW 텍스트 추출 대기 중 · Gemini는 사용하지 않습니다.",
+            )
             return
 
         auxiliary_job = self._active_auxiliary_ai_job(vod_id)
@@ -1651,6 +1659,8 @@ class MainWindow(QMainWindow):
 
         if editor._analysis_running:
             editor.set_analysis_running(False)
+        if getattr(editor, "_transcription_running", False):
+            editor.set_transcription_running(False)
         if editor._auxiliary_ai_running:
             editor.set_auxiliary_ai_running(False)
 
@@ -2028,6 +2038,10 @@ class MainWindow(QMainWindow):
             editor.set_analyzer_availability(
                 self.analyzer.available,
                 self.analyzer.unavailable_reason,
+            )
+            editor.set_transcription_availability(
+                self.analyzer.transcription_available,
+                self.analyzer.transcription_unavailable_reason,
             )
             editor.set_style_availability(
                 self.styler.available,
@@ -2428,9 +2442,6 @@ class MainWindow(QMainWindow):
         if (
             self._analysis_jobs
             or self._live_jobs
-            or self._style_jobs
-            or self._line_rewrite_jobs
-            or self._regroup_jobs
             or self._manual_link_job is not None
         ):
             self._schedule_live_reconnect_retry(1_500)
@@ -2450,18 +2461,18 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._resume_analysis_queue_if_idle)
             return
 
-        analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
-        if not analyzer.available:
+        analyzer = LocalWhisperGeminiAnalyzer.for_live_transcription(self.database)
+        if not analyzer.transcription_available:
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
                 editor.set_live_reconnect_pending(True)
                 editor.status_label.setText(
-                    "라이브 재연결 대기 · AI 분석 설정을 확인하세요: "
-                    f"{analyzer.unavailable_reason}"
+                    "라이브 재연결 대기 · 음성 인식 설정을 확인하세요: "
+                    f"{analyzer.transcription_unavailable_reason}"
                 )
             self.status_label.setText(
-                "라이브 자동 재연결 대기 · AI 분석 설정을 확인하세요: "
-                f"{analyzer.unavailable_reason}"
+                "라이브 자동 재연결 대기 · 음성 인식 설정을 확인하세요: "
+                f"{analyzer.transcription_unavailable_reason}"
             )
             self._schedule_live_reconnect_retry(60_000)
             return
@@ -2607,11 +2618,11 @@ class MainWindow(QMainWindow):
                     )
                 else:
                     self.status_label.setText(
-                        "기존 라이브 분석 기록과 자막 캐시에 자동으로 다시 연결했습니다."
+                        "기존 라이브 자막 기록과 캐시에 자동으로 다시 연결했습니다."
                     )
                 return
 
-        failure = error or "라이브 분석 작업을 다시 시작하지 못했습니다."
+        failure = error or "라이브 자막 추출을 다시 시작하지 못했습니다."
         if self._is_terminal_live_reconnect_error(failure):
             self._finish_unavailable_live_session(vod_id, failure)
             return
@@ -2784,7 +2795,69 @@ class MainWindow(QMainWindow):
         elif self._pretranscribe_queue:
             QTimer.singleShot(0, self._resume_pretranscribe_if_idle)
 
-    # -- Background auto faster-whisper (no Gemini) --------------------------
+    @Slot(str)
+    def start_transcription(self, vod_id: str) -> None:
+        """Queue a user-requested faster-whisper pass without Gemini."""
+
+        vod = self.database.get_vod(vod_id)
+        editor = self._editor_tabs.get(vod_id)
+        if vod is None or editor is None or vod.source_kind == "live":
+            return
+        if load_cached_transcript(vod) is not None:
+            self._refresh_editor_cache_state(vod_id)
+            editor.status_label.setText(
+                "저장된 Whisper 자막이 이미 있습니다. ‘저장 자막 보기’에서 확인하세요."
+            )
+            return
+        if vod_id in self._pretranscribe_jobs:
+            editor.set_transcription_running(
+                True,
+                percent=0,
+                message="FW 텍스트 추출이 이미 진행 중입니다.",
+            )
+            return
+        if vod_id in self._pretranscribe_queue:
+            editor.set_transcription_running(
+                True,
+                queued=True,
+                message="FW 텍스트 추출 대기 중입니다.",
+            )
+            return
+        if (
+            self._active_analysis_target_id(vod_id) is not None
+            or vod_id in self._analysis_queue
+            or self._active_auxiliary_ai_job(vod_id) is not None
+        ):
+            editor.status_label.setText(
+                self._ai_busy_message(
+                    "이 영상의 현재 작업이 끝난 뒤 텍스트만 추출할 수 있습니다."
+                )
+            )
+            return
+
+        analyzer = LocalWhisperGeminiAnalyzer.for_transcription(self.database)
+        if not analyzer.transcription_available:
+            QMessageBox.information(
+                self,
+                "음성 인식 설정 필요",
+                analyzer.transcription_unavailable_reason,
+            )
+            return
+
+        self._pretranscribe_attempted_ids.discard(vod_id)
+        self._pretranscribe_queue.append(vod_id)
+        editor.set_transcription_running(
+            True,
+            queued=True,
+            message="FW 텍스트 추출 대기 중 · Gemini는 사용하지 않습니다.",
+        )
+        self.status_label.setText(
+            f"FW 텍스트 추출 대기열에 추가했습니다: {vod.title}"
+        )
+        self.load_vods()
+        self._resume_pretranscribe_if_idle()
+
+    # -- Background/manual faster-whisper (no Gemini) ------------------------
     def _enqueue_auto_processing(self) -> None:
         """Act on VODs found in the latest discovery run per the auto setting."""
         mode = normalized_auto_analyze_mode(
@@ -2872,7 +2945,7 @@ class MainWindow(QMainWindow):
                 self._pretranscribe_queue.remove(vod_id)
             QTimer.singleShot(0, self._resume_pretranscribe_if_idle)
             return
-        analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
+        analyzer = LocalWhisperGeminiAnalyzer.for_transcription(self.database)
         reusable_live_vods: tuple[Vod, ...] = ()
         if vod.live_broadcast_no:
             reusable_live_vods = tuple(
@@ -2897,10 +2970,18 @@ class MainWindow(QMainWindow):
         self._pretranscribe_attempted_ids.add(vod_id)
         self._pretranscribe_jobs[vod_id] = (thread, worker)
         self.status_label.setText(
-            "FW 자막추출 병렬 실행 "
+            "FW 자막추출 실행 "
             f"{len(self._pretranscribe_jobs)}/{self._MAX_CONCURRENT_PRETRANSCRIBES}"
             f" · Gemini 미사용: {vod.title}"
         )
+        if vod_id not in self._analysis_queue:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_transcription_running(
+                    True,
+                    percent=0,
+                    message="FW 텍스트 추출 시작 · Gemini는 사용하지 않습니다.",
+                )
         self.load_vods()
         thread.start()
 
@@ -2911,7 +2992,7 @@ class MainWindow(QMainWindow):
         message: str,
     ) -> None:
         self.status_label.setText(
-            "FW 자막추출 병렬 실행 "
+            "FW 자막추출 실행 "
             f"{len(self._pretranscribe_jobs)}/{self._MAX_CONCURRENT_PRETRANSCRIBES}"
             f" · {percent}% · Gemini 미사용 · {message}"
         )
@@ -2921,6 +3002,14 @@ class MainWindow(QMainWindow):
                 editor.set_analysis_queued(
                     f"FW 자막추출 {percent}% · 완료 후 Gemini 분석을 시작합니다. · {message}",
                     percent,
+                )
+        else:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_transcription_running(
+                    True,
+                    percent=percent,
+                    message=f"FW 텍스트 추출 {percent}% · {message}",
                 )
 
     def _pretranscribe_succeeded(self, vod_id: str) -> None:
@@ -2940,16 +3029,40 @@ class MainWindow(QMainWindow):
                 )
         else:
             self.status_label.setText(f"백그라운드 FW 자막추출 완료{tail}")
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_transcription_running(False)
+                editor.status_label.setText(
+                    "FW 텍스트 추출 완료 · ‘저장 자막 보기’에서 확인할 수 있습니다."
+                )
 
     def _pretranscribe_failed(self, vod_id: str, message: str) -> None:
         if vod_id in self._pretranscribe_queue:
             self._pretranscribe_queue.remove(vod_id)
         logger.warning("Auto transcribe failed for %s: %s", vod_id, message)
+        if vod_id not in self._analysis_queue:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                editor.set_transcription_running(False)
+                editor.status_label.setText(f"FW 텍스트 추출 실패: {message}")
+            self.status_label.setText(f"FW 텍스트 추출 실패: {message}")
 
     def _pretranscribe_cancelled(self, vod_id: str) -> None:
         # Interrupted (usually by a manual job). Leave it at the front of the
         # queue so it resumes from its partial capture once things are idle.
         self._pretranscribe_attempted_ids.discard(vod_id)
+        if vod_id not in self._analysis_queue:
+            editor = self._editor_tabs.get(vod_id)
+            if editor is not None:
+                if vod_id in self._pretranscribe_queue:
+                    editor.set_transcription_running(
+                        True,
+                        queued=True,
+                        message="FW 텍스트 추출이 잠시 중단되어 다시 대기합니다.",
+                    )
+                else:
+                    editor.set_transcription_running(False)
+                    editor.status_label.setText("FW 텍스트 추출을 취소했습니다.")
 
     def _pretranscribe_thread_finished(self) -> None:
         thread = self.sender()
@@ -3068,7 +3181,7 @@ class MainWindow(QMainWindow):
             return
         self.start_analysis(
             replay.vod_id,
-            revision_reason="전체 다시보기 재분석 전 · 라이브 분석본",
+            revision_reason="전체 다시보기 재분석 전 · 라이브 자막 기록",
             reusable_live_vods=tuple(reusable_live_vods),
         )
 
@@ -3327,17 +3440,9 @@ class MainWindow(QMainWindow):
     ) -> bool:
         if getattr(self, "_close_after_analysis", False):
             return False
-        if (
-            self._analysis_jobs
-            or (self._analysis_queue and not automatic_resume)
-            or self._style_jobs
-            or self._line_rewrite_jobs
-            or self._live_jobs
-            or self._regroup_jobs
-            or self._pretranscribe_jobs
-        ):
+        if self._live_transcription_jobs_active():
             message = self._ai_busy_message(
-                "이 작업이 끝난 뒤 라이브 분석을 시작할 수 있습니다."
+                "이 작업이 끝난 뒤 라이브 자막 추출을 시작할 수 있습니다."
             )
             if automatic_resume:
                 logger.info("Deferred live auto resume for %s: %s", vod_id, message)
@@ -3346,16 +3451,17 @@ class MainWindow(QMainWindow):
             return False
         vod = self.database.get_vod(vod_id)
         editor = self._editor_tabs.get(vod_id)
-        analyzer = LocalWhisperGeminiAnalyzer.from_database(self.database)
+        analyzer = LocalWhisperGeminiAnalyzer.for_live_transcription(self.database)
         if vod is None or editor is None:
             return False
-        if not analyzer.available:
+        if not analyzer.transcription_available:
             if automatic_resume:
                 self.status_label.setText(
-                    f"라이브 자동 재연결 대기: {analyzer.unavailable_reason}"
+                    "라이브 자동 재연결 대기: "
+                    f"{analyzer.transcription_unavailable_reason}"
                 )
             else:
-                self._manual_link_failed(analyzer.unavailable_reason)
+                self._manual_link_failed(analyzer.transcription_unavailable_reason)
             return False
 
         thread = QThread(self)
@@ -3386,10 +3492,10 @@ class MainWindow(QMainWindow):
         editor.set_analysis_progress(
             0,
             "라이브 연결 완료 · 방송 "
-            f"{format_timestamp(source.runtime_seconds)}부터 실시간 분석을 시작합니다…",
+            f"{format_timestamp(source.runtime_seconds)}부터 실시간 자막을 추출합니다…",
         )
         self.status_label.setText(
-            f"라이브 실시간 분석 시작: {source.streamer_name} · "
+            f"라이브 실시간 자막 추출 시작: {source.streamer_name} · "
             f"{format_timestamp(source.runtime_seconds)}"
         )
         self.load_vods()
@@ -3418,12 +3524,6 @@ class MainWindow(QMainWindow):
         if editor is None:
             return
         editor.apply_live_update(stage, text)
-        if stage == "live_timeline":
-            self.database.save_timeline(
-                vod_id,
-                text,
-                VodState.ANALYZING.value,
-            )
 
     @Slot(str, str)
     def _live_succeeded(self, vod_id: str, document: str) -> None:
@@ -3433,9 +3533,8 @@ class MainWindow(QMainWindow):
             editor.apply_live_result(document)
         self.database.save_timeline(vod_id, document, VodState.REVIEW.value)
         self.database.set_vod_state(vod_id, VodState.REVIEW.value)
-        self._save_review_feedback_draft(vod_id, document)
         self.status_label.setText(
-            "라이브 수신과 AI 최종 타임라인 정리가 완료되었습니다."
+            "라이브 수신과 로컬 Whisper 자막 저장이 완료되었습니다."
         )
         self._refresh_editor_cache_state(vod_id)
         self.load_vods()
@@ -3480,13 +3579,13 @@ class MainWindow(QMainWindow):
                 editor.text(),
                 VodState.FAILED.value,
             )
-            editor.status_label.setText(f"라이브 분석 실패: {message}")
+            editor.status_label.setText(f"라이브 자막 추출 실패: {message}")
         self.database.set_vod_state(vod_id, VodState.FAILED.value)
         self._refresh_editor_cache_state(vod_id)
-        self.status_label.setText("라이브 실시간 분석에 실패했습니다.")
+        self.status_label.setText("라이브 실시간 자막 추출에 실패했습니다.")
         self.load_vods()
         self._schedule_replay_link_check(vod_id)
-        QMessageBox.critical(self, "라이브 분석 실패", message)
+        QMessageBox.critical(self, "라이브 자막 추출 실패", message)
 
     @Slot(str)
     def _live_cancelled(self, vod_id: str) -> None:
@@ -3496,7 +3595,7 @@ class MainWindow(QMainWindow):
         editor = self._editor_tabs.get(vod_id)
         if editor is not None:
             editor.set_live_running(False)
-            editor.status_label.setText("라이브 분석을 중단했습니다.")
+            editor.status_label.setText("라이브 자막 추출을 중단했습니다.")
             self.database.save_timeline(
                 vod_id,
                 editor.text(),
@@ -3529,29 +3628,10 @@ class MainWindow(QMainWindow):
         editor = self._editor_tabs.get(vod_id)
         if editor is None:
             return
-        if (
-            self._analysis_jobs
-            or self._analysis_queue
-            or self._live_jobs
-            or self._line_rewrite_jobs
-        ):
+        if self._auxiliary_ai_jobs_active():
             editor.status_label.setText(
                 self._ai_busy_message(
                     "이 작업이 끝난 뒤 문체 교정을 시작할 수 있습니다."
-                )
-            )
-            return
-        if self._regroup_jobs:
-            editor.status_label.setText(
-                self._ai_busy_message(
-                    "이 작업이 끝난 뒤 문체 교정을 시작할 수 있습니다."
-                )
-            )
-            return
-        if self._style_jobs:
-            editor.status_label.setText(
-                self._ai_busy_message(
-                    "이 작업이 끝난 뒤 다른 문체 교정을 시작할 수 있습니다."
                 )
             )
             return
@@ -3656,14 +3736,7 @@ class MainWindow(QMainWindow):
         if vod_id in self._line_rewrite_jobs:
             editor.status_label.setText("이미 이 탭에서 줄 변환이 진행 중입니다.")
             return
-        if (
-            self._analysis_jobs
-            or self._analysis_queue
-            or self._live_jobs
-            or self._regroup_jobs
-            or self._style_jobs
-            or self._line_rewrite_jobs
-        ):
+        if self._auxiliary_ai_jobs_active():
             editor.status_label.setText(
                 self._ai_busy_message(
                     "이 작업이 끝난 뒤 한 줄 AI 변환을 시작할 수 있습니다."
@@ -3764,14 +3837,7 @@ class MainWindow(QMainWindow):
         vod = self.database.get_vod(vod_id)
         if editor is None or vod is None:
             return
-        if (
-            self._analysis_jobs
-            or self._analysis_queue
-            or self._live_jobs
-            or self._style_jobs
-            or self._line_rewrite_jobs
-            or self._regroup_jobs
-        ):
+        if self._auxiliary_ai_jobs_active():
             editor.status_label.setText(
                 self._ai_busy_message(
                     "이 작업이 끝난 뒤 주제 다시 묶기를 시작할 수 있습니다."
@@ -3899,7 +3965,7 @@ class MainWindow(QMainWindow):
             if editor is not None:
                 editor.request_live_stop()
             self.status_label.setText(
-                "라이브 종료 요청됨 · 남은 자막과 AI 최종 타임라인을 정리합니다…"
+                "라이브 종료 요청됨 · 남은 자막을 저장합니다…"
             )
             return
         target_vod_id = self._active_analysis_target_id(vod_id)
@@ -3943,7 +4009,7 @@ class MainWindow(QMainWindow):
                 self.database.create_timeline_revision(
                     source_vod_id,
                     live_text,
-                    "라이브 분석본 · 전체 다시보기 재분석 전",
+                    "라이브 자막 기록 · 전체 다시보기 재분석 전",
                 )
             self.database.save_timeline(
                 source_vod_id,
@@ -4121,7 +4187,9 @@ class MainWindow(QMainWindow):
                 )
             )
         for vod_id in self._live_jobs:
-            candidates.append(("라이브 실시간 분석", {vod_id}, vod_id))
+            candidates.append(
+                ("라이브 자막 추출(Gemini 미사용)", {vod_id}, vod_id)
+            )
         for vod_id in self._style_jobs:
             candidates.append(("AI 문체 교정", {vod_id}, vod_id))
         for vod_id in self._line_rewrite_jobs:
@@ -4182,6 +4250,26 @@ class MainWindow(QMainWindow):
         if current:
             return f"현재 AI 작업: {current}\n{instruction}"
         return f"다른 AI 작업이 진행 중입니다.\n{instruction}"
+
+    def _live_transcription_jobs_active(self) -> bool:
+        """Only local Whisper work conflicts with starting another live capture."""
+
+        return bool(
+            self._analysis_jobs
+            or self._live_jobs
+            or self._pretranscribe_jobs
+        )
+
+    def _auxiliary_ai_jobs_active(self) -> bool:
+        """Gemini work stays serialized but does not conflict with live Whisper."""
+
+        return bool(
+            self._analysis_jobs
+            or self._analysis_queue
+            or self._style_jobs
+            or self._line_rewrite_jobs
+            or self._regroup_jobs
+        )
 
     def _vod_active_job(self, vod_id: str) -> bool:
         return (
@@ -4314,9 +4402,15 @@ class MainWindow(QMainWindow):
             if job is not None:
                 job[0].requestInterruption()
             getattr(self, "_pretranscribe_attempted_ids", set()).discard(vod_id)
-            self.status_label.setText("FW 자막추출 취소를 요청했습니다…")
             editor = self._editor_tabs.get(vod_id)
-            if editor is not None:
+            if job is None:
+                self.status_label.setText("FW 텍스트 추출 대기를 취소했습니다.")
+                if editor is not None:
+                    editor.set_transcription_running(False)
+                    editor.status_label.setText("FW 텍스트 추출 대기를 취소했습니다.")
+            else:
+                self.status_label.setText("FW 자막추출 취소를 요청했습니다…")
+            if editor is not None and job is not None:
                 editor.status_label.setText("FW 자막추출 취소를 요청했습니다…")
             return
         auxiliary_job = self._active_auxiliary_ai_job(vod_id)

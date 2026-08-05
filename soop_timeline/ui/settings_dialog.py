@@ -37,8 +37,6 @@ from ..services.preferences import (
     AUTO_ANALYZE_SETTING,
     CACHE_RETENTION_SETTING,
     DISCOVERY_INTERVAL_SETTING,
-    LIVE_AI_MODES,
-    LIVE_AI_MODE_SETTING,
     NEW_VOD_NOTIFICATION_SETTING,
     normalized_auto_analyze_mode,
     normalized_cache_retention,
@@ -87,7 +85,8 @@ class AnalysisSettingsDialog(QDialog):
         description = QLabel(
             "공개 VOD의 오디오 전용 스트림을 파일 저장 없이 고속으로 읽고, 이 PC의 "
             "faster-whisper로 음성을 인식합니다. 타임스탬프 자막과 프롬프트만 "
-            "Gemini API로 전송하며, API 키는 Windows 자격 증명 관리자에 보관됩니다."
+            "다시보기 AI 타임라인 생성 시 Gemini API로 전송합니다. "
+            "라이브 자막 추출은 Gemini를 사용하지 않습니다."
         )
         description.setWordWrap(True)
         description.setObjectName("notice")
@@ -202,18 +201,6 @@ class AnalysisSettingsDialog(QDialog):
         notice_widget.setLayout(notice_box)
         form.addRow("상단 고정 문구", notice_widget)
 
-        self.live_ai_mode_combo = QComboBox()
-        for mode in LIVE_AI_MODES.values():
-            self.live_ai_mode_combo.addItem(
-                f"{mode.label} · 시간당 약 {mode.estimated_calls_per_hour}회",
-                mode.mode_id,
-            )
-        live_mode_index = self.live_ai_mode_combo.findData(
-            database.get_setting(LIVE_AI_MODE_SETTING, "saving")
-        )
-        self.live_ai_mode_combo.setCurrentIndex(max(0, live_mode_index))
-        form.addRow("라이브 Gemini 사용", self.live_ai_mode_combo)
-
         self.whisper_model_combo = QComboBox()
         self.whisper_model_combo.addItem("large-v3-turbo · 속도 우선", "large-v3-turbo")
         self.whisper_model_combo.addItem("large-v3 · 정확도 우선", "large-v3")
@@ -259,8 +246,8 @@ class AnalysisSettingsDialog(QDialog):
 
         hint = QLabel(
             "처음 분석할 때 Whisper 모델 파일을 한 번 내려받습니다. 이후에는 로컬에 "
-            "저장됩니다. 장시간 분석을 시작하기 전 Gemini 키·모델 권한을 짧은 "
-            "요청으로 확인하며, 이 연결 확인도 소량의 Gemini API 사용량에 포함됩니다."
+            "저장됩니다. 다시보기 AI 타임라인은 시작 전 Gemini 키·모델 "
+            "권한을 확인하며, 연결 확인도 소량의 API 사용량에 포함됩니다."
         )
         hint.setWordWrap(True)
         hint.setObjectName("muted")
@@ -564,10 +551,6 @@ class AnalysisSettingsDialog(QDialog):
         self.database.set_setting(
             REVIEW_FEEDBACK_ENABLED_SETTING,
             "1" if self.review_feedback_check.isChecked() else "0",
-        )
-        self.database.set_setting(
-            LIVE_AI_MODE_SETTING,
-            str(self.live_ai_mode_combo.currentData()),
         )
         self.database.set_setting(
             DISCOVERY_INTERVAL_SETTING,

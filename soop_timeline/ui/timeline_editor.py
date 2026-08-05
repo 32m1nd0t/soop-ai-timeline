@@ -177,6 +177,7 @@ class TimelineDocumentEditor(QWidget):
     memo_changed = Signal(str, str)
     review_completed = Signal(str)
     analysis_requested = Signal(str)
+    transcription_requested = Signal(str)
     analysis_cancel_requested = Signal(str)
     live_reconnect_requested = Signal(str)
     reanalyze_as_vod_requested = Signal(str)
@@ -196,6 +197,8 @@ class TimelineDocumentEditor(QWidget):
         text: str,
         analyzer_available: bool,
         analyzer_unavailable_reason: str = "",
+        transcription_available: bool = True,
+        transcription_unavailable_reason: str = "",
         style_available: bool = False,
         style_unavailable_reason: str = "",
         parent: QWidget | None = None,
@@ -205,6 +208,7 @@ class TimelineDocumentEditor(QWidget):
         self._blocks: list[TimelineBlockWidget] = []
         self._rebuilding = False
         self._analyzer_available = analyzer_available
+        self._transcription_available = transcription_available
         self._style_available = style_available
         self._is_live = vod.source_kind == "live"
         self._review_vod: Vod | None = None if self._is_live else vod
@@ -219,6 +223,7 @@ class TimelineDocumentEditor(QWidget):
         self._cached_transcript_available = False
         self._cache_present = False
         self._analysis_running = False
+        self._transcription_running = False
         self._live_running = False
         self._auxiliary_ai_running = False
         self._document_editing_locked = False
@@ -323,10 +328,18 @@ class TimelineDocumentEditor(QWidget):
         self.analyze_button.clicked.connect(
             lambda: self.analysis_requested.emit(self.vod.vod_id)
         )
+        self.transcribe_button = QPushButton("텍스트만 추출")
+        self.transcribe_button.setToolTip(
+            "Gemini를 사용하지 않고 로컬 faster-whisper로 STT 자막만 저장합니다."
+        )
+        self.transcribe_button.setVisible(not self._is_live)
+        self.transcribe_button.clicked.connect(
+            lambda: self.transcription_requested.emit(self.vod.vod_id)
+        )
         self.cancel_analysis_button = QPushButton("분석 취소")
         self.cancel_analysis_button.setVisible(False)
         if self._is_live:
-            self.cancel_analysis_button.setText("라이브 종료 및 정리")
+            self.cancel_analysis_button.setText("라이브 자막 추출 종료")
         self.cancel_analysis_button.clicked.connect(
             lambda: self.analysis_cancel_requested.emit(self.vod.vod_id)
         )
@@ -367,6 +380,7 @@ class TimelineDocumentEditor(QWidget):
         summary_row.addWidget(self.total_label)
         summary_row.addStretch(1)
         summary_row.addWidget(self.analyze_button)
+        summary_row.addWidget(self.transcribe_button)
         summary_row.addWidget(self.reanalyze_vod_button)
         summary_row.addWidget(self.cancel_analysis_button)
         summary_row.addWidget(self.style_button)
@@ -600,6 +614,10 @@ class TimelineDocumentEditor(QWidget):
             analyzer_available,
             analyzer_unavailable_reason,
         )
+        self.set_transcription_availability(
+            transcription_available,
+            transcription_unavailable_reason,
+        )
         self.set_style_availability(style_available, style_unavailable_reason)
         self.set_text(text)
         self._last_committed_text = self.text()
@@ -668,8 +686,12 @@ class TimelineDocumentEditor(QWidget):
 
     def set_analyzer_availability(self, available: bool, reason: str = "") -> None:
         self._analyzer_available = available
-        self.analyze_button.setEnabled(available)
-        self.regroup_button.setEnabled(available and self._cached_transcript_available)
+        self.analyze_button.setEnabled(available and not self._transcription_running)
+        self.regroup_button.setEnabled(
+            available
+            and self._cached_transcript_available
+            and not self._transcription_running
+        )
         self.regroup_button.setVisible(True)
         self.granularity_combo.setVisible(True)
         self.analyze_button.setVisible(not self._is_live)
@@ -677,8 +699,8 @@ class TimelineDocumentEditor(QWidget):
         if self._is_live:
             self.notice.setText(
                 "라이브 연결 시 화면의 방송 경과시간을 시작 기준으로 사용합니다. "
-                "약 15초 단위로 로컬 Whisper 자막이 표시되고, Gemini 임시 "
-                "타임라인은 설정에서 선택한 절약 주기로 갱신됩니다. "
+                "약 15초 단위로 로컬 Whisper 자막만 표시·저장하며 "
+                "Gemini API는 사용하지 않습니다. "
                 "SOOP 라이브에는 오디오 전용 주소가 없어 저화질 스트림을 "
                 "메모리에서 수신하되 오디오만 해독하며 파일은 저장하지 않습니다."
             )
@@ -694,6 +716,43 @@ class TimelineDocumentEditor(QWidget):
                 f"AI 분석을 사용하려면 설정을 완료하세요. {reason}".strip()
             )
 
+    def set_transcription_availability(
+        self,
+        available: bool,
+        reason: str = "",
+    ) -> None:
+        self._transcription_available = available
+        self._transcription_unavailable_reason = reason
+        self._update_transcription_button()
+
+    def _update_transcription_button(self) -> None:
+        self.transcribe_button.setVisible(
+            not self._is_live and not self._transcription_running
+        )
+        self.transcribe_button.setText(
+            "텍스트 추출 완료"
+            if self._cached_transcript_available
+            else "텍스트만 추출"
+        )
+        busy = (
+            self._analysis_running
+            or self._transcription_running
+            or self._live_running
+            or self._auxiliary_ai_running
+        )
+        self.transcribe_button.setEnabled(
+            self._transcription_available
+            and not self._cached_transcript_available
+            and not busy
+        )
+        if not self._transcription_available:
+            tooltip = self._transcription_unavailable_reason
+        elif self._cached_transcript_available:
+            tooltip = "저장된 Whisper 자막이 있습니다. 아래의 ‘저장 자막 보기’를 사용하세요."
+        else:
+            tooltip = "Gemini를 사용하지 않고 로컬 faster-whisper로 STT 자막만 저장합니다."
+        self.transcribe_button.setToolTip(tooltip)
+
     def set_cached_transcript_available(
         self,
         available: bool,
@@ -701,9 +760,14 @@ class TimelineDocumentEditor(QWidget):
     ) -> None:
         self._cached_transcript_available = available
         self._cache_present = available if cache_present is None else cache_present
+        self._update_transcription_button()
         self.transcript_button.setEnabled(available)
         self.cache_delete_button.setEnabled(self._cache_present)
-        self.regroup_button.setEnabled(available and self._analyzer_available)
+        self.regroup_button.setEnabled(
+            available
+            and self._analyzer_available
+            and not self._transcription_running
+        )
         self.regroup_button.setText(
             "저장 자막 다시 정리" if self._is_live else "주제 다시 묶기"
         )
@@ -722,7 +786,7 @@ class TimelineDocumentEditor(QWidget):
 
     def set_style_availability(self, available: bool, reason: str = "") -> None:
         self._style_available = available
-        self.style_button.setEnabled(available)
+        self.style_button.setEnabled(available and not self._transcription_running)
         self.style_button.setToolTip(
             "Whisper 재분석 없이 현재 타임라인만 건조한 제목형으로 교정합니다."
             if available
@@ -733,6 +797,7 @@ class TimelineDocumentEditor(QWidget):
     def _update_line_rewrite_buttons(self) -> None:
         enabled = (
             not self._line_rewrite_running
+            and not self._transcription_running
             and self._style_available
             and self._cached_transcript_available
         )
@@ -818,6 +883,7 @@ class TimelineDocumentEditor(QWidget):
 
     def set_analysis_running(self, running: bool) -> None:
         self._analysis_running = running
+        self._update_transcription_button()
         self._update_document_editability()
         self._update_live_reconnect_button()
         self.analyze_button.setVisible(not running and not self._is_live)
@@ -827,7 +893,7 @@ class TimelineDocumentEditor(QWidget):
         self.cancel_analysis_button.setText(
             "분석 취소"
             if running
-            else ("라이브 종료 및 정리" if self._is_live else "분석 취소")
+            else ("라이브 자막 추출 종료" if self._is_live else "분석 취소")
         )
         self.analysis_progress.setVisible(running)
         self.analysis_progress.setRange(0, 100)
@@ -872,8 +938,55 @@ class TimelineDocumentEditor(QWidget):
             self.analysis_progress.setValue(max(0, min(100, percent)))
         self.status_label.setText(message)
 
+    def set_transcription_running(
+        self,
+        running: bool,
+        *,
+        queued: bool = False,
+        percent: int | None = None,
+        message: str = "",
+    ) -> None:
+        self._transcription_running = running
+        self._update_transcription_button()
+        self.analyze_button.setEnabled(not running and self._analyzer_available)
+        self.style_button.setEnabled(not running and self._style_available)
+        self.regroup_button.setEnabled(
+            not running
+            and self._analyzer_available
+            and self._cached_transcript_available
+        )
+        self._update_line_rewrite_buttons()
+        self.cache_delete_button.setEnabled(
+            not running and self._cache_present
+        )
+        self.work_reset_button.setEnabled(not running)
+        if running:
+            self.cancel_analysis_button.setVisible(True)
+            self.cancel_analysis_button.setEnabled(True)
+            self.cancel_analysis_button.setText(
+                "텍스트 추출 대기 취소" if queued else "텍스트 추출 취소"
+            )
+            self.analysis_progress.setVisible(True)
+            if percent is None:
+                self.analysis_progress.setRange(0, 0)
+            else:
+                self.analysis_progress.setRange(0, 100)
+                self.analysis_progress.setValue(max(0, min(100, percent)))
+        elif (
+            not self._analysis_running
+            and not self._live_running
+            and not self._auxiliary_ai_running
+        ):
+            self.cancel_analysis_button.setVisible(False)
+            self.cancel_analysis_button.setEnabled(False)
+            self.cancel_analysis_button.setText("분석 취소")
+            self.analysis_progress.setVisible(False)
+        if message:
+            self.status_label.setText(message)
+
     def set_live_running(self, running: bool) -> None:
         self._live_running = running
+        self._update_transcription_button()
         self._update_document_editability()
         if running:
             self._live_reconnect_pending = False
@@ -882,7 +995,7 @@ class TimelineDocumentEditor(QWidget):
         self.reanalyze_vod_button.setVisible(self._is_live and not running)
         self.cancel_analysis_button.setVisible(running)
         self.cancel_analysis_button.setText(
-            "라이브 종료 요청됨…" if not running else "라이브 종료 및 정리"
+            "라이브 종료 요청됨…" if not running else "라이브 자막 추출 종료"
         )
         self.cancel_analysis_button.setEnabled(running)
         self.analysis_progress.setVisible(running)
@@ -940,7 +1053,7 @@ class TimelineDocumentEditor(QWidget):
         self.cancel_analysis_button.setEnabled(False)
         self.cancel_analysis_button.setText("라이브 종료 요청됨…")
         self.status_label.setText(
-            "현재 오디오 구간을 마친 뒤 AI 최종 타임라인을 정리합니다…"
+            "현재 오디오 구간을 마친 뒤 누적 자막을 저장합니다…"
         )
 
     def set_style_running(self, running: bool) -> None:
@@ -972,6 +1085,7 @@ class TimelineDocumentEditor(QWidget):
         cancel_text: str = "AI 작업 취소",
     ) -> None:
         self._auxiliary_ai_running = running
+        self._update_transcription_button()
         self._update_document_editability()
         self.analyze_button.setVisible(
             not self._is_live and not running and not self._analysis_running
@@ -990,7 +1104,7 @@ class TimelineDocumentEditor(QWidget):
             self.cancel_analysis_button.setVisible(False)
             self.cancel_analysis_button.setEnabled(False)
             self.cancel_analysis_button.setText(
-                "라이브 종료 및 정리" if self._is_live else "분석 취소"
+                "라이브 자막 추출 종료" if self._is_live else "분석 취소"
             )
         self._update_live_reconnect_button()
 
@@ -1015,12 +1129,6 @@ class TimelineDocumentEditor(QWidget):
         self.status_label.setText(f"AI 문체 교정 완료 · 내용을 검수하세요{suffix}.")
 
     def apply_live_update(self, stage: str, text: str) -> None:
-        if stage == "live_timeline":
-            self.set_text(text)
-            self.status_label.setText(
-                "AI 임시 타임라인 갱신 · 라이브 음성 인식은 계속 진행 중"
-            )
-            return
         self.preview_title.setText("실시간 음성 인식 자막 · 약 15초 단위 갱신")
         if stage == "live_transcript_append":
             scroll_bar = self.preview_editor.verticalScrollBar()
@@ -1044,7 +1152,7 @@ class TimelineDocumentEditor(QWidget):
         self.set_live_running(False)
         self.preview_card.setVisible(False)
         self._emit_document_changed()
-        self.status_label.setText("라이브 타임라인 생성 완료 · 내용을 검수하세요.")
+        self.status_label.setText("라이브 자막 추출 완료 · 내용을 확인하세요.")
 
     def text(self) -> str:
         return "".join(block.text() for block in self._blocks)

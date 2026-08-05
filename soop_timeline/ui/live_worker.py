@@ -38,7 +38,7 @@ class LiveAnalysisWorker(QObject):
         self._skip_finalization = threading.Event()
 
     def request_stop(self, *, finalize: bool) -> None:
-        """Choose whether interruption should run new Gemini final requests."""
+        """Choose whether to finalize the transcript or preserve it for restart."""
         if not finalize:
             self._skip_finalization.set()
 

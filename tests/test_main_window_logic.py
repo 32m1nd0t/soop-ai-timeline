@@ -30,6 +30,92 @@ class _TimelineDatabase:
 
 
 class MainWindowStateLogicTests(unittest.TestCase):
+    def test_production_fw_pretranscribe_limit_is_one(self):
+        self.assertEqual(MainWindow._MAX_CONCURRENT_PRETRANSCRIBES, 1)
+
+    def test_manual_text_extraction_queues_fw_without_gemini(self):
+        editor_updates: list[tuple[bool, dict[str, object]]] = []
+        status_messages: list[str] = []
+        resume_requests: list[bool] = []
+        vod = SimpleNamespace(
+            vod_id="vod-stt",
+            source_kind="manual_vod",
+            title="텍스트 추출 영상",
+        )
+
+        class Database:
+            @staticmethod
+            def get_vod(vod_id: str):
+                return vod if vod_id == vod.vod_id else None
+
+        editor = SimpleNamespace(
+            set_transcription_running=lambda running, **kwargs: editor_updates.append(
+                (running, kwargs)
+            ),
+            status_label=SimpleNamespace(setText=lambda message: None),
+        )
+        window = SimpleNamespace(
+            database=Database(),
+            _editor_tabs={vod.vod_id: editor},
+            _pretranscribe_jobs={},
+            _pretranscribe_queue=[],
+            _pretranscribe_attempted_ids=set(),
+            _analysis_queue=[],
+            _active_analysis_target_id=lambda vod_id: None,
+            _active_auxiliary_ai_job=lambda vod_id: None,
+            _resume_pretranscribe_if_idle=lambda: resume_requests.append(True),
+            status_label=SimpleNamespace(setText=status_messages.append),
+            load_vods=lambda: None,
+        )
+        analyzer = SimpleNamespace(
+            transcription_available=True,
+            transcription_unavailable_reason="",
+        )
+
+        with (
+            patch(
+                "soop_timeline.ui.main_window.load_cached_transcript",
+                return_value=None,
+            ),
+            patch(
+                "soop_timeline.ui.main_window.LocalWhisperGeminiAnalyzer.for_transcription",
+                return_value=analyzer,
+            ) as factory,
+        ):
+            MainWindow.start_transcription(window, vod.vod_id)
+
+        factory.assert_called_once_with(window.database)
+        self.assertEqual(window._pretranscribe_queue, [vod.vod_id])
+        self.assertEqual(resume_requests, [True])
+        self.assertEqual(editor_updates[0][0], True)
+        self.assertTrue(editor_updates[0][1]["queued"])
+        self.assertIn(
+            "Gemini는 사용하지 않습니다",
+            editor_updates[0][1]["message"],
+        )
+
+    def test_live_whisper_does_not_block_auxiliary_gemini_work(self):
+        window = SimpleNamespace(
+            _analysis_jobs={},
+            _analysis_queue=[],
+            _live_jobs={"live-1": (object(), object())},
+            _style_jobs={},
+            _line_rewrite_jobs={},
+            _regroup_jobs={},
+        )
+
+        self.assertFalse(MainWindow._auxiliary_ai_jobs_active(window))
+
+    def test_auxiliary_gemini_work_does_not_block_live_whisper(self):
+        window = SimpleNamespace(
+            _analysis_jobs={},
+            _live_jobs={},
+            _pretranscribe_jobs={},
+            _style_jobs={"vod-1": (object(), object())},
+        )
+
+        self.assertFalse(MainWindow._live_transcription_jobs_active(window))
+
     def test_review_complete_learns_from_saved_ai_draft(self):
         saved: list[tuple[str, str, str]] = []
         states: list[tuple[str, str]] = []
@@ -946,7 +1032,7 @@ class MainWindowStateLogicTests(unittest.TestCase):
             (
                 "777",
                 "기존 라이브 분석본",
-                "라이브 분석본 · 전체 다시보기 재분석 전",
+                "라이브 자막 기록 · 전체 다시보기 재분석 전",
             ),
             revisions,
         )

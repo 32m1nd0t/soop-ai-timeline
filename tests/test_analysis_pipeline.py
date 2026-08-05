@@ -88,6 +88,28 @@ def sample_transcript() -> Transcript:
 
 
 class AnalysisPipelineTests(unittest.TestCase):
+    def test_transcription_factory_does_not_read_gemini_credentials(self):
+        database = type(
+            "Database",
+            (),
+            {
+                "get_setting": lambda self, key, default="": {
+                    "whisper_model": "large-v3",
+                    "whisper_device": "cpu",
+                }.get(key, default)
+            },
+        )()
+
+        with patch(
+            "soop_timeline.services.analyzer.get_gemini_api_key",
+            side_effect=AssertionError("STT 전용 작업은 Gemini 자격 증명을 읽으면 안 됩니다."),
+        ):
+            analyzer = LocalWhisperGeminiAnalyzer.for_transcription(database)
+
+        self.assertEqual(analyzer.config.whisper_model, "large-v3")
+        self.assertEqual(analyzer.config.whisper_device, "cpu")
+        self.assertEqual(analyzer.config.gemini_api_key, "")
+
     def test_live_replay_reuse_excludes_recorded_reconnect_gaps(self):
         replay = Vod(
             vod_id="777",
@@ -1049,7 +1071,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             self.assertIs(received[0][1]["reusable"], reusable)
             self.assertEqual(received[0][1]["reusable_ranges"], ((0, 120),))
 
-    def test_live_analysis_emits_incremental_and_final_timeline(self):
+    def test_live_analysis_saves_timestamped_transcript_without_gemini(self):
         live_vod = sample_vod()
         live_vod.source_kind = "live"
         live_vod.url = "https://play.sooplive.com/sample/98765"
@@ -1124,11 +1146,14 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertIn("01:00:00 방송 시작", result)
         self.assertEqual(len(recovered.segments), 2)
         self.assertEqual(len(reconnect_records), 1)
-        self.assertTrue(result.startswith(f"{DEFAULT_TIMELINE_NOTICE}\n\n"))
-        self.assertEqual(result.splitlines()[3], "오늘의 콘텐츠: 최종 라이브")
-        self.assertTrue(any(stage == "live_timeline" for stage, _ in previews))
+        self.assertEqual(
+            result,
+            "01:00:00 방송 시작\n01:01:05 게임 이야기\n",
+        )
+        self.assertTrue(any(stage == "live_transcript" for stage, _ in previews))
+        self.assertFalse(any(stage == "live_timeline" for stage, _ in previews))
 
-    def test_live_gemini_wait_does_not_block_new_whisper_updates(self):
+    def test_live_transcription_processes_incremental_updates_without_gemini(self):
         live_vod = sample_vod()
         live_vod.source_kind = "live"
         live_vod.url = "https://play.sooplive.com/sample/98765"
@@ -1144,7 +1169,6 @@ class AnalysisPipelineTests(unittest.TestCase):
         )
         first = TranscriptSegment("s000000", 3_600, 3_665, "첫 주제")
         second = TranscriptSegment("s000001", 3_670, 3_730, "둘째 주제")
-        generator_started = threading.Event()
         second_update_sent = threading.Event()
 
         class FakeTranscriber:
@@ -1158,8 +1182,6 @@ class AnalysisPipelineTests(unittest.TestCase):
                         (first,),
                     )
                 )
-                if not generator_started.wait(2.0):
-                    raise RuntimeError("Gemini worker did not start")
                 update(
                     LiveTranscriptUpdate(
                         "large-v3-turbo",
@@ -1176,31 +1198,13 @@ class AnalysisPipelineTests(unittest.TestCase):
                     [first, second],
                 )
 
-        class FakeGenerator:
-            def summarize_live_window(
-                self,
-                vod,
-                segments,
-                cancelled,
-                previous_entries=None,
-            ):
-                del vod, cancelled, previous_entries
-                generator_started.set()
-                if not second_update_sent.wait(2.0):
-                    raise RuntimeError("Whisper was blocked by Gemini")
-                return GeneratedTimeline(
-                    "라이브",
-                    [TimelineEntry(segments[0].segment_id, segments[0].start, "첫 주제")],
-                )
-
-            def finalize_live_entries(self, vod, titles, entries, segments, cancelled):
-                del vod, titles, segments, cancelled
-                return GeneratedTimeline("최종 라이브", entries)
+        def fail_generator(*_args):
+            raise AssertionError("라이브 자막 추출에서 Gemini를 생성하면 안 됩니다.")
 
         analyzer = LocalWhisperGeminiAnalyzer(
-            AnalyzerConfig(gemini_api_key="test", live_ai_mode="frequent"),
+            AnalyzerConfig(gemini_api_key="test"),
             transcriber_factory=lambda model, device: FakeTranscriber(),
-            generator_factory=lambda key, model: FakeGenerator(),
+            generator_factory=fail_generator,
         )
         with tempfile.TemporaryDirectory() as directory, patch(
             "soop_timeline.services.analyzer.analysis_data_dir",
@@ -1215,6 +1219,7 @@ class AnalysisPipelineTests(unittest.TestCase):
 
         self.assertTrue(second_update_sent.is_set())
         self.assertIn("첫 주제", result)
+        self.assertIn("둘째 주제", result)
 
     def test_fast_live_shutdown_saves_transcript_without_new_gemini_calls(self):
         live_vod = sample_vod()
