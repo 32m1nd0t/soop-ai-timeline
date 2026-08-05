@@ -1,6 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from soop_timeline.services.timeline_timestamp import (
     adjust_timestamp_on_current_line,
@@ -22,6 +23,7 @@ from soop_timeline.ui.review_player import (
     build_seek_script,
     build_seek_verification_script,
 )
+from soop_timeline.ui.timeline_editor import TimelineDocumentEditor
 
 
 class TimelineTimestampTests(unittest.TestCase):
@@ -368,16 +370,97 @@ class TimelineTimestampTests(unittest.TestCase):
         self.assertIn("video.pause()", script)
         self.assertIn("video.muted = true", script)
 
-    def test_close_button_hides_reusable_player_instead_of_disposing_it(self):
-        calls = []
+    def test_close_button_requests_real_player_window_close(self):
+        calls: list[str] = []
+
+        player = SimpleNamespace(
+            _closing=False,
+            close=lambda: calls.append("close"),
+        )
+        SoopReviewPlayer.close_player(player)
+
+        self.assertEqual(calls, ["close"])
+
+    def test_player_session_disposal_closes_native_webview(self):
+        calls: list[str] = []
+        web_view = SimpleNamespace(
+            hide=lambda: calls.append("hide"),
+            close=lambda: calls.append("close-webview"),
+        )
+        player = SimpleNamespace(
+            _fullscreen_active=False,
+            isFullScreen=lambda: False,
+            _stop_playback=lambda: calls.append("stop"),
+            web_view=web_view,
+            _loaded=True,
+            _dom_loaded=True,
+            _webview_rebuild_pending=True,
+        )
+
+        SoopReviewPlayer._dispose_player_session(player)
+
+        self.assertEqual(calls, ["stop", "hide", "close-webview"])
+        self.assertFalse(player._loaded)
+        self.assertFalse(player._dom_loaded)
+        self.assertFalse(player._webview_rebuild_pending)
+
+    def test_window_x_disposes_player_and_accepts_close(self):
+        calls: list[str] = []
 
         class CloseEvent:
-            def ignore(self):
-                calls.append("ignored")
+            def accept(self):
+                calls.append("accepted")
 
-        player = SimpleNamespace(close_player=lambda: calls.append("hidden"))
+        player = SimpleNamespace(
+            _closing=False,
+            _dispose_player_session=lambda: calls.append("disposed"),
+            closed=SimpleNamespace(emit=lambda: calls.append("emitted")),
+        )
         SoopReviewPlayer.closeEvent(player, CloseEvent())
-        self.assertEqual(calls, ["ignored", "hidden"])
+
+        self.assertEqual(calls, ["disposed", "emitted", "accepted"])
+        self.assertTrue(player._closing)
+
+    def test_reopening_review_player_creates_fresh_window_session(self):
+        class SignalStub:
+            def connect(self, callback):
+                del callback
+
+        def player_stub():
+            return SimpleNamespace(
+                closed=SignalStub(),
+                seek_completed=SignalStub(),
+                status_changed=SignalStub(),
+                current_time_ready=SignalStub(),
+            )
+
+        first_player = player_stub()
+        second_player = player_stub()
+        button_labels: list[str] = []
+        editor = SimpleNamespace(
+            review_player=None,
+            _review_vod=object(),
+            vod=object(),
+            player_button=SimpleNamespace(setText=button_labels.append),
+            _on_review_player_closed=lambda: None,
+            _on_seek_completed=lambda seconds: None,
+            _set_player_status=lambda message: None,
+            _insert_timestamp=lambda seconds: None,
+        )
+
+        with patch(
+            "soop_timeline.ui.timeline_editor.SoopReviewPlayer",
+            side_effect=[first_player, second_player],
+        ) as player_factory:
+            opened_first = TimelineDocumentEditor._show_review_player(editor)
+            editor.review_player = None
+            opened_second = TimelineDocumentEditor._show_review_player(editor)
+
+        self.assertIs(opened_first, first_player)
+        self.assertIs(opened_second, second_player)
+        self.assertIsNot(opened_first, opened_second)
+        self.assertEqual(player_factory.call_count, 2)
+        self.assertEqual(button_labels, ["검수 플레이어 닫기", "검수 플레이어 닫기"])
 
     def test_disposed_native_webview_is_reported_as_unhealthy(self):
         player = SimpleNamespace(

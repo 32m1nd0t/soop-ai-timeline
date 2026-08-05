@@ -589,12 +589,7 @@ class TimelineDocumentEditor(QWidget):
         self.blocks_layout.addStretch(1)
         self.scroll.setWidget(self.scroll_content)
 
-        self.review_player = SoopReviewPlayer(vod)
-        self.review_player.setVisible(False)
-        self.review_player.closed.connect(self._on_review_player_closed)
-        self.review_player.seek_completed.connect(self._on_seek_completed)
-        self.review_player.status_changed.connect(self._set_player_status)
-        self.review_player.current_time_ready.connect(self._insert_timestamp)
+        self.review_player: SoopReviewPlayer | None = None
 
         # 실시간 미리보기가 위에 세로로 쌓이면서 아래 댓글 블록이 잘리던 문제를 피하려고
         # 미리보기(좌)와 댓글 블록(우)을 가로로 나란히 배치한다. 미리보기가 숨겨지면
@@ -1553,8 +1548,8 @@ class TimelineDocumentEditor(QWidget):
         if not self._review_vod_available():
             self.status_label.setText("라이브는 현재 위치 삽입을 지원하지 않습니다.")
             return
-        self._show_review_player()
-        self.review_player.request_current_time()
+        player = self._show_review_player()
+        player.request_current_time()
 
     def _insert_timestamp(self, seconds: int) -> None:
         editor = self._focused_text_editor()
@@ -1605,12 +1600,14 @@ class TimelineDocumentEditor(QWidget):
             consumed += len(block.text())
 
     def review_player_toggle_playback(self) -> None:
-        if self._review_vod_available() and self.review_player.isVisible():
-            self.review_player.toggle_playback()
+        player = self.review_player
+        if self._review_vod_available() and player is not None and player.isVisible():
+            player.toggle_playback()
 
     def review_player_seek_relative(self, seconds: int) -> None:
-        if self._review_vod_available() and self.review_player.isVisible():
-            self.review_player.seek_relative(seconds)
+        player = self.review_player
+        if self._review_vod_available() and player is not None and player.isVisible():
+            player.seek_relative(seconds)
 
     def set_regroup_running(self, running: bool) -> None:
         self.set_auxiliary_ai_running(
@@ -1654,11 +1651,12 @@ class TimelineDocumentEditor(QWidget):
                 "방송 종료 후 다시보기가 연결되면 검수 플레이어를 사용할 수 있습니다."
             )
             return
-        if self.review_player.isVisible():
-            self.review_player.close_player()
+        player = self.review_player
+        if player is not None and player.isVisible():
+            player.close_player()
             return
-        self._show_review_player()
-        self.review_player.open_player()
+        player = self._show_review_player()
+        player.open_player()
 
     def seek_to_timestamp(self, seconds: int) -> None:
         if not self._review_vod_available():
@@ -1667,11 +1665,20 @@ class TimelineDocumentEditor(QWidget):
                 "라이브 세션의 타임스탬프는 방송 경과시간 기준이며 내부 검수 이동은 지원하지 않습니다."
             )
             return
-        self._show_review_player()
-        self.review_player.seek_to(seconds)
+        player = self._show_review_player()
+        player.seek_to(seconds)
 
-    def _show_review_player(self) -> None:
+    def _show_review_player(self) -> SoopReviewPlayer:
+        player = self.review_player
+        if player is None:
+            player = SoopReviewPlayer(self._review_vod or self.vod)
+            player.closed.connect(self._on_review_player_closed)
+            player.seek_completed.connect(self._on_seek_completed)
+            player.status_changed.connect(self._set_player_status)
+            player.current_time_ready.connect(self._insert_timestamp)
+            self.review_player = player
         self.player_button.setText("검수 플레이어 닫기")
+        return player
 
     def _review_vod_available(self) -> bool:
         return self._review_vod is not None
@@ -1680,7 +1687,8 @@ class TimelineDocumentEditor(QWidget):
         self._review_vod = replay
         self._live_reconnect_pending = False
         self._update_live_reconnect_button()
-        self.review_player.set_vod(replay)
+        if self.review_player is not None:
+            self.review_player.set_vod(replay)
         self.player_button.setVisible(True)
         self.insert_time_button.setVisible(True)
         self.open_source_button.setText("SOOP 다시보기 열기")
@@ -1701,9 +1709,14 @@ class TimelineDocumentEditor(QWidget):
         QDesktopServices.openUrl(QUrl(target.url))
 
     def close_review_player(self) -> None:
-        self.review_player.close_player()
+        player = self.review_player
+        if player is not None:
+            player.close_player()
 
     def _on_review_player_closed(self) -> None:
+        closed_player = self.sender()
+        if closed_player is None or closed_player is self.review_player:
+            self.review_player = None
         self.player_button.setText("검수 플레이어 열기")
         self.status_label.setText("SOOP 검수 플레이어를 닫았습니다.")
 

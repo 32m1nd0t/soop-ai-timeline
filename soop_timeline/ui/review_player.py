@@ -991,6 +991,7 @@ class SoopReviewPlayer(QFrame):
         self.setObjectName("playerCard")
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle(f"SOOP 검수 플레이어 · {vod.title}")
         self.resize(760, 640)
         self.setMinimumSize(520, 420)
@@ -1016,6 +1017,7 @@ class SoopReviewPlayer(QFrame):
         self._was_maximized = False
         self._webview_rebuild_pending = False
         self._rebuilding_webview = False
+        self._closing = False
 
         self._retry_timer = QTimer(self)
         self._retry_timer.setInterval(500)
@@ -1429,13 +1431,24 @@ class SoopReviewPlayer(QFrame):
         )
 
     def close_player(self) -> None:
-        was_visible = self.isVisible()
+        if self._closing:
+            return
+        self.close()
+
+    def _dispose_player_session(self) -> None:
         if self._fullscreen_active or self.isFullScreen():
             self.exit_fullscreen()
         self._stop_playback()
-        self.hide()
-        if was_visible:
-            self.closed.emit()
+        web_view = getattr(self, "web_view", None)
+        if web_view is not None:
+            try:
+                web_view.hide()
+                web_view.close()
+            except Exception:
+                logger.exception("Could not dispose review player WebView2")
+        self._loaded = False
+        self._dom_loaded = False
+        self._webview_rebuild_pending = False
 
     def _stop_playback(self) -> None:
         # Invalidate delayed auto-activation callbacks before hiding the widget;
@@ -1453,12 +1466,13 @@ class SoopReviewPlayer(QFrame):
             self.web_view.evaluate_js(build_close_script())
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        # Closing a top-level widget also closes its native WebView2 child.
-        # qtwebview2 disposes that child permanently, while the editor keeps
-        # this player object for reuse. Hide the player instead so reopening it
-        # never talks to an already-disposed WebView2 control.
-        event.ignore()
-        self.close_player()
+        if self._closing:
+            event.accept()
+            return
+        self._closing = True
+        self._dispose_player_session()
+        self.closed.emit()
+        event.accept()
 
     def _on_webview_initialized(self, success: bool, error_message: str) -> None:
         if not success:
