@@ -8,6 +8,12 @@ from unittest.mock import patch
 import numpy as np
 
 from soop_timeline.models import Vod
+from soop_timeline.services.soop_auth import (
+    SoopLoginRequired,
+    authorize_soop_resource,
+    clear_soop_session_cookies,
+    store_soop_session_cookies,
+)
 from soop_timeline.services.transcription import (
     AnalysisCancelled,
     FasterWhisperTranscriber,
@@ -157,6 +163,60 @@ class VodStreamTests(unittest.TestCase):
         self.assertAlmostEqual(source.total_duration_seconds, 24_357.984)
         self.assertIn("영상 데이터는 받지 않습니다", messages[-1][1])
 
+    def test_in_app_soop_session_is_attached_to_metadata_request(self):
+        store_soop_session_cookies(
+            [
+                {
+                    "name": "AuthTicket",
+                    "value": "verified-session",
+                    "domain": ".sooplive.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            ]
+        )
+        authorize_soop_resource(sample_vod().url)
+        try:
+            with patch(
+                "soop_timeline.services.vod_stream.urlopen",
+                return_value=FakeResponse(public_payload()),
+            ) as mocked:
+                fetch_vod_audio_source(
+                    sample_vod(), lambda *args: None, lambda: False
+                )
+        finally:
+            clear_soop_session_cookies()
+
+        request = mocked.call_args.args[0]
+        self.assertEqual(request.get_header("Cookie"), "AuthTicket=verified-session")
+
+    def test_authorized_session_is_not_attached_to_a_different_vod(self):
+        store_soop_session_cookies(
+            [
+                {
+                    "name": "AuthTicket",
+                    "value": "verified-session",
+                    "domain": ".sooplive.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            ]
+        )
+        authorize_soop_resource("https://vod.sooplive.com/player/999")
+        try:
+            with patch(
+                "soop_timeline.services.vod_stream.urlopen",
+                return_value=FakeResponse(public_payload()),
+            ) as mocked:
+                fetch_vod_audio_source(
+                    sample_vod(), lambda *args: None, lambda: False
+                )
+        finally:
+            clear_soop_session_cookies()
+
+        request = mocked.call_args.args[0]
+        self.assertIsNone(request.get_header("Cookie"))
+
     def test_non_public_vod_is_rejected(self):
         payload = public_payload()
         payload["data"]["is_public"] = 0
@@ -165,6 +225,31 @@ class VodStreamTests(unittest.TestCase):
             return_value=FakeResponse(payload),
         ):
             with self.assertRaisesRegex(RuntimeError, "전체 공개"):
+                fetch_vod_audio_source(
+                    sample_vod(), lambda *args: None, lambda: False
+                )
+
+    def test_adult_gate_requests_in_app_soop_login(self):
+        payload = public_payload()
+        payload["data"]["adult_status"] = "login_required"
+        with patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            return_value=FakeResponse(payload),
+        ):
+            with self.assertRaises(SoopLoginRequired) as raised:
+                fetch_vod_audio_source(
+                    sample_vod(), lambda *args: None, lambda: False
+                )
+
+        self.assertEqual(raised.exception.page_url, sample_vod().url)
+
+    def test_login_failure_without_data_is_classified_as_adult_gate(self):
+        payload = {"result": 0, "message": "로그인과 성인 인증이 필요합니다."}
+        with patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            return_value=FakeResponse(payload),
+        ):
+            with self.assertRaises(SoopLoginRequired):
                 fetch_vod_audio_source(
                     sample_vod(), lambda *args: None, lambda: False
                 )

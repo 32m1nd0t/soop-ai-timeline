@@ -3,6 +3,7 @@ import unittest
 from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Slot
 
 from soop_timeline.models import Vod
+from soop_timeline.services.soop_auth import SoopLoginRequired
 from soop_timeline.ui.analysis_worker import AnalysisWorker, PreTranscribeWorker
 
 
@@ -33,6 +34,42 @@ class _Receiver(QObject):
 
 
 class AnalysisWorkerTests(unittest.TestCase):
+    def test_authentication_required_is_not_reported_as_analysis_failure(self):
+        vod = Vod(
+            vod_id="19",
+            streamer_id=1,
+            channel_id="sample",
+            streamer_name="샘플",
+            title="19세 VOD",
+            url="https://vod.sooplive.com/player/19",
+            duration_text="1:00:00",
+            published_text="오늘",
+            thumbnail_url="",
+            state="new",
+            discovered_at="",
+            updated_at="",
+        )
+
+        class Analyzer:
+            @staticmethod
+            def analyze_vod(vod, **kwargs):
+                raise SoopLoginRequired(vod.url, "VOD")
+
+        authentication: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
+        worker = AnalysisWorker(Analyzer(), vod)
+        worker.authentication_required.connect(
+            lambda vod_id, url: authentication.append((vod_id, url))
+        )
+        worker.failed.connect(
+            lambda vod_id, message: failures.append((vod_id, message))
+        )
+
+        worker.run()
+
+        self.assertEqual(authentication, [("19", vod.url)])
+        self.assertEqual(failures, [])
+
     def test_pretranscribe_worker_uses_only_fw_transcription(self):
         vod = Vod(
             vod_id="fw-only",

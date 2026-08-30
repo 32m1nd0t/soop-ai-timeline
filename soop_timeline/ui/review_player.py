@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import threading
+from uuid import uuid4
 
 from PySide6.QtCore import QTimer, Qt, QUrl, QUrlQuery, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QShortcut
@@ -811,10 +812,14 @@ class ResilientQtWebView2Widget(QtWebView2Widget):
     """Guards qtwebview2 0.4.1 against stale or already-disposed HWNDs."""
 
     native_control_failed = Signal(str)
+    cookie_result_ready = Signal(str, str, str)
 
     def __init__(self, *args, **kwargs):
         self._native_failure_reported = False
+        self._cookie_callbacks: dict[str, object] = {}
+        self._cookie_delegates: dict[str, object] = {}
         super().__init__(*args, **kwargs)
+        self.cookie_result_ready.connect(self._deliver_cookie_result)
 
     def native_control_healthy(self) -> bool:
         webview = getattr(self, "_webview", None)
@@ -960,7 +965,88 @@ class ResilientQtWebView2Widget(QtWebView2Widget):
             logger.warning("WebView2 trusted click failed: %s", error)
             return False
 
+    def get_soop_cookies(self, callback) -> None:
+        """Return WebView2 cookies through a Qt-safe asynchronous callback.
+
+        DevTools is used because SOOP's authentication ticket is HTTP-only and
+        therefore intentionally unavailable through ``document.cookie``.
+        """
+
+        webview = getattr(self, "_webview", None)
+        if not self.is_ready or webview is None or not self.native_control_healthy():
+            callback([], "WebView2가 아직 준비되지 않았습니다.")
+            return
+        call_id = uuid4().hex
+        try:
+            from qtwebview2 import _dotnet_bridge as dotnet
+
+            dotnet.load_dotnet_env()
+            from System import Action, String
+            from System.Threading.Tasks import Task
+
+            task = webview.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                "Storage.getCookies",
+                "{}",
+            )
+
+            def completed(result_task) -> None:
+                try:
+                    payload = str(result_task.Result)
+                    error = ""
+                except Exception as result_error:
+                    payload = ""
+                    error = str(result_error)
+                self.cookie_result_ready.emit(call_id, payload, error)
+
+            delegate = Action[Task[String]](completed)
+            self._cookie_callbacks[call_id] = callback
+            # Keep the Python delegate alive until the .NET task completes.
+            self._cookie_delegates[call_id] = delegate
+            task.ContinueWith(delegate)
+        except Exception as error:
+            self._cookie_callbacks.pop(call_id, None)
+            self._cookie_delegates.pop(call_id, None)
+            callback([], f"SOOP 로그인 세션을 읽지 못했습니다: {error}")
+
+    def clear_browser_cookies(self) -> bool:
+        """Delete cookies from this WebView2 profile after a scoped login."""
+
+        webview = getattr(self, "_webview", None)
+        if not self.is_ready or webview is None or not self.native_control_healthy():
+            return False
+        try:
+            webview.CoreWebView2.CookieManager.DeleteAllCookies()
+            return True
+        except Exception as error:
+            logger.warning("WebView2 cookie cleanup failed: %s", error)
+            return False
+
+    def _deliver_cookie_result(
+        self,
+        call_id: str,
+        payload: str,
+        error: str,
+    ) -> None:
+        callback = self._cookie_callbacks.pop(call_id, None)
+        self._cookie_delegates.pop(call_id, None)
+        if callback is None:
+            return
+        if error:
+            callback([], f"SOOP 로그인 세션을 읽지 못했습니다: {error}")
+            return
+        try:
+            parsed = json.loads(payload)
+            cookies = parsed.get("cookies", [])
+            if not isinstance(cookies, list):
+                raise ValueError("쿠키 목록 형식이 올바르지 않습니다.")
+        except (json.JSONDecodeError, TypeError, ValueError) as parse_error:
+            callback([], f"SOOP 로그인 세션 형식이 변경되었습니다: {parse_error}")
+            return
+        callback(cookies, "")
+
     def closeEvent(self, event) -> None:
+        self._cookie_callbacks.clear()
+        self._cookie_delegates.clear()
         webview = getattr(self, "_webview", None)
         try:
             if webview is not None and not bool(webview.IsDisposed):

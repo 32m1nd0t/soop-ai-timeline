@@ -81,6 +81,11 @@ from ..services.review_feedback import (
     REVIEW_FEEDBACK_ENABLED_SETTING,
     learn_review_feedback,
 )
+from ..services.soop_auth import (
+    authorize_soop_resource,
+    clear_soop_session_cookies,
+    revoke_soop_resource,
+)
 from ..services.transcription import (
     GPU_ADDON_DOWNLOAD_URL,
     detect_whisper_runtime,
@@ -106,6 +111,10 @@ from .live_worker import LiveAnalysisWorker
 from .manual_link_worker import ManualLinkWorker
 from .regroup_worker import TimelineRegroupWorker
 from .settings_dialog import AnalysisSettingsDialog
+from .soop_login_window import (
+    SoopLoginWindow,
+    cleanup_ephemeral_soop_login_profiles,
+)
 from .style_worker import TimelineStyleWorker
 from .timeline_editor import TimelineDocumentEditor
 from .transcript_viewer_dialog import TranscriptViewerDialog
@@ -137,6 +146,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, database: Database, parent: QWidget | None = None):
         super().__init__(parent)
+        cleanup_ephemeral_soop_login_profiles()
         self.database = database
         set_timeline_notice(
             database.get_setting(TIMELINE_NOTICE_SETTING, DEFAULT_TIMELINE_NOTICE)
@@ -170,6 +180,11 @@ class MainWindow(QMainWindow):
         self._transcript_windows: dict[str, TranscriptViewerDialog] = {}
         self._comment_publishers: dict[str, SoopCommentPublisher] = {}
         self._comment_publish_acknowledged = False
+        self._soop_login_window: SoopLoginWindow | None = None
+        self._soop_auth_actions: list[dict[str, object]] = []
+        self._soop_auth_show_scheduled = False
+        self._manual_link_auth_resource = ""
+        self._soop_auth_resource_by_vod: dict[str, str] = {}
         self._analysis_queue: list[str] = self.database.recover_analysis_queue()
         # Background auto faster-whisper (no Gemini) for newly discovered VODs.
         self._pretranscribe_queue: list[str] = []
@@ -989,6 +1004,12 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.resolved.connect(self._manual_link_resolved)
         worker.failed.connect(self._manual_link_failed)
+        worker.authentication_required.connect(
+            lambda page_url, original=value: self._manual_link_authentication_required(
+                original,
+                page_url,
+            )
+        )
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._manual_link_thread_finished)
@@ -1035,6 +1056,9 @@ class MainWindow(QMainWindow):
                     self._manual_link_failed(str(error))
                     return
                 self._apply_linked_replay(reanalysis_live_id, vod.vod_id)
+                transfer_auth = getattr(self, "_transfer_manual_soop_auth", None)
+                if callable(transfer_auth):
+                    transfer_auth(vod.vod_id)
                 self._pending_reanalysis_start = (
                     reanalysis_live_id,
                     vod.vod_id,
@@ -1064,7 +1088,13 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "수동 다시보기를 추가했습니다. 고속 AI 분석을 시작합니다."
             )
-            QTimer.singleShot(0, lambda: self.start_analysis(vod.vod_id))
+            transfer_auth = getattr(self, "_transfer_manual_soop_auth", None)
+            if callable(transfer_auth):
+                transfer_auth(vod.vod_id)
+            QTimer.singleShot(
+                0,
+                lambda vod_id=vod.vod_id: self._start_scoped_vod_analysis(vod_id),
+            )
             return
 
         if isinstance(result, LiveAudioSource):
@@ -1099,7 +1129,11 @@ class MainWindow(QMainWindow):
             self._select_streamer_tab(vod.streamer_id)
             self.load_vods()
             self.open_timeline(vod.vod_id)
-            self.start_live_analysis(vod.vod_id, result)
+            transfer_auth = getattr(self, "_transfer_manual_soop_auth", None)
+            if callable(transfer_auth):
+                transfer_auth(vod.vod_id)
+            if not self.start_live_analysis(vod.vod_id, result):
+                self._release_soop_auth_for_vod(vod.vod_id)
             return
 
         self._manual_link_failed("지원하지 않는 링크 확인 결과입니다.")
@@ -1108,20 +1142,39 @@ class MainWindow(QMainWindow):
     def _manual_link_failed(self, message: str) -> None:
         self._pending_reanalysis_live_id = ""
         self._pending_reanalysis_start = None
+        self._release_manual_soop_auth()
         if getattr(self, "_close_after_analysis", False):
             return
         self.status_label.setText(f"수동 링크 확인 실패: {message}")
         QMessageBox.critical(self, "수동 링크 확인 실패", message)
 
+    def _manual_link_authentication_required(
+        self,
+        original_url: str,
+        page_url: str,
+    ) -> None:
+        self._release_manual_soop_auth()
+        self.status_label.setText(
+            "19세 콘텐츠입니다. SOOP 로그인과 성인 인증을 완료하면 자동으로 다시 확인합니다."
+        )
+        self._queue_soop_authentication(
+            "manual_link",
+            page_url,
+            "19세 SOOP 링크",
+            url=original_url,
+        )
+
     @Slot()
     def _manual_link_thread_finished(self) -> None:
         self._manual_link_job = None
+        self._release_manual_soop_auth()
         self.manual_link_button.setEnabled(True)
         self.manual_link_input.setEnabled(True)
         pending_reanalysis = self._pending_reanalysis_start
         self._pending_reanalysis_start = None
         if pending_reanalysis is not None:
             if self._close_after_analysis:
+                self._release_soop_auth_for_vod(pending_reanalysis[1])
                 if not self._active_jobs():
                     QTimer.singleShot(0, self.close)
                 return
@@ -1136,6 +1189,223 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.close)
         else:
             self._resume_analysis_queue_if_idle()
+
+    def _claim_manual_soop_auth(self, page_url: str) -> bool:
+        self._release_manual_soop_auth()
+        if not authorize_soop_resource(page_url):
+            return False
+        self._manual_link_auth_resource = page_url
+        return True
+
+    def _release_manual_soop_auth(self) -> None:
+        page_url = self._manual_link_auth_resource
+        self._manual_link_auth_resource = ""
+        if page_url:
+            revoke_soop_resource(page_url)
+
+    def _claim_soop_auth_for_vod(self, vod_id: str, page_url: str) -> bool:
+        self._release_soop_auth_for_vod(vod_id)
+        if not vod_id or not authorize_soop_resource(page_url):
+            return False
+        self._soop_auth_resource_by_vod[vod_id] = page_url
+        return True
+
+    def _transfer_manual_soop_auth(self, vod_id: str) -> None:
+        page_url = self._manual_link_auth_resource
+        if not page_url or not vod_id:
+            return
+        self._manual_link_auth_resource = ""
+        self._release_soop_auth_for_vod(vod_id)
+        self._soop_auth_resource_by_vod[vod_id] = page_url
+
+    def _release_soop_auth_for_vod(self, vod_id: str) -> None:
+        page_url = self._soop_auth_resource_by_vod.pop(vod_id, "")
+        if page_url:
+            revoke_soop_resource(page_url)
+
+    def _start_scoped_vod_analysis(self, vod_id: str) -> None:
+        self.start_analysis(vod_id)
+        if (
+            vod_id not in self._analysis_jobs
+            and vod_id not in self._analysis_queue
+        ):
+            self._release_soop_auth_for_vod(vod_id)
+
+    def _release_all_soop_auth(self) -> None:
+        self._manual_link_auth_resource = ""
+        self._soop_auth_resource_by_vod.clear()
+        clear_soop_session_cookies()
+
+    def _queue_soop_authentication(
+        self,
+        action: str,
+        page_url: str,
+        description: str,
+        **payload: object,
+    ) -> None:
+        item = {
+            "action": action,
+            "page_url": str(page_url or "https://www.sooplive.com/"),
+            "description": description,
+            **payload,
+        }
+        identity = (
+            item.get("action"),
+            item.get("url"),
+            item.get("vod_id"),
+            item.get("target_vod_id"),
+        )
+        if not any(
+            (
+                existing.get("action"),
+                existing.get("url"),
+                existing.get("vod_id"),
+                existing.get("target_vod_id"),
+            )
+            == identity
+            for existing in self._soop_auth_actions
+        ):
+            self._soop_auth_actions.append(item)
+        if not self._soop_auth_show_scheduled:
+            self._soop_auth_show_scheduled = True
+            QTimer.singleShot(0, self._show_soop_login)
+
+    def _show_soop_login(self) -> None:
+        self._soop_auth_show_scheduled = False
+        if not self._soop_auth_actions:
+            return
+        if self._soop_login_window is not None:
+            self._soop_login_window.show()
+            self._soop_login_window.raise_()
+            self._soop_login_window.activateWindow()
+            return
+        first = self._soop_auth_actions[0]
+        window = SoopLoginWindow(
+            str(first.get("page_url", "")),
+            str(first.get("description", "19세 SOOP 콘텐츠")),
+            self,
+        )
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.authenticated.connect(self._soop_authenticated)
+        window.closed.connect(self._soop_authentication_cancelled)
+        self._soop_login_window = window
+        window.open_window()
+
+    def _soop_authenticated(self) -> None:
+        window = self._soop_login_window
+        self._soop_login_window = None
+        actions = list(self._soop_auth_actions)
+        self._soop_auth_actions.clear()
+        self.status_label.setText(
+            "SOOP 로그인 세션을 확인했습니다. 대기 중인 FW/분석 작업을 다시 시작합니다."
+        )
+        if window is not None:
+            window.deleteLater()
+        QTimer.singleShot(0, lambda pending=actions: self._retry_soop_auth_actions(pending))
+
+    def _soop_authentication_cancelled(self) -> None:
+        cancelled_actions = list(self._soop_auth_actions)
+        self._soop_login_window = None
+        self._soop_auth_actions.clear()
+        if any(
+            str(item.get("action", "")) == "manual_link"
+            for item in cancelled_actions
+        ):
+            self._pending_reanalysis_live_id = ""
+            self._pending_reanalysis_start = None
+        reconnect_ids = {
+            str(item.get("vod_id", ""))
+            for item in cancelled_actions
+            if str(item.get("action", "")) == "live_reconnect"
+            and str(item.get("vod_id", ""))
+        }
+        for vod_id in reconnect_ids:
+            self._finish_unavailable_live_session(
+                vod_id,
+                "사용자가 SOOP 로그인과 성인 인증을 취소했습니다.",
+            )
+        self.status_label.setText(
+            "SOOP 로그인을 취소했습니다. 19세 콘텐츠 작업은 시작하지 않았습니다."
+        )
+        QTimer.singleShot(0, self._resume_analysis_queue_if_idle)
+
+    def _retry_soop_auth_actions(self, actions: list[dict[str, object]]) -> None:
+        # The originating worker normally finishes before the user can sign in.
+        # If a very fast callback wins that race, retry once Qt has cleaned it up.
+        if self._close_after_analysis:
+            self._release_all_soop_auth()
+            return
+        if (
+            self._manual_link_job is not None
+            or self._live_reconnect_job is not None
+            or self._analysis_jobs
+            or self._pretranscribe_jobs
+        ):
+            QTimer.singleShot(
+                100,
+                lambda pending=actions: self._retry_soop_auth_actions(pending),
+            )
+            return
+        for item in actions:
+            action = str(item.get("action", ""))
+            page_url = str(item.get("page_url", ""))
+            if action == "manual_link":
+                url = str(item.get("url", ""))
+                if url and self._claim_manual_soop_auth(page_url):
+                    self.manual_link_input.setText(url)
+                    self.resolve_manual_link()
+                    if self._manual_link_job is None:
+                        self._release_manual_soop_auth()
+                continue
+            if action == "analysis":
+                vod_id = str(item.get("vod_id", ""))
+                target_vod_id = str(item.get("target_vod_id", "")) or vod_id
+                if (
+                    vod_id
+                    and self._claim_soop_auth_for_vod(target_vod_id, page_url)
+                ):
+                    self.start_analysis(
+                        vod_id,
+                        target_vod_id=target_vod_id,
+                        revision_reason="19세 로그인 후 자동 재시도 전",
+                        reusable_live_vods=tuple(
+                            value
+                            for value in item.get("reusable_live_vods", ())
+                            if isinstance(value, Vod)
+                        ),
+                    )
+                    if (
+                        target_vod_id not in self._analysis_jobs
+                        and vod_id not in self._analysis_queue
+                    ):
+                        self._release_soop_auth_for_vod(target_vod_id)
+                continue
+            if action == "transcription":
+                vod_id = str(item.get("vod_id", ""))
+                if (
+                    vod_id
+                    and self._claim_soop_auth_for_vod(vod_id, page_url)
+                ):
+                    self.start_transcription(vod_id)
+                    if (
+                        vod_id not in self._pretranscribe_jobs
+                        and vod_id not in self._pretranscribe_queue
+                    ):
+                        self._release_soop_auth_for_vod(vod_id)
+                continue
+            if action == "live_reconnect":
+                vod_id = str(item.get("vod_id", ""))
+                if (
+                    vod_id
+                    and self._claim_soop_auth_for_vod(vod_id, page_url)
+                ):
+                    self._schedule_live_reconnect_retry(0)
+        if (
+            not self._manual_link_auth_resource
+            and not self._soop_auth_resource_by_vod
+        ):
+            clear_soop_session_cookies()
+        self._resume_analysis_queue_if_idle()
 
     def refresh_discovery(self) -> None:
         if self.discovery.busy:
@@ -2425,6 +2695,8 @@ class MainWindow(QMainWindow):
         self._live_reconnect_retry_scheduled = False
         if (
             self._close_after_analysis
+            or getattr(self, "_soop_auth_actions", ())
+            or getattr(self, "_soop_login_window", None) is not None
             or not self._stale_live_sessions
             or self._live_reconnect_job is not None
         ):
@@ -2454,6 +2726,7 @@ class MainWindow(QMainWindow):
             or vod.source_kind != "live"
             or vod.state != VodState.ANALYZING.value
         ):
+            self._release_soop_auth_for_vod(vod_id)
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
                 editor.set_live_reconnect_pending(False)
@@ -2463,6 +2736,7 @@ class MainWindow(QMainWindow):
 
         analyzer = LocalWhisperGeminiAnalyzer.for_live_transcription(self.database)
         if not analyzer.transcription_available:
+            self._release_soop_auth_for_vod(vod_id)
             editor = self._editor_tabs.get(vod_id)
             if editor is not None:
                 editor.set_live_reconnect_pending(True)
@@ -2495,6 +2769,9 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.resolved.connect(self._live_reconnect_resolved)
         worker.failed.connect(self._live_reconnect_failed)
+        worker.authentication_required.connect(
+            self._live_reconnect_authentication_required
+        )
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._live_reconnect_thread_finished)
@@ -2550,6 +2827,25 @@ class MainWindow(QMainWindow):
             "SOOP 라이브 자동 재연결에 실패했습니다."
         )
 
+    @Slot(str)
+    def _live_reconnect_authentication_required(self, page_url: str) -> None:
+        vod_id = self._live_reconnect_target_id
+        if not vod_id:
+            return
+        self._release_soop_auth_for_vod(vod_id)
+        self._live_reconnect_error = "SOOP_LOGIN_REQUIRED"
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.status_label.setText(
+                "19세 라이브 재연결 대기 · SOOP 로그인과 성인 인증을 완료하세요."
+            )
+        self._queue_soop_authentication(
+            "live_reconnect",
+            page_url,
+            "19세 라이브 자동 재연결",
+            vod_id=vod_id,
+        )
+
     @Slot()
     def _live_reconnect_thread_finished(self) -> None:
         vod_id = self._live_reconnect_target_id
@@ -2562,6 +2858,7 @@ class MainWindow(QMainWindow):
 
         if vod_id in self._cancelled_live_reconnect_ids:
             self._cancelled_live_reconnect_ids.discard(vod_id)
+            self._release_soop_auth_for_vod(vod_id)
             QTimer.singleShot(0, self._resume_analysis_queue_if_idle)
             return
 
@@ -2571,6 +2868,13 @@ class MainWindow(QMainWindow):
             return
         if not vod_id:
             self._schedule_live_reconnect_retry(1_500)
+            return
+
+        if error == "SOOP_LOGIN_REQUIRED":
+            self.status_label.setText(
+                "19세 라이브 재연결을 위해 SOOP 로그인과 성인 인증을 기다립니다."
+            )
+            self._show_soop_login()
             return
 
         vod = self.database.get_vod(vod_id)
@@ -2676,6 +2980,7 @@ class MainWindow(QMainWindow):
         vod_id: str,
         message: str,
     ) -> None:
+        self._release_soop_auth_for_vod(vod_id)
         self._remove_stale_live_session(vod_id)
         document = self.database.get_timeline(vod_id)
         if document is not None:
@@ -2712,7 +3017,9 @@ class MainWindow(QMainWindow):
 
     def _resume_persisted_analysis(self) -> None:
         if (
-            self._analysis_jobs
+            getattr(self, "_soop_auth_actions", ())
+            or getattr(self, "_soop_login_window", None) is not None
+            or self._analysis_jobs
             or self._live_jobs
             or self._live_reconnect_job is not None
             or self._stale_live_sessions
@@ -2748,7 +3055,11 @@ class MainWindow(QMainWindow):
         self.start_analysis(vod_id, _from_queue=True)
 
     def _resume_analysis_queue_if_idle(self) -> None:
-        if self._close_after_analysis:
+        if (
+            self._close_after_analysis
+            or getattr(self, "_soop_auth_actions", ())
+            or getattr(self, "_soop_login_window", None) is not None
+        ):
             return
         if self._stale_live_sessions:
             self._schedule_live_reconnect_retry(0)
@@ -2899,7 +3210,9 @@ class MainWindow(QMainWindow):
 
     def _resume_pretranscribe_if_idle(self) -> None:
         if (
-            len(self._pretranscribe_jobs)
+            getattr(self, "_soop_auth_actions", ())
+            or getattr(self, "_soop_login_window", None) is not None
+            or len(self._pretranscribe_jobs)
             >= self._MAX_CONCURRENT_PRETRANSCRIBES
             or not self._pretranscribe_queue
         ):
@@ -2962,6 +3275,9 @@ class MainWindow(QMainWindow):
         worker.progress_changed.connect(self._pretranscribe_progress)
         worker.succeeded.connect(self._pretranscribe_succeeded)
         worker.failed.connect(self._pretranscribe_failed)
+        worker.authentication_required.connect(
+            self._pretranscribe_authentication_required
+        )
         worker.cancelled.connect(self._pretranscribe_cancelled)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -3047,6 +3363,39 @@ class MainWindow(QMainWindow):
                 editor.status_label.setText(f"FW 텍스트 추출 실패: {message}")
             self.status_label.setText(f"FW 텍스트 추출 실패: {message}")
 
+    def _pretranscribe_authentication_required(
+        self,
+        vod_id: str,
+        page_url: str,
+    ) -> None:
+        self._release_soop_auth_for_vod(vod_id)
+        if vod_id in self._pretranscribe_queue:
+            self._pretranscribe_queue.remove(vod_id)
+        queued_analysis = vod_id in self._analysis_queue
+        if queued_analysis:
+            self._analysis_queue.remove(vod_id)
+            self.database.remove_analysis_queue(vod_id)
+            self.database.set_vod_state(vod_id, VodState.REVIEW.value)
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            if queued_analysis:
+                editor.set_analysis_running(False)
+            else:
+                editor.set_transcription_running(False)
+            editor.status_label.setText(
+                "19세 VOD 감지 · SOOP 로그인과 성인 인증 후 FW 추출을 자동 재시도합니다."
+            )
+        self.status_label.setText(
+            "19세 VOD입니다. SOOP 로그인과 성인 인증을 기다립니다."
+        )
+        self._queue_soop_authentication(
+            "analysis" if queued_analysis else "transcription",
+            page_url,
+            "19세 VOD FW 자막 추출",
+            vod_id=vod_id,
+        )
+        self.load_vods()
+
     def _pretranscribe_cancelled(self, vod_id: str) -> None:
         # Interrupted (usually by a manual job). Leave it at the front of the
         # queue so it resumes from its partial capture once things are idle.
@@ -3069,6 +3418,7 @@ class MainWindow(QMainWindow):
         vod_id = str(thread.property("vod_id") or "") if thread is not None else ""
         if vod_id:
             self._pretranscribe_jobs.pop(vod_id, None)
+            self._release_soop_auth_for_vod(vod_id)
         if self._close_after_analysis:
             if not self._active_jobs():
                 QTimer.singleShot(0, self.close)
@@ -3184,6 +3534,13 @@ class MainWindow(QMainWindow):
             revision_reason="전체 다시보기 재분석 전 · 라이브 자막 기록",
             reusable_live_vods=tuple(reusable_live_vods),
         )
+        if (
+            replay.vod_id not in getattr(self, "_analysis_jobs", {})
+            and replay.vod_id not in getattr(self, "_analysis_queue", ())
+        ):
+            release_auth = getattr(self, "_release_soop_auth_for_vod", None)
+            if callable(release_auth):
+                release_auth(replay.vod_id)
 
     def start_analysis(
         self,
@@ -3363,6 +3720,9 @@ class MainWindow(QMainWindow):
         worker.usage_changed.connect(editor.set_ai_usage)
         worker.succeeded.connect(self._analysis_succeeded)
         worker.failed.connect(self._analysis_failed)
+        worker.authentication_required.connect(
+            self._analysis_authentication_required
+        )
         worker.cancelled.connect(self._analysis_cancelled)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -3619,6 +3979,7 @@ class MainWindow(QMainWindow):
         vod_id = str(thread.property("vod_id") or "") if thread is not None else ""
         if vod_id:
             self._live_jobs.pop(vod_id, None)
+            self._release_soop_auth_for_vod(vod_id)
         if self._close_after_analysis and not self._active_jobs():
             QTimer.singleShot(0, self.close)
         else:
@@ -4062,6 +4423,38 @@ class MainWindow(QMainWindow):
         self.load_vods()
 
     @Slot(str, str)
+    def _analysis_authentication_required(
+        self,
+        vod_id: str,
+        page_url: str,
+    ) -> None:
+        source_vod_id = self._analysis_source_ids.get(vod_id, vod_id)
+        job = self._analysis_jobs.get(vod_id)
+        reusable_live_vods = (
+            tuple(getattr(job[1], "reusable_live_vods", ()))
+            if job is not None
+            else ()
+        )
+        self._release_soop_auth_for_vod(vod_id)
+        self._analysis_cancelled(vod_id)
+        editor = self._editor_tabs.get(vod_id)
+        if editor is not None:
+            editor.status_label.setText(
+                "19세 VOD 감지 · SOOP 로그인과 성인 인증 후 FW/AI 분석을 자동 재시도합니다."
+            )
+        self.status_label.setText(
+            "19세 VOD입니다. SOOP 로그인과 성인 인증을 기다립니다."
+        )
+        self._queue_soop_authentication(
+            "analysis",
+            page_url,
+            "19세 VOD FW/AI 분석",
+            vod_id=source_vod_id,
+            target_vod_id=vod_id,
+            reusable_live_vods=reusable_live_vods,
+        )
+
+    @Slot(str, str)
     def _analysis_failed(self, vod_id: str, message: str) -> None:
         source_vod_id = self._analysis_source_ids.get(vod_id, vod_id)
         targeted = source_vod_id != vod_id
@@ -4161,6 +4554,7 @@ class MainWindow(QMainWindow):
         self._analysis_background_fw_ready.discard(vod_id)
         self._analysis_source_ids.pop(vod_id, None)
         self._analysis_previous_states.pop(vod_id, None)
+        self._release_soop_auth_for_vod(vod_id)
         if self._close_after_analysis:
             self._analysis_queue.clear()
             if not self._active_jobs():
@@ -4581,6 +4975,11 @@ class MainWindow(QMainWindow):
         self._quit_application()
 
     def _close_auxiliary_windows(self) -> None:
+        self._soop_auth_actions.clear()
+        self._release_all_soop_auth()
+        if self._soop_login_window is not None:
+            self._soop_login_window.close()
+            self._soop_login_window = None
         for editor in list(self._editor_tabs.values()):
             editor.close_review_player()
         for window in list(self._transcript_windows.values()):
