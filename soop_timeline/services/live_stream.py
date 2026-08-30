@@ -10,6 +10,12 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .transcription import CancelCallback
+from .soop_auth import (
+    SoopLoginRequired,
+    authenticated_headers,
+    response_requires_soop_login,
+    soop_resource_authorized,
+)
 from .vod_stream import (
     MAX_METADATA_BYTES,
     USER_AGENT,
@@ -41,6 +47,7 @@ class LiveAudioSource:
     page_url: str
     runtime_seconds: float
     stream_url: str
+    auth_resource_url: str = ""
 
 
 def fetch_live_audio_source(
@@ -59,6 +66,8 @@ def fetch_live_audio_source(
         cancelled,
     )
     if int(live.get("RESULT", 0) or 0) != 1:
+        if response_requires_soop_login(live):
+            raise SoopLoginRequired(page_url, "라이브 방송")
         raise RuntimeError(_live_failure_message(live))
     resolved_broadcast_no = str(live.get("BNO", "") or "").strip()
     if not resolved_broadcast_no.isdigit():
@@ -73,8 +82,8 @@ def fetch_live_audio_source(
         grade = int(live.get("GRADE", 0) or 0)
     except (TypeError, ValueError):
         grade = 0
-    if grade >= 19:
-        raise RuntimeError("연령 확인이 필요한 라이브 방송은 분석하지 않습니다.")
+    if grade >= 19 and not soop_resource_authorized(page_url):
+        raise SoopLoginRequired(page_url, "라이브 방송")
     try:
         minimum_tier = int(live.get("P_MIN_TIER", 0) or 0)
     except (TypeError, ValueError):
@@ -92,6 +101,8 @@ def fetch_live_audio_source(
     )
     aid = str(aid_info.get("AID", "") or "").strip()
     if int(aid_info.get("RESULT", 0) or 0) != 1 or not aid:
+        if grade >= 19 or response_requires_soop_login(aid_info):
+            raise SoopLoginRequired(page_url, "라이브 방송")
         raise RuntimeError("SOOP 라이브 재생 인증 정보를 받지 못했습니다.")
 
     resource_domain = str(live.get("RMD", "") or "").strip().rstrip("/")
@@ -110,11 +121,13 @@ def fetch_live_audio_source(
     )
     manager_url = f"{resource_domain}/broad_stream_assign.html?{manager_query}"
     manager = _request_json(
-        Request(manager_url, headers=_live_headers(page_url)),
+        Request(manager_url, headers=_live_headers(page_url, manager_url)),
         "SOOP 라이브 재생 주소를 받지 못했습니다.",
     )
     stream_url = str(manager.get("view_url", "") or "").strip()
     if int(manager.get("result", 0) or 0) != 1 or not _is_soop_https_url(stream_url):
+        if grade >= 19 or response_requires_soop_login(manager):
+            raise SoopLoginRequired(page_url, "라이브 방송")
         raise RuntimeError("SOOP 라이브 재생 주소가 올바르지 않습니다.")
     separator = "&" if urlparse(stream_url).query else "?"
     stream_url = f"{stream_url}{separator}{urlencode({'aid': aid})}"
@@ -134,6 +147,9 @@ def fetch_live_audio_source(
         page_url=canonical_url,
         runtime_seconds=runtime_seconds,
         stream_url=stream_url,
+        auth_resource_url=(
+            page_url if soop_resource_authorized(page_url) else ""
+        ),
     )
 
 
@@ -166,11 +182,16 @@ def iter_live_audio_chunks(
     buffer = bytearray()
     local_start_samples = 0
     emitted = False
+    cookie_header = authenticated_headers(
+        source.stream_url,
+        source.auth_resource_url,
+    ).get("Cookie", "")
     options = {
         "headers": (
             f"Referer: {LIVE_ORIGIN}/\r\n"
             f"Origin: {LIVE_ORIGIN}\r\n"
             f"User-Agent: {USER_AGENT}\r\n"
+            + (f"Cookie: {cookie_header}\r\n" if cookie_header else "")
         ),
         "rw_timeout": "8000000",
         "reconnect": "1",
@@ -353,7 +374,7 @@ def _request_live_info(
             "is_revive": "false",
         }
     ).encode("ascii")
-    headers = _live_headers(page_url)
+    headers = _live_headers(page_url, query_url)
     headers.update(
         {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -392,13 +413,15 @@ def _request_json(request: Request, failure_message: str) -> dict[str, object]:
     return payload
 
 
-def _live_headers(page_url: str) -> dict[str, str]:
-    return {
+def _live_headers(page_url: str, request_url: str = LIVE_INFO_URL) -> dict[str, str]:
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "Origin": LIVE_ORIGIN,
         "Referer": page_url,
         "User-Agent": USER_AGENT,
     }
+    headers.update(authenticated_headers(request_url, page_url))
+    return headers
 
 
 def _stream_manager_cdn_type(value: str) -> str:

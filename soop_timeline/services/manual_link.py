@@ -8,6 +8,11 @@ from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .transcription import format_timestamp
+from .soop_auth import (
+    SoopLoginRequired,
+    authenticated_headers,
+    response_requires_soop_login,
+)
 from .vod_stream import MAX_METADATA_BYTES, USER_AGENT, VOD_INFO_URL, VOD_ORIGIN
 
 
@@ -141,16 +146,18 @@ def resolve_vod_link(
             "nPlaylistIdx": "0",
         }
     ).encode("ascii")
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": VOD_ORIGIN,
+        "Referer": parsed.page_url,
+        "User-Agent": USER_AGENT,
+    }
+    headers.update(authenticated_headers(VOD_INFO_URL, parsed.page_url))
     request = Request(
         VOD_INFO_URL,
         data=body,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": VOD_ORIGIN,
-            "Referer": parsed.page_url,
-            "User-Agent": USER_AGENT,
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -167,10 +174,14 @@ def resolve_vod_link(
         raise RuntimeError("SOOP 다시보기 정보 응답이 비정상적으로 큽니다.")
     try:
         payload = json.loads(raw.decode("utf-8"))
-        data = payload["data"]
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
         raise RuntimeError("SOOP 다시보기 정보 형식이 변경되었습니다.") from error
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise RuntimeError("SOOP 다시보기 정보 형식이 변경되었습니다.")
     if int(payload.get("result", 0) or 0) != 1 or not isinstance(data, dict):
+        if response_requires_soop_login(payload):
+            raise SoopLoginRequired(parsed.page_url, "VOD")
         raise RuntimeError("해당 SOOP 다시보기를 찾지 못했습니다.")
     if int(data.get("is_public", 0) or 0) != 1:
         raise RuntimeError("전체 공개 다시보기만 수동으로 분석할 수 있습니다.")
@@ -180,7 +191,7 @@ def resolve_vod_link(
         "pass",
         "none",
     }:
-        raise RuntimeError("로그인 또는 연령 확인이 필요한 다시보기는 분석하지 않습니다.")
+        raise SoopLoginRequired(parsed.page_url, "VOD")
 
     try:
         duration_seconds = max(

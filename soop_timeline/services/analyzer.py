@@ -470,15 +470,17 @@ class LocalWhisperGeminiAnalyzer(TimelineAnalyzer):
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
 
-        generator = self._new_generator()
-        self._preflight(generator, progress, cancelled)
-
         from .vod_stream import fetch_vod_audio_source
 
         # A VOD can still be growing immediately after a live broadcast ends.
         # Validate every completed cache against current SOOP media metadata
-        # before treating it as final.
+        # before treating it as final. This check also detects a 19+ gate before
+        # spending an AI provider call; the UI can then obtain a SOOP session
+        # and retry the same job.
         source = fetch_vod_audio_source(vod, progress, cancelled)
+
+        generator = self._new_generator()
+        self._preflight(generator, progress, cancelled)
 
         cache_path = analysis_data_dir(vod.vod_id) / "transcript.json"
         partial_path = analysis_data_dir(vod.vod_id) / "transcript.partial.json"

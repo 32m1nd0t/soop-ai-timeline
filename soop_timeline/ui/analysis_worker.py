@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ..models import Vod
 from ..services.analyzer import TimelineAnalyzer
+from ..services.soop_auth import SoopLoginRequired
 from ..services.transcription import AnalysisCancelled
 
 
@@ -18,6 +19,7 @@ class AnalysisWorker(QObject):
     usage_changed = Signal(str)
     succeeded = Signal(str, str)
     failed = Signal(str, str)
+    authentication_required = Signal(str, str)
     cancelled = Signal(str)
     finished = Signal()
 
@@ -59,6 +61,11 @@ class AnalysisWorker(QObject):
             document = self.analyzer.analyze_vod(self.vod, **arguments)
         except AnalysisCancelled:
             self.cancelled.emit(self.result_vod_id)
+        except SoopLoginRequired as error:
+            self.authentication_required.emit(
+                self.result_vod_id,
+                error.page_url,
+            )
         except Exception as error:
             logger.exception("VOD analysis failed for %s", self.vod.vod_id)
             self.failed.emit(self.result_vod_id, str(error))
@@ -82,6 +89,7 @@ class PreTranscribeWorker(QObject):
     progress_changed = Signal(str, int, str)
     succeeded = Signal(str)
     failed = Signal(str, str)
+    authentication_required = Signal(str, str)
     cancelled = Signal(str)
     finished = Signal()
 
@@ -117,6 +125,11 @@ class PreTranscribeWorker(QObject):
             self.analyzer.transcribe_vod(self.vod, **arguments)
         except AnalysisCancelled:
             self.cancelled.emit(self.vod.vod_id)
+        except SoopLoginRequired as error:
+            self.authentication_required.emit(
+                self.vod.vod_id,
+                error.page_url,
+            )
         except Exception as error:
             logger.exception("Pre-transcribe failed for %s", self.vod.vod_id)
             self.failed.emit(self.vod.vod_id, str(error))

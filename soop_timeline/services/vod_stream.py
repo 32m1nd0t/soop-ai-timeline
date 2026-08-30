@@ -11,6 +11,12 @@ from urllib.request import Request, urlopen
 import numpy as np
 
 from ..models import Vod
+from .soop_auth import (
+    SoopLoginRequired,
+    authenticated_headers,
+    response_requires_soop_login,
+    soop_resource_authorized,
+)
 from .transcription import AnalysisCancelled, CancelCallback, ProgressCallback
 
 
@@ -38,6 +44,7 @@ class VodAudioSource:
     vod_id: str
     total_duration_seconds: float
     parts: tuple[VodAudioPart, ...]
+    auth_resource_url: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,7 +119,8 @@ def fetch_vod_audio_source(
     """Return every public, audio-only HLS part used by SOOP's web player.
 
     This is a single metadata request. It does not download or persist video data,
-    does not use login cookies, and refuses protected/non-public VODs.
+    and refuses paid, hidden, or non-public VODs. An in-app SOOP session is used
+    only after the user signs in to access an age-restricted public VOD.
     """
     if cancelled():
         raise AnalysisCancelled("분석을 취소했습니다.")
@@ -127,16 +135,18 @@ def fetch_vod_audio_source(
             "nPlaylistIdx": "0",
         }
     ).encode("ascii")
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": VOD_ORIGIN,
+        "Referer": vod.url,
+        "User-Agent": USER_AGENT,
+    }
+    headers.update(authenticated_headers(VOD_INFO_URL, vod.url))
     request = Request(
         VOD_INFO_URL,
         data=body,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": VOD_ORIGIN,
-            "Referer": vod.url,
-            "User-Agent": USER_AGENT,
-        },
+        headers=headers,
         method="POST",
     )
 
@@ -169,14 +179,22 @@ def fetch_vod_audio_source(
 
     try:
         payload = json.loads(raw.decode("utf-8"))
-        data = payload["data"]
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
         raise RuntimeError(
             "SOOP VOD 정보 형식이 변경되어 고속 분석을 시작할 수 없습니다. "
             "1배속 캡처로 전환하지 않았습니다."
         ) from error
 
+    data = payload.get("data") if isinstance(payload, dict) else None
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "SOOP VOD 정보 형식이 변경되어 고속 분석을 시작할 수 없습니다. "
+            "1배속 캡처로 전환하지 않았습니다."
+        )
     if int(payload.get("result", 0) or 0) != 1 or not isinstance(data, dict):
+        if response_requires_soop_login(payload):
+            raise SoopLoginRequired(vod.url, "VOD")
         raise RuntimeError(_api_failure_message(payload))
     if int(data.get("is_public", 0) or 0) != 1:
         raise RuntimeError("전체 공개 VOD만 분석할 수 있습니다.")
@@ -184,7 +202,7 @@ def fetch_vod_audio_source(
         raise RuntimeError("유료 또는 구매 제한 VOD는 분석하지 않습니다.")
     adult_status = str(data.get("adult_status", "pass") or "pass").lower()
     if adult_status not in {"pass", "none"}:
-        raise RuntimeError("로그인 또는 연령 확인이 필요한 VOD는 분석하지 않습니다.")
+        raise SoopLoginRequired(vod.url, "VOD")
 
     raw_files = data.get("files")
     if not isinstance(raw_files, list) or not raw_files:
@@ -230,7 +248,12 @@ def fetch_vod_audio_source(
         f"오디오 전용 스트림 {len(parts):,}개 확인 · "
         f"총 {format_timestamp(total_duration)} · 영상 데이터는 받지 않습니다.",
     )
-    return VodAudioSource(vod.vod_id, total_duration, tuple(parts))
+    return VodAudioSource(
+        vod.vod_id,
+        total_duration,
+        tuple(parts),
+        vod.url if soop_resource_authorized(vod.url) else "",
+    )
 
 
 def iter_audio_chunks(
@@ -274,6 +297,7 @@ def iter_audio_chunks(
             overlap_seconds=overlap_seconds,
             skip_seconds=max(0.0, resume_at - part_offset),
             stop_seconds=min(part.duration_seconds, stop_at - part_offset),
+            auth_resource_url=source.auth_resource_url,
         )
         part_offset += part.duration_seconds
 
@@ -287,6 +311,7 @@ def _iter_part_audio_chunks(
     overlap_seconds: int,
     skip_seconds: float = 0.0,
     stop_seconds: float | None = None,
+    auth_resource_url: str = "",
 ) -> Iterator[AudioChunk]:
     try:
         import av
@@ -306,10 +331,15 @@ def _iter_part_audio_chunks(
     )
     emitted = False
     reached_stop = False
+    cookie_header = authenticated_headers(
+        part.url,
+        auth_resource_url,
+    ).get("Cookie", "")
     options = {
         "headers": (
             f"Referer: {VOD_ORIGIN}/\r\n"
             f"User-Agent: {USER_AGENT}\r\n"
+            + (f"Cookie: {cookie_header}\r\n" if cookie_header else "")
         ),
         "rw_timeout": "20000000",
         "reconnect": "1",
