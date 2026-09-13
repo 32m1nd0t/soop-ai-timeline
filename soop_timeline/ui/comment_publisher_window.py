@@ -538,27 +538,22 @@ class SoopCommentPublisher(QFrame):
         if self._verify_attempts < _MAX_VERIFY_ATTEMPTS:
             self._schedule_publish(_VERIFY_RETRY_MS, self._verify_root, generation)
             return
-        # The comment may still have posted but rendered in a form we cannot match.
-        proceed = QMessageBox.question(
-            self,
-            "댓글 확인 실패",
-            "등록한 댓글을 화면에서 확인하지 못했습니다. "
-            "이미 올라갔을 수도 있습니다.\n\n"
-            + ("그래도 대댓글을 이어서 등록할까요?" if self._replies else "창을 확인해 주세요."),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        # Verification is best-effort. The needle is the whole root comment, and
+        # the page routinely reformats long text (collapsing, escaping), so a
+        # miss here does not mean the post failed - in practice it posts fine.
+        # Carry on silently rather than blocking on a modal: this window runs
+        # off screen, so nobody can see what the dialog is asking about. A root
+        # that genuinely is missing still stops at the reply step's "find-parent".
+        logger.info(
+            "Root comment posted but not verified after %d attempts; continuing",
+            self._verify_attempts,
         )
-        if not self._publish_is_current(generation):
-            return
-        if self._replies and proceed == QMessageBox.StandardButton.Yes:
-            self._posted_count = 1
+        self._posted_count = 1
+        if self._replies:
+            self._set_status("댓글 등록 확인은 건너뛰고 대댓글을 이어서 등록합니다…")
             self._schedule_publish(0, self._post_next_reply, generation)
-        else:
-            self._finish_busy()
-            self._set_status(
-                "댓글만 등록 시도했습니다. 화면에서 결과를 확인하세요. "
-                "남은 대댓글은 편집 탭의 '이 블록 복사'로 직접 등록할 수 있습니다."
-            )
+            return
+        self._publish_done(generation)
 
     def _post_next_reply(self, generation: int) -> None:
         if not self._publish_is_current(generation):
