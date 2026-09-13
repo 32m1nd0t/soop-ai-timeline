@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 from PySide6.QtCore import QThread, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QFontDatabase
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..database import Database
 from ..services.analyzer import DEFAULT_GEMINI_MODEL, DEFAULT_WHISPER_MODEL
+from ..services.ai_provider import MAX_PROBED_MODELS, AIModelHealth, AIModelOption
 from ..services.cache_manager import cache_size_bytes, human_size, remove_all_caches
 from ..services.credentials import get_gemini_api_key, save_gemini_api_key
 from ..services.gemini_timeline import DEFAULT_TOPIC_GRANULARITY
@@ -53,6 +54,7 @@ from ..services.update_checker import (
     UPDATE_MANIFEST_SETTING,
 )
 from .ai_connection_worker import AIConnectionTestWorker
+from .ai_model_worker import AIModelHealthWorker, AIModelListWorker
 
 
 class AnalysisSettingsDialog(QDialog):
@@ -69,6 +71,11 @@ class AnalysisSettingsDialog(QDialog):
         self.setMinimumWidth(580)
         self._test_thread: QThread | None = None
         self._test_worker: AIConnectionTestWorker | None = None
+        self._model_thread: QThread | None = None
+        self._model_worker: AIModelListWorker | None = None
+        self._health_thread: QThread | None = None
+        self._health_worker: AIModelHealthWorker | None = None
+        self._health_results: dict[str, AIModelHealth] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -103,11 +110,49 @@ class AnalysisSettingsDialog(QDialog):
         )
         form.addRow("Gemini API 키", self.api_key_input)
 
-        self.gemini_model_input = QLineEdit(
+        self.gemini_model_combo = QComboBox()
+        self.gemini_model_combo.setEditable(True)
+        self.gemini_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.gemini_model_combo.addItem(
             database.get_setting("gemini_model", DEFAULT_GEMINI_MODEL)
         )
-        self.gemini_model_input.setPlaceholderText(DEFAULT_GEMINI_MODEL)
-        form.addRow("Gemini 모델", self.gemini_model_input)
+        self.gemini_model_combo.lineEdit().setPlaceholderText(DEFAULT_GEMINI_MODEL)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.gemini_model_combo, 1)
+        self.model_refresh_button = QPushButton("목록 새로고침")
+        self.model_refresh_button.setToolTip(
+            "이 API 키로 지금 사용할 수 있는 모델을 Google에서 직접 받아옵니다."
+        )
+        self.model_refresh_button.clicked.connect(self._start_model_refresh)
+        model_row.addWidget(self.model_refresh_button)
+        form.addRow("Gemini 모델", model_row)
+
+        health_row = QHBoxLayout()
+        self.model_health_button = QPushButton("모델 상태 점검")
+        self.model_health_button.setToolTip(
+            "목록의 모델에 작은 요청을 한 번씩 보내 응답 여부와 소요 시간을 확인합니다."
+        )
+        self.model_health_button.clicked.connect(self._start_model_health_check)
+        self.model_health_status = QLabel(
+            "과부하(503)로 분석이 실패하면 어떤 모델이 살아 있는지 확인해 보세요."
+        )
+        self.model_health_status.setObjectName("muted")
+        self.model_health_status.setWordWrap(True)
+        health_row.addWidget(self.model_health_button)
+        health_row.addWidget(self.model_health_status, 1)
+        form.addRow("모델 상태", health_row)
+
+        self.model_health_output = QPlainTextEdit()
+        self.model_health_output.setReadOnly(True)
+        self.model_health_output.setFont(
+            QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        )
+        self.model_health_output.setPlaceholderText(
+            "‘모델 상태 점검’을 누르면 모델별 응답 결과가 여기에 표시됩니다."
+        )
+        self.model_health_output.setFixedHeight(140)
+        self.model_health_output.setVisible(False)
+        form.addRow("", self.model_health_output)
 
         test_row = QHBoxLayout()
         self.connection_test_button = QPushButton("Gemini 연결 테스트")
@@ -423,11 +468,171 @@ class AnalysisSettingsDialog(QDialog):
         layout.addWidget(close_buttons)
         dialog.exec()
 
-    def _start_connection_test(self) -> None:
-        if self._test_thread is not None:
+    def _selected_model_name(self) -> str:
+        """Return the API model id, not the ``name · display name`` label.
+
+        Items carry the bare id in their data role; a hand-typed entry has no
+        matching item, so the raw text is the id in that case.
+        """
+        text = self.gemini_model_combo.currentText().strip()
+        index = self.gemini_model_combo.currentIndex()
+        if index >= 0 and text == self.gemini_model_combo.itemText(index):
+            stored = str(self.gemini_model_combo.itemData(index) or "").strip()
+            if stored:
+                return stored
+        return text
+
+    def _ai_task_running(self) -> bool:
+        return any(
+            thread is not None
+            for thread in (self._test_thread, self._model_thread, self._health_thread)
+        )
+
+    def _start_model_refresh(self) -> None:
+        if self._ai_task_running():
             return
         api_key = self.api_key_input.text().strip()
-        model_name = self.gemini_model_input.text().strip()
+        if not api_key:
+            QMessageBox.information(self, "입력 확인", "Gemini API 키를 입력하세요.")
+            return
+        self.model_refresh_button.setEnabled(False)
+        self.model_health_button.setEnabled(False)
+        self.model_health_status.setText("사용 가능한 모델 목록을 받아오는 중…")
+        thread = QThread(self)
+        worker = AIModelListWorker(api_key)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._model_refresh_succeeded)
+        worker.failed.connect(self._model_refresh_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._model_refresh_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._model_thread = thread
+        self._model_worker = worker
+        thread.start()
+
+    def _model_refresh_succeeded(self, options: list) -> None:
+        entries: list[AIModelOption] = list(options)
+        if not entries:
+            self.model_health_status.setText(
+                "이 API 키로 쓸 수 있는 텍스트 모델을 찾지 못했습니다."
+            )
+            return
+        current = self._selected_model_name()
+        self.gemini_model_combo.blockSignals(True)
+        self.gemini_model_combo.clear()
+        for option in entries:
+            self.gemini_model_combo.addItem(option.label, option.name)
+        if current:
+            index = self.gemini_model_combo.findData(current)
+            if index >= 0:
+                self.gemini_model_combo.setCurrentIndex(index)
+            else:
+                # A hand-typed or retired name: keep it so nothing is lost.
+                self.gemini_model_combo.insertItem(0, current, current)
+                self.gemini_model_combo.setCurrentIndex(0)
+        self.gemini_model_combo.blockSignals(False)
+        self.model_health_status.setText(
+            f"모델 {len(entries):,}개를 불러왔습니다. 상태 점검으로 응답 여부를 확인하세요."
+        )
+
+    def _model_refresh_failed(self, message: str) -> None:
+        self.model_health_status.setText(f"모델 목록을 불러오지 못했습니다 · {message}")
+
+    def _model_refresh_finished(self) -> None:
+        self._model_thread = None
+        self._model_worker = None
+        self.model_refresh_button.setEnabled(True)
+        self.model_health_button.setEnabled(True)
+
+    def _probe_candidates(self) -> list[str]:
+        names: list[str] = []
+        current = self._selected_model_name()
+        if current:
+            names.append(current)
+        for index in range(self.gemini_model_combo.count()):
+            name = str(
+                self.gemini_model_combo.itemData(index)
+                or self.gemini_model_combo.itemText(index)
+            ).strip()
+            if name and name not in names:
+                names.append(name)
+        return names[:MAX_PROBED_MODELS]
+
+    def _start_model_health_check(self) -> None:
+        if self._ai_task_running():
+            return
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            QMessageBox.information(self, "입력 확인", "Gemini API 키를 입력하세요.")
+            return
+        candidates = self._probe_candidates()
+        if not candidates:
+            QMessageBox.information(self, "입력 확인", "점검할 모델이 없습니다.")
+            return
+        self._health_results = {}
+        self.model_health_output.setVisible(True)
+        self.model_health_output.setPlainText("")
+        self.model_health_button.setEnabled(False)
+        self.model_refresh_button.setEnabled(False)
+        self.model_health_status.setText(
+            f"모델 {len(candidates)}개에 요청을 보내는 중… (최대 1~2분)"
+        )
+        thread = QThread(self)
+        worker = AIModelHealthWorker(api_key, candidates)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.probed.connect(self._model_probed)
+        worker.failed.connect(self._model_health_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._model_health_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._health_thread = thread
+        self._health_worker = worker
+        thread.start()
+
+    def _model_probed(self, result: object) -> None:
+        health: AIModelHealth = result
+        self._health_results[health.name] = health
+        self._render_health_results()
+
+    def _render_health_results(self) -> None:
+        # Healthy models first, fastest first: the top line is the one to pick.
+        ordered = sorted(
+            self._health_results.values(),
+            key=lambda item: (not item.ok, item.seconds),
+        )
+        width = max((len(item.name) for item in ordered), default=0)
+        lines = [
+            f"{'OK ' if item.ok else 'X  '}{item.name:<{width}}  "
+            f"{item.seconds:5.1f}s  {item.detail}"
+            for item in ordered
+        ]
+        self.model_health_output.setPlainText("\n".join(lines))
+
+    def _model_health_failed(self, message: str) -> None:
+        self.model_health_status.setText(f"모델 상태 점검 실패 · {message}")
+
+    def _model_health_finished(self) -> None:
+        self._health_thread = None
+        self._health_worker = None
+        self.model_health_button.setEnabled(True)
+        self.model_refresh_button.setEnabled(True)
+        healthy = sum(1 for item in self._health_results.values() if item.ok)
+        total = len(self._health_results)
+        if total:
+            self.model_health_status.setText(
+                f"점검 완료 · 정상 {healthy}/{total}개. "
+                "OK인 모델 중 하나를 골라 저장하세요."
+            )
+
+    def _start_connection_test(self) -> None:
+        if self._ai_task_running():
+            return
+        api_key = self.api_key_input.text().strip()
+        model_name = self._selected_model_name()
         if not api_key:
             QMessageBox.information(self, "입력 확인", "Gemini API 키를 입력하세요.")
             return
@@ -436,8 +641,10 @@ class AnalysisSettingsDialog(QDialog):
             return
 
         self.connection_test_button.setEnabled(False)
+        self.model_refresh_button.setEnabled(False)
+        self.model_health_button.setEnabled(False)
         self.api_key_input.setEnabled(False)
-        self.gemini_model_input.setEnabled(False)
+        self.gemini_model_combo.setEnabled(False)
         self.connection_status.setText("API 키와 모델 권한을 확인하는 중…")
         thread = QThread(self)
         worker = AIConnectionTestWorker(
@@ -518,14 +725,20 @@ class AnalysisSettingsDialog(QDialog):
         self._test_thread = None
         self._test_worker = None
         self.connection_test_button.setEnabled(True)
+        self.model_refresh_button.setEnabled(True)
+        self.model_health_button.setEnabled(True)
         self.api_key_input.setEnabled(True)
-        self.gemini_model_input.setEnabled(True)
+        self.gemini_model_combo.setEnabled(True)
 
     def _save(self) -> None:
-        if self._test_thread is not None:
-            QMessageBox.information(self, "연결 테스트 중", "연결 테스트가 끝난 뒤 저장하세요.")
+        if self._ai_task_running():
+            QMessageBox.information(
+                self,
+                "확인 작업 진행 중",
+                "연결 테스트 또는 모델 점검이 끝난 뒤 저장하세요.",
+            )
             return
-        model_name = self.gemini_model_input.text().strip()
+        model_name = self._selected_model_name()
         if not model_name:
             QMessageBox.information(self, "입력 확인", "Gemini 모델 이름을 입력하세요.")
             return
@@ -582,11 +795,11 @@ class AnalysisSettingsDialog(QDialog):
         self.accept()
 
     def reject(self) -> None:
-        if self._test_thread is not None:
+        if self._ai_task_running():
             QMessageBox.information(
                 self,
-                "연결 테스트 중",
-                "연결 테스트가 끝난 뒤 창을 닫아 주세요.",
+                "확인 작업 진행 중",
+                "연결 테스트 또는 모델 점검이 끝난 뒤 창을 닫아 주세요.",
             )
             return
         super().reject()

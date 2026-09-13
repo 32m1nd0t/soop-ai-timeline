@@ -6,9 +6,11 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
+import logging
+import random
 import threading
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 from .transcription import AnalysisCancelled
 
@@ -104,10 +106,18 @@ class AIRequestFailure(RuntimeError):
 
 CancelCallback = Callable[[], bool]
 
+_LOGGER = logging.getLogger(__name__)
+
 # Rate limits and transient network errors are retried with backoff. Gemini's
 # free-tier per-minute quotas can take up to ~60s to reset, so allow several
 # attempts and honour the server-provided Retry-After delay before giving up.
 MAX_REQUEST_ATTEMPTS = 5
+# Server-side failures (503 UNAVAILABLE above all) arrive in bursts that last
+# minutes rather than seconds, especially while Google is shifting capacity
+# after a new model ships. Five attempts only covers ~15s, so overload and
+# connectivity blips get a much longer budget; the backoff stays cancellable.
+MAX_SERVER_ERROR_ATTEMPTS = 9
+RETRYABLE_SERVER_CATEGORIES = frozenset({"server", "network"})
 MAX_RETRY_BACKOFF_SECONDS = 60.0
 GEMINI_REQUEST_TIMEOUT_MS = 120_000
 
@@ -160,7 +170,7 @@ class StructuredAIProvider(ABC):
         if not self.available:
             raise RuntimeError(self.unavailable_reason)
         last_error: Exception | None = None
-        for attempt in range(MAX_REQUEST_ATTEMPTS):
+        for attempt in range(_attempt_ceiling()):
             if cancelled():
                 raise AnalysisCancelled("AI 요청을 취소했습니다.")
             try:
@@ -180,12 +190,40 @@ class StructuredAIProvider(ABC):
             except Exception as error:
                 last_error = error
                 info = classify_ai_error(error)
-                if not info.retryable or attempt >= MAX_REQUEST_ATTEMPTS - 1:
+                max_attempts = _max_attempts_for(info.category)
+                if not info.retryable or attempt >= max_attempts - 1:
+                    _log_request_failure(
+                        self.display_name,
+                        purpose,
+                        info,
+                        error,
+                        attempt,
+                        max_attempts,
+                    )
                     raise AIRequestFailure(self.display_name, info) from error
-                delay = info.retry_after_seconds or float(2**attempt)
+                delay = _jittered(info.retry_after_seconds or float(2**attempt))
                 delay = min(MAX_RETRY_BACKOFF_SECONDS, max(1.0, delay))
+                _LOGGER.info(
+                    "%s %s retry %d/%d in %.1fs (category=%s status=%s): %s",
+                    self.display_name,
+                    purpose,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    info.category,
+                    _error_status_code(error),
+                    _safe_error(error),
+                )
                 _interruptible_backoff(delay, cancelled)
         info = classify_ai_error(last_error)
+        _log_request_failure(
+            self.display_name,
+            purpose,
+            info,
+            last_error,
+            _attempt_ceiling(),
+            _attempt_ceiling(),
+        )
         raise AIRequestFailure(self.display_name, info) from last_error
 
     def test_connection(
@@ -279,6 +317,151 @@ class GeminiProvider(StructuredAIProvider):
             _int_attr(usage, "prompt_token_count"),
             _int_attr(usage, "candidates_token_count"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AIModelOption:
+    """A text model the account may select in settings."""
+
+    name: str
+    display_name: str
+    input_token_limit: int = 0
+
+    @property
+    def label(self) -> str:
+        if self.display_name and self.display_name != self.name:
+            return f"{self.name} · {self.display_name}"
+        return self.name
+
+
+@dataclass(frozen=True, slots=True)
+class AIModelHealth:
+    """One model's answer to a single, un-retried probe request."""
+
+    name: str
+    ok: bool
+    seconds: float
+    detail: str
+
+
+# Models the timeline pipeline cannot drive: it needs JSON text generation, so
+# image/audio/robotics/research endpoints only clutter the model picker.
+_NON_TEXT_MODEL_MARKERS = (
+    "image",
+    "banana",
+    "tts",
+    "transcribe",
+    "embedding",
+    "lyria",
+    "veo",
+    "imagen",
+    "robotics",
+    "computer-use",
+    "deep-research",
+    "antigravity",
+)
+
+PROBE_TIMEOUT_MS = 90_000
+MAX_PROBED_MODELS = 12
+_PROBE_PROMPT = "Reply with just: ok"
+
+_SHORT_STATUS_LABELS = {
+    "server": "과부하 (서버 5xx)",
+    "quota": "사용 한도 소진",
+    "rate_limit": "요청 한도 초과",
+    "auth": "권한 없음",
+    "model": "모델 없음 (은퇴)",
+    "network": "네트워크 오류",
+    "safety": "안전 정책 차단",
+    "response": "응답 해석 실패",
+}
+
+
+def is_selectable_text_model(name: str, supported_actions: Iterable[str] = ()) -> bool:
+    """Return whether a listed model belongs in the settings model picker."""
+    actions = [str(action) for action in supported_actions or ()]
+    if actions and "generateContent" not in actions:
+        return False
+    lowered = name.rsplit("/", 1)[-1].lower()
+    if not lowered.startswith("gemini"):
+        return False
+    return not any(marker in lowered for marker in _NON_TEXT_MODEL_MARKERS)
+
+
+def list_text_models(api_key: str) -> list[AIModelOption]:
+    """Ask Google which text models this API key may actually use.
+
+    The settings dialog used to take a hand-typed model name, which silently
+    rots when Google retires a version. Listing keeps the picker honest.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        raise RuntimeError("Gemini API 키를 먼저 입력하세요.")
+    from google import genai
+
+    client = genai.Client(api_key=key)
+    options: list[AIModelOption] = []
+    for model in client.models.list():
+        raw_name = str(getattr(model, "name", "") or "")
+        name = raw_name.rsplit("/", 1)[-1]
+        if not name:
+            continue
+        if not is_selectable_text_model(name, getattr(model, "supported_actions", ()) or ()):
+            continue
+        options.append(
+            AIModelOption(
+                name,
+                str(getattr(model, "display_name", "") or ""),
+                _positive_int(getattr(model, "input_token_limit", 0)),
+            )
+        )
+    options.sort(key=lambda option: option.name)
+    return options
+
+
+def probe_model_health(api_key: str, model_name: str) -> AIModelHealth:
+    """Send one small request and report how the model answered.
+
+    Deliberately bypasses :meth:`StructuredAIProvider.request_json` so a single
+    503 shows up as a 503 instead of being hidden behind minutes of retries.
+    """
+    key = str(api_key or "").strip()
+    name = str(model_name or "").strip()
+    started = time.monotonic()
+    if not key or not name:
+        return AIModelHealth(name, False, 0.0, "API 키와 모델 이름이 필요합니다.")
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=PROBE_TIMEOUT_MS),
+        )
+        client.models.generate_content(model=name, contents=_PROBE_PROMPT)
+    except Exception as error:
+        elapsed = time.monotonic() - started
+        info = classify_ai_error(error)
+        code = _error_status_code(error)
+        label = _SHORT_STATUS_LABELS.get(info.category, "오류")
+        detail = f"{label} · {code}" if code else label
+        _LOGGER.info(
+            "Model probe %s failed in %.1fs (category=%s status=%s): %s",
+            name,
+            elapsed,
+            info.category,
+            code,
+            _safe_error(error),
+        )
+        return AIModelHealth(name, False, elapsed, detail)
+    return AIModelHealth(name, True, time.monotonic() - started, "정상")
+
+
+def _positive_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def create_ai_provider(
@@ -504,6 +687,43 @@ def _error_status_code(error: Exception) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _max_attempts_for(category: str) -> int:
+    """Return how many attempts a failure of this category is worth."""
+    if category in RETRYABLE_SERVER_CATEGORIES:
+        return MAX_SERVER_ERROR_ATTEMPTS
+    return MAX_REQUEST_ATTEMPTS
+
+
+def _attempt_ceiling() -> int:
+    return max(MAX_REQUEST_ATTEMPTS, MAX_SERVER_ERROR_ATTEMPTS)
+
+
+def _jittered(seconds: float) -> float:
+    """Spread retries so parallel requests do not resynchronise on failure."""
+    return seconds * (1.0 + random.random() * 0.25)
+
+
+def _log_request_failure(
+    provider_name: str,
+    purpose: str,
+    info: AIErrorInfo,
+    error: Exception | None,
+    attempts: int,
+    max_attempts: int,
+) -> None:
+    """Record the raw provider error, which the user-facing message discards."""
+    _LOGGER.warning(
+        "%s %s failed after %d/%d attempts (category=%s status=%s): %s",
+        provider_name,
+        purpose,
+        attempts + 1 if attempts < max_attempts else max_attempts,
+        max_attempts,
+        info.category,
+        _error_status_code(error) if error is not None else None,
+        _safe_error(error),
+    )
 
 
 def _interruptible_backoff(seconds: float, cancelled: CancelCallback) -> None:

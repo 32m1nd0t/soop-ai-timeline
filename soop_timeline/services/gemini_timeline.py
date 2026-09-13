@@ -940,7 +940,21 @@ class AITimelineGenerator:
                     "\n".join(segment.text for segment in window),
                 ),
             )
-            payload = self._request_json(prompt, cancelled)
+            try:
+                payload = self._request_json(prompt, cancelled)
+            except AnalysisCancelled:
+                raise
+            except Exception as error:
+                # Every finished window is already checkpointed, so the run can
+                # resume where it stopped. Say so: the bare provider message
+                # reads as if the whole pass has to start over.
+                message = " ".join(str(error).split())[:500]
+                if index:
+                    message = (
+                        f"{message} (구간 {index}/{len(windows)}까지 저장했습니다. "
+                        "다시 실행하면 이어서 진행합니다.)"
+                    )
+                raise RuntimeError(message) from error
             if cancelled():
                 raise AnalysisCancelled("분석을 취소했습니다.")
             title = str(payload.get("content_title", "")).strip()
