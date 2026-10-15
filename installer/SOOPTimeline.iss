@@ -35,6 +35,11 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 [Tasks]
 Name: "desktopicon"; Description: "바탕 화면에 바로가기 만들기"; GroupDescription: "추가 바로가기:"; Flags: unchecked
 
+[InstallDelete]
+; Updates used to overlay new runtime files on the previous version's, leaving
+; stale libraries behind. The GPU add-on lives in {app}\gpu-runtime and is kept.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "..\dist\SOOPTimeline\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion

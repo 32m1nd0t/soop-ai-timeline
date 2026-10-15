@@ -40,6 +40,32 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn("Remove-Item -LiteralPath $exe -Force", script)
         self.assertIn("Remove-Item -LiteralPath $manifestPath -Force", script)
 
+    def test_release_builds_use_pinned_dependencies(self) -> None:
+        constraints = (self.root / "build-constraints.txt").read_text(encoding="utf-8")
+        pins = {
+            line.split("==", 1)[0].lower()
+            for line in constraints.splitlines()
+            if "==" in line and not line.startswith("#")
+        }
+
+        for package in ("huggingface-hub", "pyside6", "ctranslate2", "av"):
+            self.assertIn(package, pins)
+        for path in (
+            ".github/workflows/release.yml",
+            "build_exe.ps1",
+            "build_installed_app.ps1",
+        ):
+            script = (self.root / path).read_text(encoding="utf-8")
+            self.assertIn("pip install -c build-constraints.txt", script, path)
+
+    def test_installer_replaces_previous_runtime_files(self) -> None:
+        installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("[InstallDelete]", installer)
+        self.assertIn('Name: "{app}\\_internal"', installer)
+
     def test_installer_and_release_workflow_include_verified_update_assets(self) -> None:
         installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
             encoding="utf-8"

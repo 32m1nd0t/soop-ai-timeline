@@ -26,7 +26,7 @@ try {
         Remove-Item -LiteralPath $manifestPath -Force
     }
 
-    & $python -m pip install -e ".[build,gpu-windows]"
+    & $python -m pip install -c build-constraints.txt -e ".[build,gpu-windows]"
     if ($LASTEXITCODE -ne 0) {
         throw "빌드 의존성 설치에 실패했습니다. (exit code: $LASTEXITCODE)"
     }

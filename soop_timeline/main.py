@@ -46,7 +46,8 @@ def main() -> int:
     app.setFont(QFont("Malgun Gothic", 10))
     app.setStyleSheet(APP_STYLE)
 
-    smoke_test = "--smoke-test" in sys.argv
+    whisper_smoke_test = "--whisper-smoke-test" in sys.argv
+    smoke_test = "--smoke-test" in sys.argv or whisper_smoke_test
     gpu_smoke_test = "--gpu-smoke-test" in sys.argv
     if smoke_test or gpu_smoke_test:
         try:
@@ -90,7 +91,9 @@ def main() -> int:
     window.show()
     if startup_vod_id:
         QTimer.singleShot(0, lambda: window.open_timeline(startup_vod_id))
-    if smoke_test:
+    if whisper_smoke_test:
+        QTimer.singleShot(1500, lambda: _run_whisper_smoke_test(app))
+    elif smoke_test:
         QTimer.singleShot(800, app.quit)
     try:
         return app.exec()
@@ -117,6 +120,29 @@ def _verify_packaged_dependencies() -> None:
             "required": ["ok"],
         },
     )
+
+
+def _run_whisper_smoke_test(app) -> None:
+    """Load the default Whisper model the way analysis does, inside the full app.
+
+    Not run in CI (it downloads the model). Point SOOP_TIMELINE_DATA_DIR at a
+    scratch folder when running it next to a real installation.
+    """
+    from .paths import app_data_dir
+    from .services.transcription import FasterWhisperTranscriber
+
+    report_path = app_data_dir() / "whisper-smoke-result.txt"
+    try:
+        FasterWhisperTranscriber("large-v3-turbo", "cpu")._prepare_backend(
+            lambda *_args: None,
+            lambda: False,
+        )
+    except Exception:
+        report_path.write_text(traceback.format_exc(), encoding="utf-8")
+        app.exit(2)
+        return
+    report_path.write_text("Whisper model loaded.\n", encoding="utf-8")
+    app.exit(0)
 
 
 def _verify_gpu_runtime() -> None:

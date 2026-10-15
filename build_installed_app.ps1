@@ -22,7 +22,7 @@ try {
     if (Test-Path -LiteralPath $installedDir) {
         Remove-Item -LiteralPath $installedDir -Recurse -Force
     }
-    & $python -m pip install -e ".[build]"
+    & $python -m pip install -c build-constraints.txt -e ".[build]"
     if ($LASTEXITCODE -ne 0) {
         throw "CPU 설치본 빌드 의존성 설치에 실패했습니다. (exit code: $LASTEXITCODE)"
     }
