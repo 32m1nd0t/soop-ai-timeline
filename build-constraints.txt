@@ -1,8 +1,7 @@
 # Release build dependency pins (pip -c).
-# Snapshot of the v0.8.4 build, the last set verified on a real PC.
-# v0.8.5 resolved newer versions unpinned and the packaged app could no
-# longer open the cached Whisper model. Upgrade deliberately, then verify
-# with `SOOPTimeline.exe --whisper-smoke-test` before tagging a release.
+# Snapshot of the v0.8.4 build set, so every tag builds the same libraries
+# instead of whatever pip resolves that day. Upgrade deliberately, then
+# verify with `SOOPTimeline.exe --whisper-smoke-test` before tagging.
 altgraph==0.17.5
 annotated-types==0.8.0
 anyio==4.15.1

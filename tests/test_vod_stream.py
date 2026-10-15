@@ -26,6 +26,7 @@ from soop_timeline.services.transcription import (
     WhisperRuntime,
     _WhisperBackend,
     _MODEL_LOCK,
+    _hard_link_model_snapshot,
     load_vod_transcript_cache,
     missing_covered_ranges,
     save_vod_transcript_cache,
@@ -216,6 +217,32 @@ class VodStreamTests(unittest.TestCase):
                 )
         finally:
             _MODEL_LOCK.release()
+
+    def test_model_snapshot_symlinks_become_hard_links_to_blobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "blobs").mkdir()
+            snapshot = root / "snapshots" / "abc"
+            snapshot.mkdir(parents=True)
+            blob = root / "blobs" / "b1"
+            blob.write_bytes(b"model-bytes")
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            try:
+                (snapshot / "model.bin").symlink_to(Path("..", "..", "blobs", "b1"))
+            except OSError:
+                self.skipTest("creating symlinks is not permitted here")
+
+            _hard_link_model_snapshot(snapshot)
+
+            model = snapshot / "model.bin"
+            self.assertFalse(model.is_symlink())
+            self.assertEqual(model.read_bytes(), b"model-bytes")
+            self.assertTrue(blob.exists())
+            self.assertEqual(blob.stat().st_nlink, 2)
+            self.assertEqual(
+                sorted(item.name for item in snapshot.iterdir()),
+                ["config.json", "model.bin"],
+            )
 
     def test_public_metadata_returns_every_audio_part_in_order(self):
         messages: list[tuple[int, str]] = []

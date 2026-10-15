@@ -66,6 +66,13 @@ class DistributionDocumentTests(unittest.TestCase):
         self.assertIn("[InstallDelete]", installer)
         self.assertIn('Name: "{app}\\_internal"', installer)
 
+    def test_relaunched_app_does_not_inherit_redirection_guard(self) -> None:
+        installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("RedirectionGuard=no", installer)
+
     def test_installer_and_release_workflow_include_verified_update_assets(self) -> None:
         installer = (self.root / "installer" / "SOOPTimeline.iss").read_text(
             encoding="utf-8"

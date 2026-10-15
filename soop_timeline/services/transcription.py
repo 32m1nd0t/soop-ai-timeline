@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import importlib.util
 import json
@@ -472,6 +473,44 @@ _MODEL_CACHE: dict[tuple[str, str], _WhisperBackend] = {}
 _MODEL_LOCK = threading.Lock()
 
 
+def _whisper_model_path(model_name: str) -> str:
+    if os.path.isdir(model_name):
+        return model_name
+    from faster_whisper.utils import download_model
+
+    snapshot = download_model(model_name)
+    _hard_link_model_snapshot(snapshot)
+    return snapshot
+
+
+def _hard_link_model_snapshot(snapshot_dir: str | Path) -> None:
+    """Replace Hugging Face cache symlinks in a model snapshot with hard links.
+
+    An app started by its Inno Setup installer (e.g. relaunched after an
+    update) inherits Windows RedirectionGuard, which refuses to follow
+    symlinks created by a non-elevated user. That is exactly how the HF cache
+    points snapshot files at blobs, so CTranslate2 could not open model.bin.
+    Hard links are plain directory entries: they work under RedirectionGuard
+    and take no extra disk space.
+    """
+    for entry in Path(snapshot_dir).iterdir():
+        if not entry.is_symlink():
+            continue
+        temporary = entry.with_name(f"{entry.name}.hardlink-tmp")
+        try:
+            target = Path(os.path.normpath(entry.parent / os.readlink(entry)))
+            if not target.is_file():
+                continue
+            temporary.unlink(missing_ok=True)
+            os.link(target, temporary)
+            os.replace(temporary, entry)
+        except OSError:
+            # e.g. the blob is on another volume. Keep the symlink; it still
+            # works whenever RedirectionGuard is not enforced.
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+
 class FasterWhisperTranscriber:
     def __init__(self, model_name: str = "large-v3-turbo", device: str = "auto"):
         self.model_name = model_name
@@ -513,7 +552,7 @@ class FasterWhisperTranscriber:
             backend = _MODEL_CACHE.get(cache_key)
             if backend is None:
                 model = WhisperModel(
-                    self.model_name,
+                    _whisper_model_path(self.model_name),
                     device=runtime.device,
                     compute_type=runtime.compute_type,
                 )

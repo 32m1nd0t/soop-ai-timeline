@@ -23,6 +23,10 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 UsePreviousAppDir=yes
+; The app relaunched after an update inherits Setup's RedirectionGuard, which
+; blocks the Hugging Face cache symlinks and broke Whisper model loading.
+; Installs are per-user and normally non-elevated, so the guard adds little here.
+RedirectionGuard=no
 UninstallDisplayIcon={app}\SOOPTimeline.exe
 MinVersion=10.0
 ArchitecturesAllowed=x64compatible
