@@ -640,8 +640,10 @@ class FasterWhisperTranscriber:
     ) -> Transcript:
         """Transcribe bounded PCM chunks while the next audio chunk is streamed.
 
-        Only SOOP's audio-only HLS is read. No complete media or audio file is
-        created, and the decoder and batched GPU inference overlap in time.
+        SOOP's audio-only HLS is read, except for cold-archived parts whose
+        audio-only playlist is gone; those decode audio from the lowest-quality
+        muxed rendition. No complete media or audio file is created, and the
+        decoder and batched GPU inference overlap in time.
         Validated live-caption ranges can be reused so Whisper only receives
         genuinely missing portions of the completed replay.
         """

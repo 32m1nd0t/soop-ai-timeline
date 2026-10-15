@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from typing import Iterator
@@ -30,6 +31,10 @@ WHISPER_SAMPLE_RATE = 16_000
 DEFAULT_CHUNK_SECONDS = 10 * 60
 DEFAULT_OVERLAP_SECONDS = 15
 MAX_METADATA_BYTES = 8 * 1024 * 1024
+COLD_STORAGE_PREFIX = "cold-"
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,6 +42,9 @@ class VodAudioPart:
     order: int
     duration_seconds: float
     url: str
+    # Lowest-quality muxed rendition, set only when ``url`` is in SOOP's cold
+    # archive. Used only after the audio-only playlist is confirmed 410 Gone.
+    cold_fallback_url: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -229,7 +237,14 @@ def fetch_vod_audio_source(
             order = int(item.get("file_order", index) or index)
         except (TypeError, ValueError) as error:
             raise RuntimeError("SOOP 본편 재생시간 정보가 올바르지 않습니다.") from error
-        parts.append(VodAudioPart(order, duration_seconds, radio_url))
+        cold_fallback_url = (
+            _lowest_quality_rendition_url(item)
+            if _is_cold_storage_url(radio_url)
+            else ""
+        )
+        parts.append(
+            VodAudioPart(order, duration_seconds, radio_url, cold_fallback_url)
+        )
 
     parts.sort(key=lambda item: item.order)
     summed_duration = sum(part.duration_seconds for part in parts)
@@ -243,11 +258,19 @@ def fetch_vod_audio_source(
     if total_duration <= 0:
         raise RuntimeError("SOOP VOD 전체 재생시간을 확인하지 못했습니다.")
 
-    progress(
-        8,
-        f"오디오 전용 스트림 {len(parts):,}개 확인 · "
-        f"총 {format_timestamp(total_duration)} · 영상 데이터는 받지 않습니다.",
-    )
+    if any(_is_cold_storage_url(part.url) for part in parts):
+        progress(
+            8,
+            f"오디오 스트림 {len(parts):,}개 확인 · "
+            f"총 {format_timestamp(total_duration)} · 보관된 오래된 다시보기라 "
+            "오디오 전용 스트림이 없는 구간은 최저 화질 스트림에서 오디오만 해독합니다.",
+        )
+    else:
+        progress(
+            8,
+            f"오디오 전용 스트림 {len(parts):,}개 확인 · "
+            f"총 {format_timestamp(total_duration)} · 영상 데이터는 받지 않습니다.",
+        )
     return VodAudioSource(
         vod.vod_id,
         total_duration,
@@ -265,7 +288,11 @@ def iter_audio_chunks(
     start_seconds: float = 0.0,
     end_seconds: float | None = None,
 ) -> Iterator[AudioChunk]:
-    """Decode audio-only HLS into bounded in-memory PCM chunks."""
+    """Decode audio-only HLS into bounded in-memory PCM chunks.
+
+    A cold-archived part whose audio-only playlist is confirmed gone falls back
+    to its lowest-quality muxed rendition; only the audio track is decoded.
+    """
     if chunk_seconds <= 0:
         raise ValueError("chunk_seconds must be positive")
     if overlap_seconds < 0 or overlap_seconds >= chunk_seconds:
@@ -347,13 +374,29 @@ def _iter_part_audio_chunks(
         "reconnect_delay_max": "5",
     }
 
+    stream_url = part.url
+    allow_muxed_video = False
+    if _is_cold_storage_url(part.url) and _audio_playlist_gone(part.url, cookie_header):
+        if not part.cold_fallback_url:
+            raise RuntimeError(
+                f"오래된 다시보기라 SOOP이 {part.order}번 구간의 오디오 전용 스트림을 "
+                "더 이상 제공하지 않고, 대체할 저화질 스트림도 찾지 못했습니다."
+            )
+        logger.info(
+            "Cold VOD part %s audio-only playlist is gone; "
+            "decoding audio from the lowest-quality rendition",
+            part.order,
+        )
+        stream_url = part.cold_fallback_url
+        allow_muxed_video = True
+
     try:
-        with av.open(part.url, options=options) as container:
+        with av.open(stream_url, options=options) as container:
             audio_streams = [stream for stream in container.streams if stream.type == "audio"]
             video_streams = [stream for stream in container.streams if stream.type == "video"]
             if not audio_streams:
                 raise RuntimeError("오디오 트랙을 찾지 못했습니다.")
-            if video_streams:
+            if video_streams and not allow_muxed_video:
                 raise RuntimeError("오디오 전용이 아닌 스트림이 반환되어 분석을 중단했습니다.")
 
             stream = audio_streams[0]
@@ -472,6 +515,59 @@ def _is_soop_https_url(url: str) -> bool:
     return parsed.scheme == "https" and (
         host == "sooplive.com" or host.endswith(".sooplive.com")
     )
+
+
+def _is_cold_storage_url(url: str) -> bool:
+    """Whether a SOOP VOD URL lives in the cold archive (e.g. ``/cold-spkt/``)."""
+    if not _is_soop_https_url(url):
+        return False
+    first_segment = urlparse(url).path.lstrip("/").split("/", 1)[0].lower()
+    return first_segment.startswith(COLD_STORAGE_PREFIX)
+
+
+def _lowest_quality_rendition_url(item: dict[str, object]) -> str:
+    """Return the lowest-bitrate single rendition (not the adaptive master)."""
+    candidates: list[tuple[int, str]] = []
+    quality_info = item.get("quality_info")
+    if not isinstance(quality_info, list):
+        return ""
+    for quality in quality_info:
+        if not isinstance(quality, dict):
+            continue
+        if str(quality.get("name", "") or "").lower() == "adaptive":
+            continue
+        url = str(quality.get("file", "") or "").strip()
+        if not _is_soop_https_url(url):
+            continue
+        bitrate_text = str(quality.get("bitrate", "") or "").strip().lower()
+        try:
+            bitrate = int(bitrate_text.removesuffix("k"))
+        except ValueError:
+            continue
+        if bitrate > 0:
+            candidates.append((bitrate, url))
+    return min(candidates)[1] if candidates else ""
+
+
+def _audio_playlist_gone(url: str, cookie_header: str) -> bool:
+    """Confirm SOOP answers 410 Gone for an audio-only playlist.
+
+    FFmpeg reports every uncommon 4xx the same way, so the exact status is
+    checked with a plain request before switching to a muxed rendition.
+    """
+    headers = {
+        "Referer": f"{VOD_ORIGIN}/",
+        "User-Agent": USER_AGENT,
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    try:
+        with urlopen(Request(url, headers=headers), timeout=20):
+            return False
+    except HTTPError as error:
+        return error.code == 410
+    except (URLError, TimeoutError, OSError):
+        return False
 
 
 def _api_failure_message(payload: object) -> str:

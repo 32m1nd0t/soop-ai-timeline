@@ -1,9 +1,11 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import numpy as np
 
@@ -40,8 +42,12 @@ from soop_timeline.services.vod_stream import (
     VodAudioSource,
     build_vod_seek_parts,
     fetch_vod_audio_source,
+    iter_audio_chunks,
     resolve_vod_seek_target,
 )
+
+
+COLD_BASE = "https://vod-archive-kr-cdn-z01.sooplive.com/cold-spkt/vod/20250302/1"
 
 
 def sample_vod() -> Vod:
@@ -105,6 +111,72 @@ def public_payload() -> dict[str, object]:
     }
 
 
+def cold_payload() -> dict[str, object]:
+    def quality(name: str, bitrate: str, path: str) -> dict[str, str]:
+        return {"name": name, "bitrate": bitrate, "file": f"{COLD_BASE}/{path}"}
+
+    return {
+        "result": 1,
+        "data": {
+            "is_public": 1,
+            "is_paid": False,
+            "is_ppv": False,
+            "adult_status": "pass",
+            "total_file_duration": 600_000,
+            "files": [
+                {
+                    "file_order": 1,
+                    "duration": 600_000,
+                    "hide": "N",
+                    "radio_url": f"{COLD_BASE}/p1.mp4/audio.m3u8",
+                    "quality_info": [
+                        quality("adaptive", "0k", "p1.smil/manifest.m3u8"),
+                        quality("original", "8000k", "p1.mp4/manifest.m3u8"),
+                        quality("hd4k", "4000k", "p1_4000k.mp4/manifest.m3u8"),
+                        quality("hd", "1000k", "p1_1000k.mp4/manifest.m3u8"),
+                    ],
+                }
+            ],
+        },
+    }
+
+
+class FakeAvContainer:
+    def __init__(self, stream_types: tuple[str, ...]):
+        self.streams = [SimpleNamespace(type=kind) for kind in stream_types]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def demux(self, stream):
+        del stream
+        return iter([SimpleNamespace(decode=lambda: [object()])])
+
+
+def fake_av(stream_types: tuple[str, ...], opened: list[str]) -> SimpleNamespace:
+    def open_container(url, options=None):
+        del options
+        opened.append(url)
+        return FakeAvContainer(stream_types)
+
+    def resample(frame):
+        if frame is None:
+            return []
+        return [SimpleNamespace(to_ndarray=lambda: np.zeros((1, 16_000), np.int16))]
+
+    return SimpleNamespace(
+        open=open_container,
+        AudioResampler=lambda **kwargs: SimpleNamespace(resample=resample),
+    )
+
+
+def audio_gone(url: str = f"{COLD_BASE}/p1.mp4/audio.m3u8") -> HTTPError:
+    return HTTPError(url, 410, "Gone", {}, None)
+
+
 class VodStreamTests(unittest.TestCase):
     def test_resolves_global_time_to_local_time_after_short_leading_part(self):
         parts = build_vod_seek_parts(
@@ -160,8 +232,116 @@ class VodStreamTests(unittest.TestCase):
         request = mocked.call_args.args[0]
         self.assertIn(b"nTitleNo=123", request.data)
         self.assertEqual([part.order for part in source.parts], [1, 2])
+        self.assertEqual([part.cold_fallback_url for part in source.parts], ["", ""])
         self.assertAlmostEqual(source.total_duration_seconds, 24_357.984)
         self.assertIn("영상 데이터는 받지 않습니다", messages[-1][1])
+
+    def test_cold_archive_metadata_keeps_lowest_single_rendition_as_fallback(self):
+        messages: list[str] = []
+        with patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            return_value=FakeResponse(cold_payload()),
+        ):
+            source = fetch_vod_audio_source(
+                sample_vod(),
+                lambda percent, message: messages.append(message),
+                lambda: False,
+            )
+
+        self.assertEqual(source.parts[0].url, f"{COLD_BASE}/p1.mp4/audio.m3u8")
+        self.assertEqual(
+            source.parts[0].cold_fallback_url,
+            f"{COLD_BASE}/p1_1000k.mp4/manifest.m3u8",
+        )
+        self.assertIn("최저 화질 스트림에서 오디오만", messages[-1])
+
+    def test_cold_part_decodes_lowest_rendition_only_after_audio_is_gone(self):
+        part = VodAudioPart(
+            1,
+            1,
+            f"{COLD_BASE}/p1.mp4/audio.m3u8",
+            f"{COLD_BASE}/p1_1000k.mp4/manifest.m3u8",
+        )
+        opened: list[str] = []
+        with patch.dict(sys.modules, {"av": fake_av(("video", "audio"), opened)}), patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            side_effect=audio_gone(),
+        ):
+            chunks = list(
+                iter_audio_chunks(VodAudioSource("123", 1, (part,)), lambda: False)
+            )
+
+        self.assertEqual(opened, [part.cold_fallback_url])
+        self.assertEqual(len(chunks), 1)
+        self.assertAlmostEqual(chunks[0].duration_seconds, 1.0)
+
+    def test_cold_part_keeps_audio_only_stream_while_it_is_available(self):
+        part = VodAudioPart(
+            1,
+            1,
+            f"{COLD_BASE}/p1.mp4/audio.m3u8",
+            f"{COLD_BASE}/p1_1000k.mp4/manifest.m3u8",
+        )
+        opened: list[str] = []
+        with patch.dict(sys.modules, {"av": fake_av(("audio",), opened)}), patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            return_value=FakeResponse({}),
+        ):
+            list(iter_audio_chunks(VodAudioSource("123", 1, (part,)), lambda: False))
+
+        self.assertEqual(opened, [part.url])
+
+    def test_cold_part_rejects_muxed_video_when_audio_failure_is_not_gone(self):
+        part = VodAudioPart(
+            1,
+            1,
+            f"{COLD_BASE}/p1.mp4/audio.m3u8",
+            f"{COLD_BASE}/p1_1000k.mp4/manifest.m3u8",
+        )
+        opened: list[str] = []
+        with patch.dict(sys.modules, {"av": fake_av(("video", "audio"), opened)}), patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            side_effect=HTTPError(part.url, 403, "Forbidden", {}, None),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "오디오 전용이 아닌"):
+                list(
+                    iter_audio_chunks(VodAudioSource("123", 1, (part,)), lambda: False)
+                )
+
+        self.assertEqual(opened, [part.url])
+
+    def test_regular_part_is_never_probed_or_switched_to_muxed_video(self):
+        part = VodAudioPart(
+            1,
+            1,
+            "https://vod-archive-kr-cdn-z01.sooplive.com/spkt/vod/p1.mp4/audio.m3u8",
+            "https://vod-archive-kr-cdn-z01.sooplive.com/spkt/vod/p1_1000k.mp4/manifest.m3u8",
+        )
+        opened: list[str] = []
+        with patch.dict(sys.modules, {"av": fake_av(("video", "audio"), opened)}), patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            side_effect=AssertionError("regular VOD must not be probed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "오디오 전용이 아닌"):
+                list(
+                    iter_audio_chunks(VodAudioSource("123", 1, (part,)), lambda: False)
+                )
+
+        self.assertEqual(opened, [part.url])
+
+    def test_gone_cold_part_without_fallback_explains_archived_audio(self):
+        part = VodAudioPart(1, 1, f"{COLD_BASE}/p1.mp4/audio.m3u8")
+        opened: list[str] = []
+        with patch.dict(sys.modules, {"av": fake_av(("audio",), opened)}), patch(
+            "soop_timeline.services.vod_stream.urlopen",
+            side_effect=audio_gone(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "오래된 다시보기"):
+                list(
+                    iter_audio_chunks(VodAudioSource("123", 1, (part,)), lambda: False)
+                )
+
+        self.assertEqual(opened, [])
 
     def test_in_app_soop_session_is_attached_to_metadata_request(self):
         store_soop_session_cookies(
